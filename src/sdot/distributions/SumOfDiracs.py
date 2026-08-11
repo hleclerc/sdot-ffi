@@ -1,13 +1,13 @@
 from typing import TYPE_CHECKING, cast, overload
 
-from ..tensor.CtShapeVar import CtShapeVar
-from ..tensor.ShapeVar import ShapeVar
-from ..tensor.AxisList import AxisList
-from ..tensor.Tensor import Tensor
-from ..tensor.Axis import Axis
-from ..util.ComputedAttribute import ComputedAttribute
+from loom.tensor import CtShapeVar
+from loom.tensor import ShapeVar
+from loom.tensor import AxisList
+from loom.tensor import Tensor
+from loom.tensor import Axis
+from loom.util import ComputedAttribute
 
-from ..compilation.FfiCode import FfiCodeParallel
+from loom.compilation.FfiCode import FfiCodeParallel
 
 from .Distribution import Distribution
 

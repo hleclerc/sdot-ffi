@@ -1,14 +1,14 @@
 from typing import TYPE_CHECKING, cast, overload
 
-from ..tensor.CtShapeVar import CtShapeVar
-from ..tensor.ShapeVar import ShapeVar
-from ..tensor.AxisList import AxisList
-from ..tensor.Tensor import Tensor
-from ..tensor.Axis import Axis
+from loom.tensor import CtShapeVar
+from loom.tensor import ShapeVar
+from loom.tensor import AxisList
+from loom.tensor import Tensor
+from loom.tensor import Axis
 
-from ..util.ComputedAttribute import ComputedAttribute
-from ..compilation.FfiCode import FfiCodeParallel
-from ..drivers.driver import driver
+from loom.util import ComputedAttribute
+from loom.compilation.FfiCode import FfiCodeParallel
+from loom.drivers.driver import driver
 
 from .Distribution import Distribution
 

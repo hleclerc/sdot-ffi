@@ -1,5 +1,5 @@
-from ..util.Aggregate import Aggregate
-from ..tensor.Tensor import Tensor
+from loom.util import Aggregate
+from loom.tensor import Tensor
 
 
 class Distribution( Aggregate ):
