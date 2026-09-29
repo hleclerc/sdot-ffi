@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+
+# sorties de compilation
+build/
+*.o
+*.a
+*.so
+*.so.p
+*.dylib
+compile_commands.json
+
+# LE CATALOGUE COMPILE : des `.so` par variante de machine, reconstruits par
+# `scripts/build_catalogue.py`. Seul le README, qui explique comment, est suivi.
+catalogue/*
+!catalogue/README.md
+
+# le runner ( errand )
+.errand/
+runs/
+
+# divers
+tmp/
+.cache/
