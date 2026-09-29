@@ -59,7 +59,9 @@ UTP HD typename DTP::TF DTP::measure() const {
         CartesianIndices<DECAYED_TYPE_OF( shape )> cells{ shape };
         TF sum = 0;
         for ( PI flat = 0; flat < cells.size(); ++flat ) {
-            const TF cell = cells[ flat ].apply_values( [&]( auto ...i ) {
+            // `cells[ flat ]` rend desormais un `Coords` ( un multi-indice NOMME ) et non plus le
+            // tuple nu : le depaquetage se demande a ses `values`.
+            const TF cell = cells[ flat ].values.apply_values( [&]( auto ...i ) {
                 // running axis counter over the index pack (axes 0..d-1, in order)
                 PI axis = 0;
                 TF spacing = 1;

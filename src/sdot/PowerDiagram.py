@@ -28,13 +28,14 @@ n'auraient rien enlevé, donc les cellules sont les MÊMES, aux erreurs d'arrond
 
 import numpy as np
 
+import loom
 from loom.compilation.FfiCode import FfiCode
 from loom.drivers.driver import driver
 from loom.tensor import Axis, CtShapeVar, IntTensor, RealTensor, ShapeVar, Tensor, new_batch_axis
 from loom.util import Aggregate
 
 from .Cell import BOUNDARY, Cell
-from .CellScratch import CellScratch, fp_size, merge_call
+from .CellScratch import CellScratch, fp_size
 
 
 def diagram_class_for( positions, weights, accelerator ):
@@ -202,14 +203,14 @@ class PowerDiagram( Aggregate ):
         kwargs de l'appel )`. Sans distribution, `unit_density()` -- une valeur que le C++ fabrique
         lui-même -- et une cotangente `0` que `UnitDensity` ignore."""
         if self.distribution is None:
-            return "power_diagram.unit_density()", "0", {}
-        return "distribution", "grad_for_distribution", { "distribution": self.distribution }
+            return "inputs.power_diagram.unit_density()", "0", {}
+        return "inputs.distribution", "grad_of_inputs.distribution", { "distribution": self.distribution }
 
     # ---- la mémoire ( `PowerDiagram_Bsp` seulement ) --------------------------------------------------
 
     def _memo_for_call( self ):
-        """`( expression C++ des deux tenseurs de sortie, kwargs de l'appel, ce qu'il faut reprendre
-        après )` -- rien pour un stockage qui n'a pas de mémoire"""
+        """`( expression C++ des deux tenseurs de sortie, arguments de l'appel, ce qu'il faut
+        reprendre après )` -- rien pour un stockage qui n'a pas de mémoire"""
         return "0, 0", {}, None
 
     def _memo_after_call( self, produced ):
@@ -253,30 +254,27 @@ class PowerDiagram( Aggregate ):
         # l'axe des work-items est un axe de BATCH porté par le scratch : `thread_index` /
         # `nb_threads` sont le rang de ce work-item et leur nombre, la boucle striée se lit dessus
         num_thread = new_batch_axis( nt, prefix = "thread" )
-        scratch, sc_kwargs = CellScratch.for_flat_call( "scratch", nb_words, dom.kernel_dtype, batch_axes = [ num_thread ] )
-
         res = RealTensor[ self.num_point ]()
         dist_expr, grad_dist_expr, dist_kwargs = self._dist_for()
-        memo_expr, memo_kwargs, memo_produced = self._memo_for_call()
+        memo_expr, memo_args, memo_produced = self._memo_for_call()
 
-        driver.call(
-            FfiCode.per_item( code = "power_diagram.measures( res, dom_cell, scratch( batch_index ), "
+        loom.ffi_call(
+            "power_diagram_measures",
+            FfiCode.per_item( code = "inputs.power_diagram.measures( outputs.res, inputs.dom_cell, scratch.pool( batch_index ), "
                            f"{ dist_expr }, { memo_expr }, thread_index, nb_threads );",
                 # les gradients sur les germes sont PARTAGÉS par tous les items : chaque work-item y
                 # accumule ( `atomic_add` côté C++ ), et la plateforme les met à zéro avant le corps
                 ),
-            FfiCode.per_item( "power_diagram.measures_bwd( res, dom_cell, grad_for_res, "
+            FfiCode.per_item( "inputs.power_diagram.measures_bwd( outputs.res, inputs.dom_cell, grad_of_outputs.res, "
                            f"{ self._grad_seeds_expr() }, "
-                           f"scratch( batch_index ), { dist_expr }, { grad_dist_expr }, "
+                           f"scratch.pool( batch_index ), { dist_expr }, { grad_dist_expr }, "
                            "thread_index, nb_threads );" ),
-            name = "power_diagram_measures",
-            **merge_call( merge_call( dict( output_attributes = [ "res" ] ), sc_kwargs ), memo_kwargs.get( "call", {} ) ),
             power_diagram = self,
             dom_cell = dom,
-            res = res,
-            scratch = scratch,
+            res = loom.out( res ),
+            pool = CellScratch.for_call( nb_words, dom.kernel_dtype, batch_axes = [ num_thread ] ),
             **dist_kwargs,
-            **memo_kwargs.get( "args", {} ),
+            **memo_args,
         )
         self._memo_after_call( memo_produced )
         return res
@@ -293,22 +291,19 @@ class PowerDiagram( Aggregate ):
         nb_words = self._scratch_words( self._scratch_capacity, self._nb_work_cells(), False )
         nt = driver.device.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ self.num_point ] )
         num_thread = new_batch_axis( nt, prefix = "thread" )
-        scratch, sc_kwargs = CellScratch.for_flat_call( "scratch", nb_words, dom.kernel_dtype, batch_axes = [ num_thread ] )
-
         mass = RealTensor[ self.num_point ]()
         first = RealTensor[ self.num_point, self.dim ]()
         second = RealTensor[ self.num_point ]()
         dist_expr, _, dist_kwargs = self._dist_for()
 
-        driver.call(
-            FfiCode.per_item( code = "power_diagram.moments( mass, first, second, dom_cell, scratch( batch_index ), "
-                           f"{ dist_expr }, thread_index, nb_threads );" ),
-            name = "power_diagram_moments",
-            **merge_call( dict( output_attributes = [ "mass", "first", "second" ] ), sc_kwargs ),
+        loom.ffi_call(
+            "power_diagram_moments",
+            FfiCode.per_item( code = "inputs.power_diagram.moments( outputs.mass, outputs.first, outputs.second, "
+                           f"inputs.dom_cell, scratch.pool( batch_index ), { dist_expr }, thread_index, nb_threads );" ),
             power_diagram = self,
             dom_cell = dom,
-            mass = mass, first = first, second = second,
-            scratch = scratch,
+            mass = loom.out( mass ), first = loom.out( first ), second = loom.out( second ),
+            pool = CellScratch.for_call( nb_words, dom.kernel_dtype, batch_axes = [ num_thread ] ),
             **dist_kwargs,
         )
         return mass, first, second
@@ -331,22 +326,18 @@ class PowerDiagram( Aggregate ):
 
         nb_words = self._scratch_words( cap, self._nb_work_cells(), False )
         nt = driver.device.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ num_cell ] )
-        scratch, sc_kwargs = CellScratch.for_flat_call( "scratch", nb_words, dom.kernel_dtype, nb_threads = nt )
         dist_expr, _, dist_kwargs = self._dist_for()
 
-        driver.call(
-            FfiCode.per_item( code = "power_diagram.hessian_row( SI( ranks( batch_index ) ), dom_cell, nbrs( batch_index ), "
-                           f"scratch, thread_index, { dist_expr } );",
-                max_nb_threads = "return scratch.words.shape( 0 );" ),
-            name = "power_diagram_hessian_rows",
-            **merge_call( dict(
-                output_capacities = { "nbrs.nb_nbrs": 16 },
-                output_attributes = [ "nbrs" ] ), sc_kwargs ),
+        loom.ffi_call(
+            "power_diagram_hessian_rows",
+            FfiCode.per_item( code = "inputs.power_diagram.hessian_row( SI( inputs.ranks( batch_index ) ), inputs.dom_cell, "
+                           f"outputs.nbrs( batch_index ), scratch.pool, thread_index, { dist_expr } );",
+                max_nb_threads = "return scratch.pool.words.shape( 0 );" ),
             power_diagram = self,
             dom_cell = dom,
             ranks = ranks,
-            scratch = scratch,
-            nbrs = nbrs,
+            pool = CellScratch.for_call( nb_words, dom.kernel_dtype, nb_threads = nt ),
+            nbrs = loom.out( nbrs, capacities = { "nb_nbrs": 16 } ),
             **dist_kwargs,
         )
         counts = np.asarray( nbrs.nb_nbrs.value ).reshape( -1 ).astype( int )
@@ -373,21 +364,16 @@ class PowerDiagram( Aggregate ):
 
         nb_words = self._scratch_words( cap, 1, False )
         nt = driver.device.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ num_cell ] )
-        scratch, sc_kwargs = CellScratch.for_flat_call( "scratch", nb_words, dom.kernel_dtype, nb_threads = nt )
-
-        driver.call(
-            FfiCode.per_item( code = "power_diagram.build_cell( SI( ranks( batch_index ) ), dom_cell, cells( batch_index ), "
-                           "scratch, thread_index );",
-                max_nb_threads = "return scratch.words.shape( 0 );" ),
-            name = "power_diagram_cells",
-            **merge_call( dict(
-                output_capacities = { "cells.nb_vertices": cap, "cells.nb_cuts": cap },
-                output_attributes = [ "cells" ] ), sc_kwargs ),
+        loom.ffi_call(
+            "power_diagram_cells",
+            FfiCode.per_item( code = "inputs.power_diagram.build_cell( SI( inputs.ranks( batch_index ) ), inputs.dom_cell, "
+                           "outputs.cells( batch_index ), scratch.pool, thread_index );",
+                max_nb_threads = "return scratch.pool.words.shape( 0 );" ),
             power_diagram = self,
             dom_cell = dom,
             ranks = ranks,
-            scratch = scratch,
-            cells = cells,
+            pool = CellScratch.for_call( nb_words, dom.kernel_dtype, nb_threads = nt ),
+            cells = loom.out( cells, capacities = { "nb_vertices": cap, "nb_cuts": cap } ),
         )
         return cells
 

@@ -24,6 +24,7 @@ chemin ordinaire à la compilation.
 
 import numpy as np
 
+import loom
 from loom.drivers.driver import driver
 from loom.tensor import Axis, IntTensor, RealTensor, ShapeVar
 
@@ -69,9 +70,10 @@ class PowerDiagram_Bsp( PowerDiagram ):
             return "0, 0", {}, None
         nbrs = IntTensor[ self.num_point, self.num_memo, dict( size = 32 ) ]()
         counts = IntTensor[ self.num_point, dict( size = 32 ) ]()
-        return "memo_nbrs_out, memo_counts_out", dict(
-            call = dict( output_attributes = [ "memo_nbrs_out", "memo_counts_out" ] ),
-            args = dict( memo_nbrs_out = nbrs, memo_counts_out = counts ) ), ( nbrs, counts )
+        # le role est porte par la valeur, donc il n'y a plus de liste de chemins a fondre dans
+        # celles de l'appel : ce sont des arguments comme les autres, marques.
+        return "outputs.memo_nbrs_out, outputs.memo_counts_out", dict(
+            memo_nbrs_out = loom.out( nbrs ), memo_counts_out = loom.out( counts ) ), ( nbrs, counts )
 
     def _memo_after_call( self, produced ):
         if produced is None:
@@ -156,4 +158,4 @@ class PowerDiagram_Bsp( PowerDiagram ):
             self.memo_counts = produced[ "memo_counts_out" ].raw
 
     def _grad_seeds_expr( self ):
-        return "grad_for_power_diagram.sorted_positions, grad_for_power_diagram.sorted_weights"
+        return "grad_of_inputs.power_diagram.sorted_positions, grad_of_inputs.power_diagram.sorted_weights"

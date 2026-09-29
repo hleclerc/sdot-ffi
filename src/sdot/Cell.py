@@ -159,9 +159,9 @@ class Cell( Aggregate ):
         cap = self.dim + 1
         loom.ffi_call(
             "init_as_unbounded",
-            FfiCode.per_item( code = "outputs.cell( batch_index ).init_as_unbounded( scratch.scratch( batch_index ) );" ),
+            FfiCode.per_item( code = "outputs.cell( batch_index ).init_as_unbounded( scratch.pool( batch_index ) );" ),
             cell = loom.out( self, capacities = { "nb_vertices": cap, "nb_cuts": cap } ),
-            scratch = self._call_scratch( cap ),
+            pool = self._call_scratch( cap ),
         )
 
     def init_as_hypercube( self, origin = None, axes = None, cut_id = BOUNDARY, batch_axes = None ):
@@ -177,9 +177,9 @@ class Cell( Aggregate ):
         cap = self.init_capacity()
         loom.ffi_call(
             "init_as_hypercube",
-            FfiCode.per_item( code = "outputs.cell( batch_index ).init_as_hypercube( scratch.scratch( batch_index ), inputs.origin, inputs.axes, inputs.cut_id );" ),
+            FfiCode.per_item( code = "outputs.cell( batch_index ).init_as_hypercube( scratch.pool( batch_index ), inputs.origin, inputs.axes, inputs.cut_id );" ),
             cell = loom.out( self, capacities = { "nb_vertices": cap, "nb_cuts": cap } ),
-            scratch = self._call_scratch( cap ),
+            pool = self._call_scratch( cap ),
             cut_id = cut_id,
             origin = origin,
             axes = axes,
@@ -200,14 +200,14 @@ class Cell( Aggregate ):
         res = self._empty_like_me()
         loom.ffi_call(
             "cut",
-            FfiCode.per_item( code = "inputs.cell( batch_index ).cut( outputs.res( batch_index ), scratch.scratch( batch_index ), "
+            FfiCode.per_item( code = "inputs.cell( batch_index ).cut( outputs.res( batch_index ), scratch.pool( batch_index ), "
                                      "inputs.direction, inputs.offset, inputs.cut_id );" ),
             cut_id = cut_id,
             direction = direction,
             offset = offset,
             cell = self,
             res = loom.out( res, capacities = { "nb_vertices": cap_v, "nb_cuts": cap_c } ),
-            scratch = self._call_scratch( max( cap_v, cap_c ) ),
+            pool = self._call_scratch( max( cap_v, cap_c ) ),
         )
         self._adopt_geometry( res )
         return self
@@ -230,12 +230,12 @@ class Cell( Aggregate ):
         res = RealTensor[ tuple( self.batch_axes ) ]()
         loom.ffi_call(
             "measure",
-            FfiCode.per_item( code = "inputs.cell( batch_index ).measure( outputs.res( batch_index ), scratch.scratch( batch_index ) );" ),
+            FfiCode.per_item( code = "inputs.cell( batch_index ).measure( outputs.res( batch_index ), scratch.pool( batch_index ) );" ),
             FfiCode.per_item( "inputs.cell( batch_index ).measure_bwd( outputs.res( batch_index ), grad_of_outputs.res( batch_index ), "
-                              "grad_of_inputs.cell( batch_index ).vertex_positions, scratch.scratch( batch_index ) );" ),
+                              "grad_of_inputs.cell( batch_index ).vertex_positions, scratch.pool( batch_index ) );" ),
             cell = self,
             res = loom.out( res ),
-            scratch = self._call_scratch( max( self._cap_v(), self._cap_c() ) ),
+            pool = self._call_scratch( max( self._cap_v(), self._cap_c() ) ),
         )
         return res
 

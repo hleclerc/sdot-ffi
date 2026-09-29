@@ -26,7 +26,7 @@ class PowerDiagram_Plain( PowerDiagram ):
         return np.arange( int( self.nb_points.value ) )
 
     def _grad_seeds_expr( self ):
-        return "grad_for_power_diagram.positions, grad_for_power_diagram.weights"
+        return "grad_of_inputs.power_diagram.positions, grad_of_inputs.power_diagram.weights"
 
     # ---- ce que le solveur de `OtPlan` ecrit ( voir `PowerDiagram_Bsp` ) ----------------------------
 
