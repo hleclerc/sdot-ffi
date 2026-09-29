@@ -4,6 +4,7 @@ import numpy as np
 
 # `loom.tensor` D'ABORD : `AaBsp` est le premier module que `sdot/__init__.py` importe, et
 # `loom.drivers.driver` importé avant lui coupe le cycle `driver <-> tensor` du mauvais côté.
+import loom
 from loom.tensor import Axis, CtShapeVar, IntTensor, RealTensor, ShapeVar, new_batch_axis
 from loom.compilation.FfiCode import FfiCode
 from loom.drivers.driver import driver
@@ -273,16 +274,16 @@ class AaBsp( SpatialAccelerator ):
         # l'arbre n'est PAS un argument : ses majorants courants sont ce qu'on remplace, et sous
         # une trace ils peuvent être des traceurs d'une trace close ( voir `OtPlan` ). Seules les
         # tranches entrent.
-        driver.call(
+        loom.ffi_call(
+            "bsp_refresh_majorants",
             FfiCode.per_item( includes = [ "sdot/bsp_build_level.h" ],
-                code = "bsp_refresh_majorant( cloud, node_begin( batch_index ), node_end( batch_index ), "
-                           "maj.wa( batch_index ), maj.wb( batch_index ) );" ),
-            name = "bsp_refresh_majorants",
-            output_attributes = [ "maj" ],
-            has_dynamic_capacity = False,
-            cloud = cloud, maj = maj,
+                code = "bsp_refresh_majorant( inputs.cloud, inputs.node_begin( batch_index ), inputs.node_end( batch_index ), "
+                           "outputs.maj.wa( batch_index ), outputs.maj.wb( batch_index ) );" ),
+            cloud = cloud,
+            maj = loom.out( maj ),
             node_begin = IntTensor[ num_node ]( np.asarray( self.node_begin ).reshape( -1 ) ),
             node_end   = IntTensor[ num_node ]( np.asarray( self.node_end ).reshape( -1 ) ),
+            has_dynamic_capacity = False,
         )
         self.node_wa = maj.wa.raw
         self.node_wb = maj.wb.raw
@@ -500,29 +501,31 @@ def _build_in_kernel( pos, w, leaf_size ):
         leaf = IntTensor[ num_param ]()
         leaf.set( np.array( [ leaf_size ], dtype = np.int64 ) )
 
-        # sans poids, ni le nuage ni le majorant n'ont de tenseur : laissés HORS des sorties, ils
-        # restent `Unbound`, arrivent en `NoneTensor`, et les deux blocs correspondants du kernel
-        # disparaissent à la compilation (même règle que `PowerDiagram.weights`).
-        no_weights = [] if w is not None else [ "dst.weights", "lvl.wa", "lvl.wb" ]
+        # CE QUE LE NIVEAU ÉCRIT, nommé POSITIVEMENT. `begin` / `end` sont son ENTRÉE ( la tranche
+        # décidée par le niveau d'au-dessus ) : ne pas les nommer suffit à les laisser lues et non
+        # allouées. Sans poids, ni le nuage ni le majorant n'ont de tenseur : pas nommés non plus,
+        # ils restent `Unbound`, arrivent en `NoneTensor`, et les deux blocs correspondants du
+        # kernel disparaissent à la compilation ( même règle que `PowerDiagram.weights` ).
+        ecrit_dst = [ "positions", "order" ] + ( [ "weights" ] if w is not None else [] )
+        ecrit_lvl = [ "mid", "box" ] + ( [ "wa", "wb" ] if w is not None else [] )
 
-        driver.call(
+        loom.ffi_call(
+            "bsp_build_level",
             FfiCode.per_item( includes = [ "sdot/bsp_build_level.h" ],
-                code = "bsp_build_level( src, dst, perm, "
-                           "lvl.begin( batch_index ), lvl.end( batch_index ), "
-                           "lvl.box( batch_index ), "
-                           "lvl.wa( batch_index ), lvl.wb( batch_index ), lvl.mid( batch_index ), "
-                           "SI( leaf_size( 0 ) ) );" ),
-            name = "bsp_build_level",
-            output_attributes = [ "dst", "lvl", "perm" ],
-            # `begin` / `end` sont l'ENTRÉE du niveau : sous une sortie nommée, il faut les en
-            # retirer explicitement pour qu'elles restent lues et non allouées.
-            output_exceptions = [ "lvl.begin", "lvl.end" ] + no_weights,
-            scratch_attributes = [ "perm" ],
+                code = "bsp_build_level( inputs.src, outputs.dst, scratch.perm, "
+                           "outputs.lvl.begin( batch_index ), outputs.lvl.end( batch_index ), "
+                           "outputs.lvl.box( batch_index ), "
+                           "outputs.lvl.wa( batch_index ), outputs.lvl.wb( batch_index ), outputs.lvl.mid( batch_index ), "
+                           "SI( inputs.leaf_size( 0 ) ) );" ),
+            src = src,
+            dst = loom.out( dst, *ecrit_dst ),
+            lvl = loom.out( lvl, *ecrit_lvl ),
+            perm = loom.scratch( perm ),
+            leaf_size = leaf,
             # toutes les tailles sont prescrites en amont (elles ne dépendent que de `n` et du
             # niveau) : aucun compte n'est décidé par le kernel, donc rien ne peut déborder et le
             # test d'exécution -- une synchro device -> hôte par appel -- n'a rien à surveiller.
             has_dynamic_capacity = False,
-            src = src, dst = dst, lvl = lvl, perm = perm, leaf_size = leaf,
         )
 
         mid = np.asarray( lvl.mid ).reshape( -1 )

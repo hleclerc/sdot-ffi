@@ -234,7 +234,9 @@ UTP HD void DTP::measure_bwd( auto &&grad_values, auto &&grad_mass ) const {
             auto shape = img.values.shape();
             CartesianIndices<DECAYED_TYPE_OF( shape )> cells{ shape };
             for ( PI flat = 0; flat < cells.size(); ++flat ) {
-                cells[ flat ].apply_values( [&]( auto ...i ) {
+                // meme raison qu'au forward : `cells[ flat ]` est un `Coords`, le
+                // depaquetage se demande a ses `values`.
+                cells[ flat ].values.apply_values( [&]( auto ...i ) {
                     PI axis = 0;
                     TF spacing = 1;
                     ( ( spacing *= TF( img.knots( axis, i + 1 ) ) - TF( img.knots( axis, i ) ), ++axis ), ... );

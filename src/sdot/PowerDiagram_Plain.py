@@ -5,6 +5,7 @@ Le plancher contre lequel `PowerDiagram_Bsp` se mesure ( `O( n² )` ), et ce qui
 positions sont un traceur, sur lequel aucun arbre ne se bâtit. Côté noyau : `PowerDiagram_Plain.h`.
 """
 
+import loom
 from loom.tensor import RealTensor
 
 from .PowerDiagram import PowerDiagram
@@ -32,8 +33,8 @@ class PowerDiagram_Plain( PowerDiagram ):
 
     def _solver_weights_call( self ):
         w = RealTensor[ self.num_point ]()
-        return ( "power_diagram.with_weights( weights_out )",
-                 dict( output_attributes = [ "weights_out" ], args = dict( weights_out = w ) ), dict( weights_out = w ) )
+        return ( "inputs.power_diagram.with_weights( outputs.weights_out )",
+                 dict( weights_out = loom.out( w ) ), dict( weights_out = w ) )
 
     def _solver_weights_after( self, produced ):
         self.weights = produced[ "weights_out" ].raw

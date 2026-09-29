@@ -45,6 +45,7 @@ appel sont en lecture seule.
 
 import numpy as np                  # les seuls tableaux hôtes d'ici : les quelques plans du domaine
 
+import loom
 from loom.compilation.FfiCode import FfiCode
 from loom.drivers.driver import driver
 from loom.tensor import Axis, CtShapeVar, IntTensor, RealTensor, ShapeVar, Tensor
@@ -220,8 +221,8 @@ class OtPlan:
         dist_expr, _, dist_kwargs = pd._dist_for()
         pd_expr, pd_kwargs, pd_produced = pd._solver_weights_call()
 
-        out = [ "weights", "history", "stats" ] + pd_kwargs[ "output_attributes" ]
-        driver.call(
+        loom.ffi_call(
+            "otplan_solve",
             # `handler` et pas le noyau echafaude par defaut : ce corps EST le handler. Il est du
             # code HOTE -- il a besoin de la `queue`, et il pilote lui-meme son parallelisme ( cent
             # diagrammes dans un seul appel ), donc il n'y a ni foncteur par item ni `run_parallel`
@@ -229,34 +230,34 @@ class OtPlan:
             FfiCode.handler( includes = [ "sdot/otplan/Solve.h" ],
                 sources = [ "sdot/otplan/Lineaire.cpp" ],
                 code = "\n".join( [
-                    "using TK_otplan = std::conditional_t<CT_VALUE( options.kernel_fp_size ) == 64, double, float>;",
+                    "using TK_otplan = std::conditional_t<CT_VALUE( inputs.options.kernel_fp_size ) == 64, double, float>;",
                     f"auto pd_otplan = { pd_expr };",
                     "otplan::OptionsSolveur os;",
                     "otplan::NewtonOptions &no = os.newton;",
-                    "no.tol_abs = double( options.mass_tol ); no.tol_rel = double( options.mass_rtol ); no.t_min = double( options.t_min );",
-                    "no.mult_ok = double( options.mult_ok ); no.facteur = double( options.facteur ); no.beta0 = double( options.beta0 );",
-                    "no.mult_lim = double( options.mult_lim ); no.confiance = double( options.confiance );",
-                    "no.maxit = int( SI( options.max_iter ) ); no.max_reculs = int( SI( options.max_reculs ) );",
-                    "no.pas = int( SI( options.pas ) ); no.trace = SI( options.trace ) != 0;",
-                    "os.lin = otplan::Lin( int( SI( options.lin ) ) ); os.cap0 = SI( options.cap0 );",
-                    "os.continuation = int( SI( options.continuation ) ); os.seuil_continuation = double( options.conv_seuil );",
-                    "os.conv_s0 = double( options.conv_s0 ); os.conv_ratio = double( options.conv_ratio ); os.conv_min = double( options.conv_min );",
-                    f"otplan::resoudre<TK_otplan>( queue, pd_otplan, power_diagram, dom_cell, { dist_expr }, nu, w0, os, weights, history, stats );",
+                    "no.tol_abs = double( inputs.options.mass_tol ); no.tol_rel = double( inputs.options.mass_rtol ); no.t_min = double( inputs.options.t_min );",
+                    "no.mult_ok = double( inputs.options.mult_ok ); no.facteur = double( inputs.options.facteur ); no.beta0 = double( inputs.options.beta0 );",
+                    "no.mult_lim = double( inputs.options.mult_lim ); no.confiance = double( inputs.options.confiance );",
+                    "no.maxit = int( SI( inputs.options.max_iter ) ); no.max_reculs = int( SI( inputs.options.max_reculs ) );",
+                    "no.pas = int( SI( inputs.options.pas ) ); no.trace = SI( inputs.options.trace ) != 0;",
+                    "os.lin = otplan::Lin( int( SI( inputs.options.lin ) ) ); os.cap0 = SI( inputs.options.cap0 );",
+                    "os.continuation = int( SI( inputs.options.continuation ) ); os.seuil_continuation = double( inputs.options.conv_seuil );",
+                    "os.conv_s0 = double( inputs.options.conv_s0 ); os.conv_ratio = double( inputs.options.conv_ratio ); os.conv_min = double( inputs.options.conv_min );",
+                    f"otplan::resoudre<TK_otplan>( queue, pd_otplan, inputs.power_diagram, inputs.dom_cell, { dist_expr }, inputs.nu, inputs.w0, os, "
+                    "outputs.weights, outputs.history, outputs.stats );",
                 ] ) ),
-            name = "otplan_solve",
-            output_attributes = out,
-            output_exceptions = [] if keep_weights else [ "history.weights" ],
-            output_capacities = { "history.nb_steps": int( max_iter ) + 1 },
-            has_dynamic_capacity = False,
             power_diagram = pd,
             dom_cell = dom,
             nu = self._masses,
             w0 = w0,
             options = options,
-            weights = weights,
-            history = history,
-            stats = stats,
-            **pd_kwargs[ "args" ],
+            weights = loom.out( weights ),
+            # les poids de chaque pas ne sont ecrits que si on les a demandes : ne pas nommer
+            # `weights` le laisse observe, donc ni alloue ni lu.
+            history = loom.out( history, *( [ "rows", "weights" ] if keep_weights else [ "rows" ] ),
+                                capacities = { "nb_steps": int( max_iter ) + 1 } ),
+            stats = loom.out( stats ),
+            has_dynamic_capacity = False,
+            **pd_kwargs,
             **dist_kwargs,
         )
         pd._solver_weights_after( pd_produced )

@@ -139,15 +139,17 @@ class PowerDiagram_Bsp( PowerDiagram ):
         wa = RealTensor[ self.tree.num_bsp_node, self.tree.dim ]()
         wb = RealTensor[ self.tree.num_bsp_node ]()
         args = dict( sorted_weights_out = sw, node_wa_out = wa, node_wb_out = wb )
-        expr = "power_diagram.with_weights( sorted_weights_out, node_wa_out, node_wb_out"
+        expr = ( "inputs.power_diagram.with_weights( outputs.sorted_weights_out, outputs.node_wa_out, "
+                 "outputs.node_wb_out" )
         # la memoire aussi ( `memory > 0` ) : le solveur la refait a chaque balayage, dans deux sorties
         # neuves qu'il initialise depuis les souvenirs d'avant
         if self.memo_counts.is_defined:
             nbrs = IntTensor[ self.num_point, self.num_memo, dict( size = 32 ) ]()
             counts = IntTensor[ self.num_point, dict( size = 32 ) ]()
             args.update( memo_nbrs_out = nbrs, memo_counts_out = counts )
-            expr += ", memo_nbrs_out, memo_counts_out"
-        return ( expr + " )", dict( output_attributes = list( args ), args = args ), args )
+            expr += ", outputs.memo_nbrs_out, outputs.memo_counts_out"
+        # les marqueurs portent le role : il n'y a plus de liste de chemins a cote.
+        return ( expr + " )", { n: loom.out( t ) for n, t in args.items() }, args )
 
     def _solver_weights_after( self, produced ):
         self.sorted_weights = produced[ "sorted_weights_out" ].raw

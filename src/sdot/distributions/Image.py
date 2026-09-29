@@ -1,5 +1,6 @@
 import numpy
 
+import loom
 from loom.compilation.FfiCode import FfiCode
 from loom.drivers.driver import driver
 from loom.tensor import Axis, AxisList, CtShapeVar, RealTensor, ShapeVar
@@ -125,15 +126,14 @@ class Image( Distribution ):
 
     def _update_current_mass( self ):
         # res = RealTensor[ tuple( self.batch_axes ) ]()
-        driver.call(
-            FfiCode.per_item( code = "image.current_mass( batch_index ) = image( batch_index ).measure();",
+        loom.ffi_call(
+            "mass",
+            FfiCode.per_item( code = "outputs.image.current_mass( batch_index ) = outputs.image( batch_index ).measure();",
                 ),
-            FfiCode.per_item( "image( batch_index ).measure_bwd( grad_for_image( batch_index ).values, "
-                           "grad_for_image( batch_index ).current_mass );" ),
-            name = "mass",
-            output_attributes = [ "image.current_mass" ],
+            FfiCode.per_item( "outputs.image( batch_index ).measure_bwd( grad_of_outputs.image( batch_index ).values, "
+                           "grad_of_outputs.image( batch_index ).current_mass );" ),
+            image = loom.out( self, "current_mass" ),
             has_dynamic_capacity = False,
-            image = self,
         )
 
     def batch_slice( self, index ):
@@ -193,14 +193,13 @@ class Image( Distribution ):
         cum_axis = Axis( ShapeVar( self.nb_pieces + 1 ), name = "num_cell_cum" )
         cell_cum_mass = RealTensor[ *self.batch_axes, cum_axis ]()
 
-        driver.call(
-            FfiCode.per_item( code = "image( batch_index ).fill_cell_cum_mass( cell_cum_mass( batch_index ) );",
+        loom.ffi_call(
+            "cell_cum_mass",
+            FfiCode.per_item( code = "inputs.image( batch_index ).fill_cell_cum_mass( outputs.cell_cum_mass( batch_index ) );",
             ),
-            name = "cell_cum_mass",
-            output_attributes = [ "cell_cum_mass" ],
-            has_dynamic_capacity = False,
             image = detached,
-            cell_cum_mass = cell_cum_mass,
+            cell_cum_mass = loom.out( cell_cum_mass ),
+            has_dynamic_capacity = False,
         )
         self.cell_cum_mass.set_raw( cell_cum_mass.raw )
 

@@ -52,28 +52,3 @@ class CellScratch( Aggregate ):
         chemins dans celles de l'appel."""
         sc = cls( kernel_fp_size = fp_size( kernel_dtype ), nb_threads = int( nb_threads ), batch_axes = batch_axes )
         return loom.scratch( sc, capacities = { "nb_words": int( nb_words ) } )
-
-    @classmethod
-    def for_flat_call( cls, name, nb_words, kernel_dtype, nb_threads = 1, batch_axes = None ):
-        """LA FORME PLATE, le temps de la migration : `( scratch, kwargs de l'appel )`. Elle
-        disparaît avec le dernier `driver.call` de sdot."""
-        sc = cls( kernel_fp_size = fp_size( kernel_dtype ), nb_threads = int( nb_threads ), batch_axes = batch_axes )
-        return sc, dict(
-            output_capacities = { f"{ name }.nb_words": int( nb_words ) },
-            output_attributes = [ name ],
-            scratch_attributes = [ name ],
-        )
-
-
-def merge_call( base, extra ):
-    """fusionne deux jeux de kwargs de `driver.call` ( capacités, listes de sorties ).
-
-    Ne sert plus qu'aux sites encore en forme plate ; le vocabulaire de marqueurs le rend inutile,
-    puisqu'un rôle porté par la valeur n'a rien à fondre dans quoi que ce soit."""
-    res = dict( base )
-    for k, v in extra.items():
-        if isinstance( v, dict ):
-            res[ k ] = { **res.get( k, {} ), **v }
-        else:
-            res[ k ] = list( res.get( k, [] ) ) + list( v )
-    return res

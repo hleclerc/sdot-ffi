@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, cast, overload
 from sdot.distributions.Distribution import Distribution
 from sdot.distributions.SumOfDiracs import SumOfDiracs
 
+import loom
 from loom.tensor import CtShapeVar
 from loom.tensor import ShapeVar
 from loom.tensor import AxisList
@@ -153,8 +154,11 @@ class OtPlan1d( Aggregate ):
         # `barycenters` is produced only when asked for: including it in `output_attributes` binds it
         # as an OUTPUT (the forward writes it, guarded on `is_valid` C++-side); leaving it out keeps
         # it a NoneTensor, and the backward recomputes b_i. This is what the flag decides.
-        barycenters_out = [ "plan.barycenters" ] if self._with_barycenters else []
-        group_size_expr = "num_local_marker.shape( 0 )"   # une expression C++, lue sur un argument
+        # CE QUE LE NOYAU ECRIT DANS `plan`, nomme POSITIVEMENT. `barycenters` n'est produit que
+        # si on le demande : ne pas le nommer le laisse `NoneTensor` ( le forward le garde sous
+        # `is_valid` cote C++ ) et l'adjoint recalcule b_i. C'est ce que le drapeau decide.
+        ecrit = [ "cost", "nb_diracs" ] + ( [ "barycenters" ] if self._with_barycenters else [] )
+        group_size_expr = "scratch.num_local_marker.shape( 0 )"   # une expression C++, lue sur un argument
 
         # LA GEOMETRIE DE LANCEMENT, ecrite une fois et donnee aux DEUX sens. Ici ils la partagent,
         # mais ce n'est plus impose : un adjoint est un `FfiCode` entier et peut avoir la sienne.
@@ -166,45 +170,39 @@ class OtPlan1d( Aggregate ):
         # `group_scan` ( scratch global ordinaire, pas de la memoire locale ).
         #
         # C'est un CORPS de methode C++ ( voir `FfiCode` ) : les arguments de l'appel y sont en
-        # portee sous leurs noms, et le calcul se lit. `256` reste `NB_BUCKETS` recopie a la main
-        # depuis `OtPlan1d.cxx`, et `subgroup_size` un litteral fige pour ce device -- mais puisque
-        # ceci est du C++, inclure l'en-tete qui declare `NB_BUCKETS` fera disparaitre la copie.
+        # portee sous leurs noms -- donc sous leur GROUPE -- et le calcul se lit.
         geometrie_cooperative = dict(
-            max_nb_threads = "return sorted_indices.shape( 0 );",
+            max_nb_threads = "return scratch.sorted_indices.shape( 0 );",
             group_size = f"return { group_size_expr };",
             local_mem_elems = ( f"const int gs = { group_size_expr };\n"
                                 f"        const int sg = { driver.device.subgroup_size };\n"
                                 f"        return ( 2 * ( ( gs + sg - 1 ) / sg ) + 1 ) * 256;" ),
         )
-        driver.call(
-            FfiCode.per_item( # `scratch( group_index )` yields this work-GROUP's shared rank-1 row (`scratch( k )`
-                # inside, cooperatively). `plan( batch_index )` still picks the angle. The backward
-                # RE-SORTS into its OWN fresh scratch, so it needs all of them -- they are no longer
-                # residuals (per-group, their forward content is transient). `local_index`/`local_size`/
-                # `group`/`local_scratch` are the reserved cooperative params (see FfiCode).
-                # `group_scan` backs the parallel sweep (see `_scratch`'s docstring); `cell_cum_mass`
-                # is read straight off `plan(batch_index).dst_dist`, not passed in here.
-                code = ( "plan( batch_index ).update_outputs( sorted_indices( group_index ), radix_tmp( group_index ), sorted_pos( group_index ), "
-                            "group_scan( group_index ), "
+        loom.ffi_call(
+            "update_outputs_OtPlan1d",
+            FfiCode.per_item( # `scratch.<x>( group_index )` yields this work-GROUP's shared rank-1 row.
+                # `plan( batch_index )` still picks the angle. The backward RE-SORTS into its OWN
+                # fresh scratch, so it needs all of them -- they are no longer residuals (per-group,
+                # their forward content is transient). `local_index`/`local_size`/`group`/
+                # `local_scratch` are the reserved cooperative params (see FfiCode). `group_scan`
+                # backs the parallel sweep (see `_scratch`'s docstring); `cell_cum_mass` is read
+                # straight off `plan(batch_index).dst_dist`, not passed in here.
+                code = ( "outputs.plan( batch_index ).update_outputs( scratch.sorted_indices( group_index ), scratch.radix_tmp( group_index ), scratch.sorted_pos( group_index ), "
+                            "scratch.group_scan( group_index ), "
                             "local_index, local_size, group, local_scratch, sub_group );" ),
                 **geometrie_cooperative ),
-            FfiCode.per_item( code = ( "plan( batch_index ).update_outputs_bwd( grad_for_plan( batch_index ), sorted_indices( group_index ), radix_tmp( group_index ), sorted_pos( group_index ), "
-                            "group_scan( group_index ), "
+            FfiCode.per_item( code = ( "outputs.plan( batch_index ).update_outputs_bwd( grad_of_outputs.plan( batch_index ), scratch.sorted_indices( group_index ), scratch.radix_tmp( group_index ), scratch.sorted_pos( group_index ), "
+                            "scratch.group_scan( group_index ), "
                             "local_index, local_size, group, local_scratch, sub_group );" ),
-                    prologue = "plan.src_dist.zero_position_grad( queue, grad_for_plan.src_dist );",
+                    prologue = "outputs.plan.src_dist.zero_position_grad( queue, grad_of_outputs.plan.src_dist );",
                     **geometrie_cooperative ),
-            name = "update_outputs_OtPlan1d",
-            output_attributes = barycenters_out + [ "plan.cost", "plan.nb_diracs", "sorted_indices", "radix_tmp", "sorted_pos", "num_local_marker", "group_scan" ],
-            # the scratch buffers are per-group transient: the backward re-allocates them fresh instead
-            # of reading the forward's (stale) values as residuals -- see `_call_backward`. `sorted_pos`
-            # caches the sorted 1D positions so the sweeps STREAM them (no re-projection).
-            # `num_local_marker`/`group_scan` are transient too.
-            scratch_attributes = [ "sorted_indices", "radix_tmp", "sorted_pos", "num_local_marker", "group_scan" ],
-            # every output count is prescribed from `nb_diracs`, so no capacity can overflow: skip the
-            # per-call run-time overflow check (a device->host sync under jit). See driver.call.
+            plan = loom.out( self, *ecrit ),
+            # les tampons sont transitoires PAR GROUPE : l'adjoint les re-alloue frais au lieu de
+            # lire les valeurs ( perimees ) de l'aller comme des residus -- voir `_call_backward`.
+            **{ n: loom.scratch( t ) for n, t in self._scratch().items() },
+            # chaque compte de sortie est prescrit depuis `nb_diracs`, donc aucune capacite ne peut
+            # deborder : on saute le test d'execution ( une synchro device -> hote par appel ).
             has_dynamic_capacity = False,
-            plan = self,
-            **self._scratch(),
         )
 
     def _update_outputs_via_angle_loop( self ):
@@ -273,7 +271,7 @@ class OtPlan1d( Aggregate ):
         `positions[jnp.argsort(positions)]` upstream).
         """
         self.dst_dist.ensure_cell_cum_mass()
-        group_size_expr = "num_local_marker.shape( 0 )"   # une expression C++, lue sur un argument
+        group_size_expr = "scratch.num_local_marker.shape( 0 )"   # une expression C++, lue sur un argument
         gs = driver.device.group_size( nb_shared_bytes_per_subgroup = 0, nb_shared_bytes_fixed = 0 )
         # ONE group only: this call handles a SINGLE angle (the caller's `lax.scan` supplies the outer
         # angle loop), so there is no "concurrent angles" axis to size `num_group` on (contrast
@@ -286,26 +284,23 @@ class OtPlan1d( Aggregate ):
         # mais ce n'est plus impose -- un adjoint est un `FfiCode` entier et peut avoir la sienne.
         # no `sort_diracs` here (order already given) -> no radix-bucket local scratch needed.
         geometrie_presortee = dict(
-            max_nb_threads = "return sorted_indices.shape( 0 );",
+            max_nb_threads = "return inputs.sorted_indices.shape( 0 );",
             group_size = f"return { group_size_expr };",
             local_mem_elems = "return 0;",
         )
-        driver.call(
-            FfiCode.per_item( code = ( "plan( batch_index ).update_outputs_presorted( sorted_indices( group_index ), sorted_pos( group_index ), "
-                            "group_scan( group_index ), "
+        loom.ffi_call(
+            "update_outputs_presorted_OtPlan1d",
+            FfiCode.per_item( code = ( "outputs.plan( batch_index ).update_outputs_presorted( inputs.sorted_indices( group_index ), inputs.sorted_pos( group_index ), "
+                            "scratch.group_scan( group_index ), "
                             "local_index, local_size, group );" ),
                 **geometrie_presortee,
             ),
-            FfiCode.per_item( code = ( "plan( batch_index ).update_outputs_bwd_presorted( grad_for_plan( batch_index ), sorted_indices( group_index ), sorted_pos( group_index ), "
-                            "group_scan( group_index ), "
+            FfiCode.per_item( code = ( "outputs.plan( batch_index ).update_outputs_bwd_presorted( grad_of_outputs.plan( batch_index ), inputs.sorted_indices( group_index ), inputs.sorted_pos( group_index ), "
+                            "scratch.group_scan( group_index ), "
                             "local_index, local_size, group );" ),
-                    prologue = "plan.src_dist.zero_position_grad( queue, grad_for_plan.src_dist );",
+                    prologue = "outputs.plan.src_dist.zero_position_grad( queue, grad_of_outputs.plan.src_dist );",
                     **geometrie_presortee ),
-            name = "update_outputs_presorted_OtPlan1d",
-            output_attributes = [ "plan.cost", "plan.nb_diracs", "num_local_marker", "group_scan" ],
-            scratch_attributes = [ "num_local_marker", "group_scan" ],
-            has_dynamic_capacity = False,
-            plan = self,
+            plan = loom.out( self, "cost", "nb_diracs" ),
             # `Tensor.wrap` only takes axis NAME strings (it mints fresh, detached axes) -- use the SAME
             # names as `num_group`/`self.num_dirac` above so `CallArgsAnalysis` unifies them by name
             # with this call's other tensors instead of minting disconnected ShapeVars.
@@ -313,6 +308,7 @@ class OtPlan1d( Aggregate ):
                                            [ num_group.name, self.num_dirac.name ], dtype = int ),
             sorted_pos = Tensor.wrap( sorted_pos if sorted_pos.ndim == 2 else sorted_pos[ None ],
                                        [ num_group.name, self.num_dirac.name ] ),
-            num_local_marker = IntTensor[ num_local ](),
-            group_scan = RealTensor[ num_group, num_scan ](),
+            num_local_marker = loom.scratch( IntTensor[ num_local ]() ),
+            group_scan = loom.scratch( RealTensor[ num_group, num_scan ]() ),
+            has_dynamic_capacity = False,
         )
