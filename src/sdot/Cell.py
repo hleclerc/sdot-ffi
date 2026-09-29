@@ -19,12 +19,13 @@ cellule n'est pas bornée.
 import os
 
 import numpy as np
+import loom
 from loom.compilation.FfiCode import FfiCode
 from loom.drivers.driver import driver
 from loom.tensor import Axis, RealTensor, ShapeVar, Tensor
 from loom.util import Aggregate
 
-from .CellScratch import CellScratch, fp_size, merge_call
+from .CellScratch import CellScratch, fp_size
 from . import cell_viz
 
 # les identifiants de coupe qui ne désignent pas un germe -- voir `cell/Ids.h`, qui fait foi
@@ -137,9 +138,10 @@ class Cell( Aggregate ):
             return max( int( n ), 1 )
         return int( self.nb_cuts.allocated_capacity() or self.init_capacity() )
 
-    def _call_scratch( self, name, cap ):
-        """le scratch d'un appel sur CETTE cellule : une ligne par item, `cap` sommets"""
-        return CellScratch.for_call( name, self.scratch_words( cap, fp_size( self._kernel_dtype ) ),
+    def _call_scratch( self, cap ):
+        """le scratch d'un appel sur CETTE cellule : une ligne par item, `cap` sommets.
+        Déjà marqué `loom.scratch`, donc il se passe sous son nom et rien d'autre."""
+        return CellScratch.for_call( self.scratch_words( cap, fp_size( self._kernel_dtype ) ),
                                      self._kernel_dtype, batch_axes = self.batch_axes or None )
 
     # ---- les kernels ------------------------------------------------------------------------------
@@ -155,15 +157,11 @@ class Cell( Aggregate ):
         if batch_axes is not None:
             self.apply_batch_axes( batch_axes )
         cap = self.dim + 1
-        scratch, sc_kwargs = self._call_scratch( "scratch", cap )
-        driver.call(
-            FfiCode.per_item( code = "cell( batch_index ).init_as_unbounded( scratch( batch_index ) );" ),
-            name = "init_as_unbounded",
-            **merge_call( dict(
-                output_capacities = { "cell.nb_vertices": cap, "cell.nb_cuts": cap },
-                output_attributes = [ "cell" ] ), sc_kwargs ),
-            cell = self,
-            scratch = scratch,
+        loom.ffi_call(
+            "init_as_unbounded",
+            FfiCode.per_item( code = "outputs.cell( batch_index ).init_as_unbounded( scratch.scratch( batch_index ) );" ),
+            cell = loom.out( self, capacities = { "nb_vertices": cap, "nb_cuts": cap } ),
+            scratch = self._call_scratch( cap ),
         )
 
     def init_as_hypercube( self, origin = None, axes = None, cut_id = BOUNDARY, batch_axes = None ):
@@ -177,18 +175,14 @@ class Cell( Aggregate ):
         axes = RealTensor[ self.dim_axis, Axis( ShapeVar( d ), name = "num_axis" ) ]( np.eye( d ) if axes is None else axes )
 
         cap = self.init_capacity()
-        scratch, sc_kwargs = self._call_scratch( "scratch", cap )
-        driver.call(
-            FfiCode.per_item( code = "cell( batch_index ).init_as_hypercube( scratch( batch_index ), origin, axes, cut_id );" ),
-            name = "init_as_hypercube",
-            **merge_call( dict(
-                output_capacities = { "cell.nb_vertices": cap, "cell.nb_cuts": cap },
-                output_attributes = [ "cell" ] ), sc_kwargs ),
+        loom.ffi_call(
+            "init_as_hypercube",
+            FfiCode.per_item( code = "outputs.cell( batch_index ).init_as_hypercube( scratch.scratch( batch_index ), inputs.origin, inputs.axes, inputs.cut_id );" ),
+            cell = loom.out( self, capacities = { "nb_vertices": cap, "nb_cuts": cap } ),
+            scratch = self._call_scratch( cap ),
             cut_id = cut_id,
             origin = origin,
             axes = axes,
-            cell = self,
-            scratch = scratch,
         )
 
     def cut( self, direction, offset, cut_id = BOUNDARY ):
@@ -204,19 +198,16 @@ class Cell( Aggregate ):
 
         cap_v, cap_c = self._cut_capacities()
         res = self._empty_like_me()
-        scratch, sc_kwargs = self._call_scratch( "scratch", max( cap_v, cap_c ) )
-        driver.call(
-            FfiCode.per_item( code = "cell( batch_index ).cut( res( batch_index ), scratch( batch_index ), direction, offset, cut_id );" ),
-            name = "cut",
-            **merge_call( dict(
-                output_capacities = { "res.nb_vertices": cap_v, "res.nb_cuts": cap_c },
-                output_attributes = [ "res" ] ), sc_kwargs ),
+        loom.ffi_call(
+            "cut",
+            FfiCode.per_item( code = "inputs.cell( batch_index ).cut( outputs.res( batch_index ), scratch.scratch( batch_index ), "
+                                     "inputs.direction, inputs.offset, inputs.cut_id );" ),
             cut_id = cut_id,
             direction = direction,
             offset = offset,
             cell = self,
-            res = res,
-            scratch = scratch,
+            res = loom.out( res, capacities = { "nb_vertices": cap_v, "nb_cuts": cap_c } ),
+            scratch = self._call_scratch( max( cap_v, cap_c ) ),
         )
         self._adopt_geometry( res )
         return self
@@ -237,17 +228,14 @@ class Cell( Aggregate ):
         que soit celui du noyau. `TF::max` pour une cellule non bornée. Dérivable par rapport à
         `vertex_positions`."""
         res = RealTensor[ tuple( self.batch_axes ) ]()
-        scratch, sc_kwargs = self._call_scratch( "scratch", max( self._cap_v(), self._cap_c() ) )
-        driver.call(
-            FfiCode.per_item( code = "cell( batch_index ).measure( res( batch_index ), scratch( batch_index ) );",
-                ),
-            FfiCode.per_item( "cell( batch_index ).measure_bwd( res( batch_index ), grad_for_res( batch_index ), "
-                           "grad_for_cell( batch_index ).vertex_positions, scratch( batch_index ) );" ),
-            name = "measure",
-            **merge_call( dict( output_attributes = [ "res" ] ), sc_kwargs ),
+        loom.ffi_call(
+            "measure",
+            FfiCode.per_item( code = "inputs.cell( batch_index ).measure( outputs.res( batch_index ), scratch.scratch( batch_index ) );" ),
+            FfiCode.per_item( "inputs.cell( batch_index ).measure_bwd( outputs.res( batch_index ), grad_of_outputs.res( batch_index ), "
+                              "grad_of_inputs.cell( batch_index ).vertex_positions, scratch.scratch( batch_index ) );" ),
             cell = self,
-            res = res,
-            scratch = scratch,
+            res = loom.out( res ),
+            scratch = self._call_scratch( max( self._cap_v(), self._cap_c() ) ),
         )
         return res
 

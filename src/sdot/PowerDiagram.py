@@ -253,7 +253,7 @@ class PowerDiagram( Aggregate ):
         # l'axe des work-items est un axe de BATCH porté par le scratch : `thread_index` /
         # `nb_threads` sont le rang de ce work-item et leur nombre, la boucle striée se lit dessus
         num_thread = new_batch_axis( nt, prefix = "thread" )
-        scratch, sc_kwargs = CellScratch.for_call( "scratch", nb_words, dom.kernel_dtype, batch_axes = [ num_thread ] )
+        scratch, sc_kwargs = CellScratch.for_flat_call( "scratch", nb_words, dom.kernel_dtype, batch_axes = [ num_thread ] )
 
         res = RealTensor[ self.num_point ]()
         dist_expr, grad_dist_expr, dist_kwargs = self._dist_for()
@@ -293,7 +293,7 @@ class PowerDiagram( Aggregate ):
         nb_words = self._scratch_words( self._scratch_capacity, self._nb_work_cells(), False )
         nt = driver.device.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ self.num_point ] )
         num_thread = new_batch_axis( nt, prefix = "thread" )
-        scratch, sc_kwargs = CellScratch.for_call( "scratch", nb_words, dom.kernel_dtype, batch_axes = [ num_thread ] )
+        scratch, sc_kwargs = CellScratch.for_flat_call( "scratch", nb_words, dom.kernel_dtype, batch_axes = [ num_thread ] )
 
         mass = RealTensor[ self.num_point ]()
         first = RealTensor[ self.num_point, self.dim ]()
@@ -331,7 +331,7 @@ class PowerDiagram( Aggregate ):
 
         nb_words = self._scratch_words( cap, self._nb_work_cells(), False )
         nt = driver.device.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ num_cell ] )
-        scratch, sc_kwargs = CellScratch.for_call( "scratch", nb_words, dom.kernel_dtype, nb_threads = nt )
+        scratch, sc_kwargs = CellScratch.for_flat_call( "scratch", nb_words, dom.kernel_dtype, nb_threads = nt )
         dist_expr, _, dist_kwargs = self._dist_for()
 
         driver.call(
@@ -373,7 +373,7 @@ class PowerDiagram( Aggregate ):
 
         nb_words = self._scratch_words( cap, 1, False )
         nt = driver.device.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ num_cell ] )
-        scratch, sc_kwargs = CellScratch.for_call( "scratch", nb_words, dom.kernel_dtype, nb_threads = nt )
+        scratch, sc_kwargs = CellScratch.for_flat_call( "scratch", nb_words, dom.kernel_dtype, nb_threads = nt )
 
         driver.call(
             FfiCode.per_item( code = "power_diagram.build_cell( SI( ranks( batch_index ) ), dom_cell, cells( batch_index ), "

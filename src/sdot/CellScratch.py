@@ -8,6 +8,7 @@ découpe ( `cell/Scratch.h` ). Sa taille est décidée par l'hôte, avec la form
 débordement pour un diagramme entier.
 """
 
+import loom
 from loom.tensor import Axis, CtShapeVar, IntTensor, ShapeVar
 from loom.util import Aggregate
 
@@ -40,9 +41,22 @@ class CellScratch( Aggregate ):
     kernel_fp_size : CtShapeVar
 
     @classmethod
-    def for_call( cls, name, nb_words, kernel_dtype, nb_threads = 1, batch_axes = None ):
-        """`( scratch, kwargs de l'appel )` : ce qu'un `driver.call` ajoute pour recevoir un scratch
-        de `nb_words` mots par ligne, `nb_threads` lignes ( batché sur `batch_axes` si l'appel l'est )."""
+    def for_call( cls, nb_words, kernel_dtype, nb_threads = 1, batch_axes = None ):
+        """Le scratch d'un appel, DÉJÀ MARQUÉ : `nb_words` mots par ligne, `nb_threads` lignes
+        ( batché sur `batch_axes` si l'appel l'est ), prêt à être passé sous le nom que le noyau
+        lui donne -- `scratch = CellScratch.for_call( ... )`.
+
+        Il n'y a plus de `name` à répéter : le rôle est porté par la VALEUR, donc le nom de
+        l'argument est le nom, et rien ne peut plus se désaccorder entre les deux. C'est aussi ce
+        qui a fait disparaître `merge_call`, dont l'unique métier était de fondre ces listes de
+        chemins dans celles de l'appel."""
+        sc = cls( kernel_fp_size = fp_size( kernel_dtype ), nb_threads = int( nb_threads ), batch_axes = batch_axes )
+        return loom.scratch( sc, capacities = { "nb_words": int( nb_words ) } )
+
+    @classmethod
+    def for_flat_call( cls, name, nb_words, kernel_dtype, nb_threads = 1, batch_axes = None ):
+        """LA FORME PLATE, le temps de la migration : `( scratch, kwargs de l'appel )`. Elle
+        disparaît avec le dernier `driver.call` de sdot."""
         sc = cls( kernel_fp_size = fp_size( kernel_dtype ), nb_threads = int( nb_threads ), batch_axes = batch_axes )
         return sc, dict(
             output_capacities = { f"{ name }.nb_words": int( nb_words ) },
@@ -52,7 +66,10 @@ class CellScratch( Aggregate ):
 
 
 def merge_call( base, extra ):
-    """fusionne deux jeux de kwargs de `driver.call` ( capacités, listes de sorties )"""
+    """fusionne deux jeux de kwargs de `driver.call` ( capacités, listes de sorties ).
+
+    Ne sert plus qu'aux sites encore en forme plate ; le vocabulaire de marqueurs le rend inutile,
+    puisqu'un rôle porté par la valeur n'a rien à fondre dans quoi que ce soit."""
     res = dict( base )
     for k, v in extra.items():
         if isinstance( v, dict ):
