@@ -79,8 +79,8 @@ class SumOfDiracs( Distribution ):
         # positions" case.
         if int( self.nb_dims.value ) != 1 or not self.weights.is_defined:
             return None
-        positions = self.positions.tensor[ ..., 0 ]
-        weights = self.weights.tensor
+        positions = self.positions.value[ ..., 0 ]
+        weights = self.weights.value
         if positions.ndim > 1:
             return weights, { "positions": positions }, lambda extra: extra[ "positions" ]
         return weights, {}, lambda extra: positions

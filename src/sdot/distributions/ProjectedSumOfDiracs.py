@@ -87,9 +87,9 @@ class ProjectedSumOfDiracs( Distribution ):
         if not self.weights.is_defined:
             return None
         import jax.numpy as jnp
-        points = self.points.tensor
-        normal = self.normal.tensor
-        weights = self.weights.tensor
+        points = self.points.value
+        normal = self.normal.value
+        weights = self.weights.value
         if normal.ndim > 1:
             return weights, { "normal": normal }, lambda extra: jnp.einsum( "n p, p -> n", points, extra[ "normal" ] )
         return weights, {}, lambda extra: jnp.einsum( "n p, p -> n", points, normal )
@@ -101,6 +101,6 @@ class ProjectedSumOfDiracs( Distribution ):
             return None
         return ProjectedSumOfDiracs(
             points = self.points,
-            normal = Tensor.wrap( self.normal.tensor[ index ], [ self.proj_dim.name ] ),
+            normal = Tensor.wrap( self.normal.value[ index ], [ self.proj_dim.name ] ),
             weights = self.weights if self.weights.is_defined else None,
         )

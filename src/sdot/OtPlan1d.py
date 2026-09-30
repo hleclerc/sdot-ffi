@@ -235,10 +235,10 @@ class OtPlan1d( Aggregate ):
             src_i = self.src_dist.batch_slice( index )
             dst_i = self.dst_dist.batch_slice( index )
             plan_i = OtPlan1d( src_i, dst_i, with_barycenters = with_barycenters )
-            # `.raw`, not `.tensor`: `plan.nb_diracs` is itself a kernel OUTPUT (re-confirmed
+            # `.raw`, not `.value`: `plan.nb_diracs` is itself a kernel OUTPUT (re-confirmed
             # device-side, see `update_outputs`'s `output_attributes`), so under this trace it is
-            # no longer the static host int `.tensor` needs to slice `barycenters` down to its
-            # logical shape (`.tensor`'s own docstring: "a kernel-written count is a device value
+            # no longer the static host int `.value` needs to slice `barycenters` down to its
+            # logical shape (`.value`'s own docstring: "a kernel-written count is a device value
             # under a trace, where Python cannot slice by it"). `.raw` reads the buffer as
             # allocated instead -- exactly the logical shape here anyway, since every count in
             # this call is prescribed from `nb_diracs` with no capacity slack.

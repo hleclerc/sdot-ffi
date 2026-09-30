@@ -14,7 +14,7 @@ set_kernel_dtype( "FP64" )
 
 
 def _measures( v ):
-    return numpy.asarray( v.measures.tensor ).reshape( -1 )
+    return numpy.asarray( v.measures.value ).reshape( -1 )
 
 
 def _monte_carlo_measures( pos, mi, ma, weights = None, nb_samples = 200000, seed = 0 ):
@@ -106,7 +106,7 @@ if test( "a_box_domain_survives_driver_jit" ):
     bnd = box_half_spaces( [ 0, 0 ], [ 1, 1 ] )
 
     def loss( w ):
-        return PowerDiagram( pos, w, boundaries = bnd ).measures.tensor.sum()
+        return PowerDiagram( pos, w, boundaries = bnd ).measures.value.sum()
 
     w0 = numpy.zeros( 10 )
     eager  = float( loss( w0 ) )
@@ -367,7 +367,7 @@ def _facets_2d( pd, n ):
 def _jacobian( f, x, nb_rows ):
     """La jacobienne de `f` en `x`, ligne par ligne : `nb_rows` passages de l'adjoint, chacun avec
     une cotangente un-hot. On la matérialise parce qu'on a de quoi la comparer terme à terme."""
-    _, pullback = driver.vjp( lambda a: f( a ).tensor, x )
+    _, pullback = driver.vjp( lambda a: f( a ).value, x )
     rows = []
     for i in range( nb_rows ):
         seed = numpy.zeros( nb_rows )
@@ -470,7 +470,7 @@ if test( "the_domain_carries_no_gradient" ):
     dirs = numpy.array( [ [ 1.0, 0 ], [ 0, 1.0 ], [ -1.0, 0 ], [ 0, -1.0 ] ] )
     offs = numpy.array( [ 1.0, 1.0, 0.0, 0.0 ] )
     _, pullback = driver.vjp(
-        lambda o: PowerDiagram( pos, boundaries = ( dirs, o ) ).measures.tensor, offs )
+        lambda o: PowerDiagram( pos, boundaries = ( dirs, o ) ).measures.value, offs )
     assert numpy.abs( numpy.asarray( pullback( numpy.ones( n ) )[ 0 ] ) ).max() == 0
 
 
@@ -508,7 +508,7 @@ if test( "cells_measure_like_measures" ):
         rng = numpy.random.default_rng( 11 )
         pos = rng.uniform( 0.1, 0.9, size = ( 20, d ) )
         v = Voronoi( pos, boundaries = box_half_spaces( [ 0 ] * d, [ 1 ] * d ) )
-        got = numpy.asarray( v.cells.measure.tensor ).reshape( -1 )
+        got = numpy.asarray( v.cells.measure.value ).reshape( -1 )
         assert numpy.allclose( got, _measures( v ) ), d
         assert abs( float( got.sum() ) - 1 ) < 1e-10
 
@@ -532,7 +532,7 @@ if test( "weighted_cells_are_the_weighted_cells" ):
         w = rng.uniform( -0.06, 0.06, size = 14 )
         w[ 3 ] = -2.0                                  # celui-là ne gagne nulle part
         pd = PowerDiagram( pos, weights = w, boundaries = box_half_spaces( [ 0 ] * d, [ 1 ] * d ) )
-        got = numpy.asarray( pd.cells.measure.tensor ).reshape( -1 )
+        got = numpy.asarray( pd.cells.measure.value ).reshape( -1 )
         assert numpy.allclose( got, _measures( pd ), atol = 1e-12 ), d
         assert abs( float( got[ 3 ] ) ) < 1e-14, ( d, got[ 3 ] )
         assert abs( float( got.sum() ) - 1 ) < 1e-10, d
@@ -881,8 +881,8 @@ if test( "an_accelerated_diagram_draws_the_same_cells" ):
     pos = rng.uniform( 0.05, 0.95, size = ( 40, 2 ) )
     w = rng.uniform( -0.02, 0.02, 40 )
     plain, fast = _both_ways( pos, w, box_half_spaces( [ 0, 0 ], [ 1, 1 ] ) )
-    a = numpy.asarray( plain.cells.measure.tensor ).reshape( -1 )
-    b = numpy.asarray( fast.cells.measure.tensor ).reshape( -1 )
+    a = numpy.asarray( plain.cells.measure.value ).reshape( -1 )
+    b = numpy.asarray( fast.cells.measure.value ).reshape( -1 )
     assert numpy.allclose( a, b, atol = 1e-9 )
     assert numpy.allclose( b, _measures( fast ), atol = 1e-9 )
 
@@ -939,7 +939,7 @@ if p := bench( "pd accelerated",
             t = time.perf_counter()
             if w is not None:
                 pd.weights = w
-            m = numpy.asarray( pd.measures.tensor )
+            m = numpy.asarray( pd.measures.value )
             return time.perf_counter() - t, m.reshape( -1 )
         once()                                          # chauffe : c'est celui-là qui compile
         once()                                          # et celui-ci qui remplit la mémoire ( `memory` )
@@ -1699,7 +1699,7 @@ if test( "the_float_kernel_tiles_the_domain" ):
             m = _measures( pd )
             assert abs( float( m.sum() ) - 1 ) < 1e-6, ( d, kd, m.sum() )
             # la mesure elle-même est dans le flottant des positions, pas dans celui du noyau
-            assert numpy.asarray( pd.measures.tensor ).dtype == numpy.float64
+            assert numpy.asarray( pd.measures.value ).dtype == numpy.float64
             ref = _measures( PowerDiagram( pos, weights = w, boundaries = box_half_spaces( [ 0 ] * d, [ 1 ] * d ), kernel_dtype = "FP64" ) )
             assert numpy.abs( m - ref ).max() < 2e-6, ( d, kd )
 

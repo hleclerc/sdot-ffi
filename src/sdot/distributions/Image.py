@@ -147,8 +147,8 @@ class Image( Distribution ):
         for name in ( "origin", "frame", "knots" ):
             attr = getattr( self, name )
             if attr.is_defined:
-                kwargs[ name ] = attr.tensor
-        return Image( values = self.values.tensor[ index ], **kwargs )
+                kwargs[ name ] = attr.value
+        return Image( values = self.values.value[ index ], **kwargs )
 
     def ensure_cell_cum_mass( self ):
         """Materializes `cell_cum_mass` (a lazy `ComputedAttribute`, mirrors `mass`/`current_mass`)
@@ -172,11 +172,11 @@ class Image( Distribution ):
         for name in ( "origin", "frame", "knots" ):
             attr = getattr( self, name )
             if attr.is_defined:
-                detached_kwargs[ name ] = driver.stop_gradient( attr.tensor )
+                detached_kwargs[ name ] = driver.stop_gradient( attr.value )
         detached = Image(
             nb_dims = self.nb_dims.value,
             shape = self.shape.value,
-            values = driver.stop_gradient( self.values.tensor ),
+            values = driver.stop_gradient( self.values.value ),
             batch_axes = self.batch_axes,
             **detached_kwargs,
         )
@@ -239,9 +239,9 @@ class Image( Distribution ):
         import jax
         from ._pure_jax_cost1d import cost_1d_ot
 
-        values = self.values.tensor
-        s_min = self.origin.tensor[ 0 ] if self.origin.is_defined else 0.0
-        dw = self.frame.tensor[ 0, 0 ] if self.frame.is_defined else 1.0
+        values = self.values.value
+        s_min = self.origin.value[ 0 ] if self.origin.is_defined else 0.0
+        dw = self.frame.value[ 0, 0 ] if self.frame.is_defined else 1.0
 
         if self.batch_axes:
             # only the genuinely PER-ANGLE leaves are mapped (`lax.map` requires every leaf of

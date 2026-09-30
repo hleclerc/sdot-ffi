@@ -45,7 +45,7 @@ if test( "unbounded_1D" ):
 
 if test( "batch" ):
     c = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 2, 0 ], [ 0, 1 ] ], batch_axes = [ new_batch_axis( 2 ) ] )
-    assert tuple( c.measure.tensor ) == ( 2, 2 )
+    assert tuple( c.measure.value ) == ( 2, 2 )
     assert c.nb_items == 2 and numpy.allclose( c.vertices( 1 ), c.vertices( 0 ) )
 
 def _cell_with_coords( d, coords, cut_ids, vertex_cuts = None, vertex_nbrs = None ):
@@ -63,8 +63,8 @@ if test( "grad_measure" ):
     # l'adjoint du lacet, vérifié par différence finie sur les coordonnées elles-mêmes
     c = Cell.make_hypercube( 2, [ 0.3, -0.2 ], [ [ 2.0, 0.1 ], [ -0.3, 1.0 ] ] )
     c.cut( [ 1, 1 ], 1.5 )
-    coords = driver.array( numpy.asarray( c.vertex_positions.tensor ) )
-    ids = numpy.asarray( c.cut_ids.tensor )
+    coords = driver.array( numpy.asarray( c.vertex_positions.value ) )
+    ids = numpy.asarray( c.cut_ids.value )
     check_grad( lambda x: _cell_with_coords( 2, x, ids ).measure, coords )
 
 if p := test( "cut" ):
@@ -222,7 +222,7 @@ if test( "cut_batched" ):
     c = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 1, 0 ], [ 0, 1 ] ], batch_axes = [ new_batch_axis( nb_items ) ] )
     c.cut( [ 1, 1 ], 1.5 )
 
-    m = numpy.asarray( c.measure.tensor )
+    m = numpy.asarray( c.measure.value )
     assert m.shape == ( nb_items, )
     assert numpy.allclose( m, 0.875 )
 
@@ -239,7 +239,7 @@ if test( "the_float_kernel_cuts_the_same_cells" ):
         assert numpy.allclose( a.vertices(), b.vertices(), atol = 1e-6 )
         assert abs( float( a.measure ) - float( b.measure ) ) < 1e-6
         # ... et la mesure sort dans le flottant de l'appelant, pas dans celui du noyau
-        assert numpy.asarray( a.measure.tensor ).dtype == numpy.float64
+        assert numpy.asarray( a.measure.value ).dtype == numpy.float64
 
 
 # -- l'oracle des tests d > 2 -----------------------------------------------------------------
@@ -299,7 +299,7 @@ def _check_against_reference( c, planes, name, exact = True ):
     vi = c.vertex_cut_indices
     ev = c.edges
     cd, co = c.cut_planes
-    ci = numpy.asarray( c.cut_ids.tensor )
+    ci = numpy.asarray( c.cut_ids.value )
     d = vp.shape[ 1 ]
 
     dirs, offs, ref, ref_on = _reference_cell( planes )
@@ -640,9 +640,9 @@ if test( "grad_measure_nd" ):
     for d in ( 3, 4 ):
         c = Cell.make_hypercube( d, numpy.zeros( d ), numpy.eye( d ) + 0.07 * numpy.arange( d * d ).reshape( d, d ) / ( d * d ) )
         c.cut( numpy.linspace( 0.8, 1.3, d ).tolist(), float( d ) - 0.7 )
-        coords = driver.array( numpy.asarray( c.vertex_positions.tensor ) )
-        ids = numpy.asarray( c.cut_ids.tensor )
-        vc, vn = numpy.asarray( c.vertex_cuts.tensor ), numpy.asarray( c.vertex_nbrs.tensor )
+        coords = driver.array( numpy.asarray( c.vertex_positions.value ) )
+        ids = numpy.asarray( c.cut_ids.value )
+        vc, vn = numpy.asarray( c.vertex_cuts.value ), numpy.asarray( c.vertex_nbrs.value )
         check_grad( lambda x: _cell_with_coords( d, x, ids, vc, vn ).measure, coords )
 
 if test( "measure_nd_batched" ):
@@ -651,7 +651,7 @@ if test( "measure_nd_batched" ):
                              batch_axes = [ new_batch_axis( nb_items ) ] )
     c.cut( [ 1, 1, 1 ], 2.5 )
 
-    m = numpy.asarray( c.measure.tensor )
+    m = numpy.asarray( c.measure.value )
     assert m.shape == ( nb_items, )
     assert numpy.allclose( m, 1 - 0.5 ** 3 / 6 )
 

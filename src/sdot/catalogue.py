@@ -33,7 +33,7 @@ def provoke( device = None ):
             for weights in ( None, w ):
                 for acc in ( "plain", None ):
                     pd = PowerDiagram( pos, weights = weights, boundaries = box, accelerator = acc, kernel_dtype = kernel )
-                    np.asarray( pd.measures.tensor )
+                    np.asarray( pd.measures.value )
                     pd.moments
                     pd.hessian_rows()
                     pd.cells
@@ -44,12 +44,12 @@ def provoke( device = None ):
         # une densité image, et une somme de gaussiennes
         img = Image( values = rng.uniform( 0.5, 1.5, size = ( 16, ) * d ) )
         pd = PowerDiagram( pos * 16, boundaries = box_half_spaces( [ 0 ] * d, [ 16 ] * d ), distribution = img )
-        np.asarray( pd.measures.tensor )
+        np.asarray( pd.measures.value )
         pd.moments
         if d == 2:
             sog = SumOfGaussians( positions = pos[ :4 ], sigmas = [ 0.1 ] * 4, weights = [ 1.0 ] * 4 )
             pd = PowerDiagram( pos, boundaries = box, distribution = sog )
-            np.asarray( pd.measures.tensor )
+            np.asarray( pd.measures.value )
             _vjp( lambda p: PowerDiagram( p, boundaries = box, distribution = sog ).measures, pos )
 
     # LE TRANSPORT ( `OtPlan` ) : un noyau par ( dimension, stockage, densité ) -- sur CPU seulement,
@@ -70,7 +70,7 @@ def provoke( device = None ):
     for d in ( 2, 3 ):
         c = Cell.make_hypercube( d, [ 0 ] * d, np.eye( d ).tolist() )
         c.cut( [ 1.0 ] * d, 1.0 )
-        np.asarray( c.measure.tensor )
+        np.asarray( c.measure.value )
 
 
 def _vjp( f, x ):
