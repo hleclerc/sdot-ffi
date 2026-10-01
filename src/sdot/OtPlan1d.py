@@ -196,7 +196,7 @@ class OtPlan1d( Aggregate ):
                             "local_index, local_size, group, local_scratch, sub_group );" ),
                     prologue = "outputs.plan.src_dist.zero_position_grad( queue, grad_of_outputs.plan.src_dist );",
                     **geometrie_cooperative ),
-            plan = loom.out( self, *ecrit ),
+            plan = loom.out( self, writes = ecrit ),
             # les tampons sont transitoires PAR GROUPE : l'adjoint les re-alloue frais au lieu de
             # lire les valeurs ( perimees ) de l'aller comme des residus -- voir `_call_backward`.
             **{ n: loom.scratch( t ) for n, t in self._scratch().items() },
@@ -300,7 +300,7 @@ class OtPlan1d( Aggregate ):
                             "local_index, local_size, group );" ),
                     prologue = "outputs.plan.src_dist.zero_position_grad( queue, grad_of_outputs.plan.src_dist );",
                     **geometrie_presortee ),
-            plan = loom.out( self, "cost", "nb_diracs" ),
+            plan = loom.out( self, writes = ( "cost", "nb_diracs" ) ),
             # `Tensor.wrap` only takes axis NAME strings (it mints fresh, detached axes) -- use the SAME
             # names as `num_group`/`self.num_dirac` above so `CallArgsAnalysis` unifies them by name
             # with this call's other tensors instead of minting disconnected ShapeVars.

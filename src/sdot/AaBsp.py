@@ -518,8 +518,8 @@ def _build_in_kernel( pos, w, leaf_size ):
                            "outputs.lvl.wa( batch_index ), outputs.lvl.wb( batch_index ), outputs.lvl.mid( batch_index ), "
                            "SI( inputs.leaf_size( 0 ) ) );" ),
             src = src,
-            dst = loom.out( dst, *ecrit_dst ),
-            lvl = loom.out( lvl, *ecrit_lvl ),
+            dst = loom.out( dst, writes = ecrit_dst ),
+            lvl = loom.out( lvl, writes = ecrit_lvl ),
             perm = loom.scratch( perm ),
             leaf_size = leaf,
             # toutes les tailles sont prescrites en amont (elles ne dépendent que de `n` et du

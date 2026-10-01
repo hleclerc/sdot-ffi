@@ -253,7 +253,7 @@ class OtPlan:
             weights = loom.out( weights ),
             # les poids de chaque pas ne sont ecrits que si on les a demandes : ne pas nommer
             # `weights` le laisse observe, donc ni alloue ni lu.
-            history = loom.out( history, *( [ "rows", "weights" ] if keep_weights else [ "rows" ] ),
+            history = loom.out( history, writes = [ "rows", "weights" ] if keep_weights else [ "rows" ],
                                 capacities = { "nb_steps": int( max_iter ) + 1 } ),
             stats = loom.out( stats ),
             has_dynamic_capacity = False,

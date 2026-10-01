@@ -132,7 +132,7 @@ class Image( Distribution ):
                 ),
             FfiCode.per_item( "outputs.image( batch_index ).measure_bwd( grad_of_outputs.image( batch_index ).values, "
                            "grad_of_outputs.image( batch_index ).current_mass );" ),
-            image = loom.out( self, "current_mass" ),
+            image = loom.out( self, writes = ( "current_mass", ) ),
             has_dynamic_capacity = False,
         )
 
