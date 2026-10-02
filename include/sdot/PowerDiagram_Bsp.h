@@ -36,7 +36,7 @@ struct PowerDiagram_Bsp {
     HD auto fournisseur( SI k0 ) const { return FournisseurBsp<PowerDiagram_Bsp,TK,ct_dim,has_weights,has_memo>( *this, k0 ); }
 
     /// LE MEME DIAGRAMME, les poids et les majorants de l'arbre lus AILLEURS -- des vues que
-    /// l'appelant possede et ECRIT ( le solveur de `OtPlan`, qui pose des poids a chaque essai ) :
+    /// l'appelant possede et ECRIT ( le solveur de `SdotPlanNd`, qui pose des poids a chaque essai ) :
     /// les entrees d'un appel sont en lecture seule, ses sorties non. L'ordre des membres est
     /// celui de `PowerDiagram_Bsp.py` / `AaBsp.py` ( le meme que `kernel_form` ci-dessus ).
     HD auto with_weights( auto &&sorted_weights_, auto &&node_wa_, auto &&node_wb_ ) const {

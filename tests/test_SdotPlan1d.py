@@ -1,7 +1,7 @@
 import numpy
 
 from loom import driver
-from sdot import Image, OtPlan1d, SumOfDiracs1d
+from sdot import Image, SdotPlan1d, SumOfDiracs1d
 from loom.devices import Cpu
 from errand import test
 from loom.util import info
@@ -14,7 +14,7 @@ if test( "basic" ):
     src = SumOfDiracs1d( positions = [ 0, 1 ] )
     dst = Image( values = [ 1, 0, 1 ] )
 
-    otp = OtPlan1d( src, dst, with_barycenters = True )
+    otp = SdotPlan1d( src, dst, with_barycenters = True )
 
     info( otp.cost )
     info( otp.barycenters )
@@ -23,7 +23,7 @@ if test( "cost_uniform" ):
     # Un seul dirac (masse 1) face à une densité uniforme sur [0,1] (masse 1) : le coût est
     # exactement Integral_0^1 (x - 0.5)^2 dx = 1/12, et le barycentre de la tranche cible est 0.5.
     # Ce cas franchit aussi la garde de bornes `udp_cont` (une seule cellule, boucle non entrée).
-    otp = OtPlan1d( SumOfDiracs1d( positions = [ 0.5 ] ), Image( values = [ 1 ] ), with_barycenters = True )
+    otp = SdotPlan1d( SumOfDiracs1d( positions = [ 0.5 ] ), Image( values = [ 1 ] ), with_barycenters = True )
 
     assert abs( float( otp.cost ) - 1 / 12 ) < 1e-6
     assert abs( float( otp.barycenters.sum() ) - 0.5 ) < 1e-6
@@ -31,7 +31,7 @@ if test( "cost_uniform" ):
 if test( "cost_two_cells" ):
     # Densité uniforme 0.5 sur [0,2] (masse 1), un dirac en 1.0 : le prélèvement traverse DEUX
     # cellules (la boucle `while` de `udp_cont` s'exécute une fois), coût attendu 1/3.
-    otp = OtPlan1d( SumOfDiracs1d( positions = [ 1.0 ] ), Image( values = [ 1, 1 ] ) )
+    otp = SdotPlan1d( SumOfDiracs1d( positions = [ 1.0 ] ), Image( values = [ 1, 1 ] ) )
 
     assert abs( float( otp.cost ) - 1 / 3 ) < 1e-6
 
@@ -41,7 +41,7 @@ if test( "grad_cost" ):
     # l'assignation des tranches ; le coût est alors lisse et l'adjoint 2 w_i ( p_i - b_i ) exact.
     positions = driver.array( [ 0.2, 0.5, 0.9 ] )
 
-    check_grad( lambda p: OtPlan1d( SumOfDiracs1d( positions = p ), Image( values = [ 1, 0, 1 ] ) ).cost, positions )
+    check_grad( lambda p: SdotPlan1d( SumOfDiracs1d( positions = p ), Image( values = [ 1, 0, 1 ] ) ).cost, positions )
 
 if test( "grad_values" ):
     # Dérivée de `cost` par rapport aux valeurs de l'image : terme direct Integral (x-p)^2 + terme
@@ -50,7 +50,7 @@ if test( "grad_values" ):
     values = driver.array( [ 1.0, 3.0, 1.0 ] )
     info( values )
 
-    check_grad( lambda v: OtPlan1d( SumOfDiracs1d( positions = [ 0.2, 0.5, 0.9 ] ), Image( values = v ) ).cost, values )
+    check_grad( lambda v: SdotPlan1d( SumOfDiracs1d( positions = [ 0.2, 0.5, 0.9 ] ), Image( values = v ) ).cost, values )
 
 if test( "group_size_cooperative" ):
     # Force `local_size > 1` on CPU (never the perf path there -- see `Cpu.group_size`'s docstring --
@@ -64,19 +64,19 @@ if test( "group_size_cooperative" ):
     positions = [ 0.9, 0.1, 0.5, 0.3, 0.7, 0.05, 0.95, 0.42, 0.63, 0.18 ]
     values = [ 1, 2, 0, 3, 1 ]
 
-    otp_ref = OtPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ), with_barycenters = True )
+    otp_ref = SdotPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ), with_barycenters = True )
     cost_ref = float( otp_ref.cost )
     bary_ref = numpy.asarray( otp_ref.barycenters )
 
     orig_group_size = Cpu.group_size
     Cpu.group_size = lambda self, **_: 4
     try:
-        otp = OtPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ), with_barycenters = True )
+        otp = SdotPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ), with_barycenters = True )
         assert abs( float( otp.cost ) - cost_ref ) < 1e-9 * max( 1.0, abs( cost_ref ) )
         assert numpy.allclose( numpy.asarray( otp.barycenters ), bary_ref, rtol = 1e-9, atol = 1e-9 )
 
         weights = driver.array( [ 1.0 ] * len( positions ) )
-        check_grad( lambda w: OtPlan1d( SumOfDiracs1d( positions = positions, weights = w ), Image( values = values ) ).cost, weights )
+        check_grad( lambda w: SdotPlan1d( SumOfDiracs1d( positions = positions, weights = w ), Image( values = values ) ).cost, weights )
     finally:
         Cpu.group_size = orig_group_size
 
@@ -90,17 +90,17 @@ if test( "zero_density_cells" ):
     positions = [ 0.1, 0.3, 0.5, 0.7, 0.9 ]
 
     for values in ( [ 0, 0, 1, 2, 1 ], [ 1, 2, 1, 0, 0 ] ):
-        otp_ref = OtPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
+        otp_ref = SdotPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
         cost_ref = float( otp_ref.cost )
 
         orig_group_size = Cpu.group_size
         Cpu.group_size = lambda self, **_: 4
         try:
-            otp = OtPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
+            otp = SdotPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
             assert abs( float( otp.cost ) - cost_ref ) < 1e-9 * max( 1.0, abs( cost_ref ) )
 
             weights = driver.array( [ 1.0 ] * len( positions ) )
-            check_grad( lambda w: OtPlan1d( SumOfDiracs1d( positions = positions, weights = w ), Image( values = values ) ).cost, weights )
+            check_grad( lambda w: SdotPlan1d( SumOfDiracs1d( positions = positions, weights = w ), Image( values = values ) ).cost, weights )
         finally:
             Cpu.group_size = orig_group_size
 
@@ -110,13 +110,13 @@ if test( "single_cell_target" ):
     positions = [ 0.2, 0.5, 0.7, 0.9 ]
     values = [ 1 ]
 
-    otp_ref = OtPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
+    otp_ref = SdotPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
     cost_ref = float( otp_ref.cost )
 
     orig_group_size = Cpu.group_size
     Cpu.group_size = lambda self, **_: 4
     try:
-        otp = OtPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
+        otp = SdotPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
         assert abs( float( otp.cost ) - cost_ref ) < 1e-9 * max( 1.0, abs( cost_ref ) )
     finally:
         Cpu.group_size = orig_group_size
@@ -127,17 +127,17 @@ if test( "more_threads_than_diracs" ):
     positions = [ 0.3, 0.7 ]
     values = [ 1, 2, 1 ]
 
-    otp_ref = OtPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
+    otp_ref = SdotPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
     cost_ref = float( otp_ref.cost )
 
     orig_group_size = Cpu.group_size
     Cpu.group_size = lambda self, **_: 8
     try:
-        otp = OtPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
+        otp = SdotPlan1d( SumOfDiracs1d( positions = positions ), Image( values = values ) )
         assert abs( float( otp.cost ) - cost_ref ) < 1e-9 * max( 1.0, abs( cost_ref ) )
 
         weights = driver.array( [ 1.0, 1.0 ] )
-        check_grad( lambda w: OtPlan1d( SumOfDiracs1d( positions = positions, weights = w ), Image( values = values ) ).cost, weights )
+        check_grad( lambda w: SdotPlan1d( SumOfDiracs1d( positions = positions, weights = w ), Image( values = values ) ).cost, weights )
     finally:
         Cpu.group_size = orig_group_size
 
@@ -153,12 +153,12 @@ if test( "boundary_straddling_cell_grad" ):
     positions = [ 0.1, 0.2, 0.3, 0.7, 0.8, 0.9 ]
     values = driver.array( [ 1.0, 1.0 ] )
 
-    check_grad( lambda v: OtPlan1d( SumOfDiracs1d( positions = positions ), Image( values = v ) ).cost, values )
+    check_grad( lambda v: SdotPlan1d( SumOfDiracs1d( positions = positions ), Image( values = v ) ).cost, values )
 
     orig_group_size = Cpu.group_size
     Cpu.group_size = lambda self, **_: 3
     try:
-        check_grad( lambda v: OtPlan1d( SumOfDiracs1d( positions = positions ), Image( values = v ) ).cost, values )
+        check_grad( lambda v: SdotPlan1d( SumOfDiracs1d( positions = positions ), Image( values = v ) ).cost, values )
     finally:
         Cpu.group_size = orig_group_size
 
@@ -168,7 +168,7 @@ if test( "grad_weights" ):
     # (Python, dérivée par le framework) est traversée de bout en bout par `check_grad`.
     weights = driver.array( [ 1.0, 1.0, 2.0 ] )
 
-    check_grad( lambda w: OtPlan1d( SumOfDiracs1d( positions = [ 0.2, 0.5, 0.9 ], weights = w ), Image( values = [ 1, 3, 1 ] ) ).cost, weights )
+    check_grad( lambda w: SdotPlan1d( SumOfDiracs1d( positions = [ 0.2, 0.5, 0.9 ], weights = w ), Image( values = [ 1, 3, 1 ] ) ).cost, weights )
 
 if test( "joint_position_and_weight_value_grad" ):
     # Différencie positions ET poids ET valeurs de l'image EN MÊME TEMPS (barycentres NON stockés,
@@ -179,13 +179,13 @@ if test( "joint_position_and_weight_value_grad" ):
     weights   = driver.array( [ 1.0, 1.0, 2.0 ] )
     values    = driver.array( [ 1.0, 3.0, 1.0 ] )
 
-    check_grad( lambda p, w, v: OtPlan1d( SumOfDiracs1d( positions = p, weights = w ), Image( values = v ) ).cost,
+    check_grad( lambda p, w, v: SdotPlan1d( SumOfDiracs1d( positions = p, weights = w ), Image( values = v ) ).cost,
                 positions, weights, values )
 
     orig_group_size = Cpu.group_size
     Cpu.group_size = lambda self, **_: 4
     try:
-        check_grad( lambda p, w, v: OtPlan1d( SumOfDiracs1d( positions = p, weights = w ), Image( values = v ) ).cost,
+        check_grad( lambda p, w, v: SdotPlan1d( SumOfDiracs1d( positions = p, weights = w ), Image( values = v ) ).cost,
                     positions, weights, values )
     finally:
         Cpu.group_size = orig_group_size

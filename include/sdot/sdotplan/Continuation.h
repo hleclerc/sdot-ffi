@@ -31,7 +31,7 @@
 #include <cmath>
 
 namespace sdot {
-namespace otplan {
+namespace sdotplan {
 
 /// la distribution `dist` a la largeur `s` : `at( s )` rend une reference valable jusqu'au prochain `at`
 template<class Dist>
@@ -76,7 +76,9 @@ struct Convolee<Image<T...>> {
         CartesianIndices<DECAYED_TYPE_OF( shape )> cells{ shape };
         src.resize( PI( cells.size() ) );
         for ( PI flat = 0; flat < PI( cells.size() ); ++flat )
-            src[ flat ] = cells[ flat ].apply_values( [&]( auto ...i ) { return double( dist.values( i... ) ); } );
+            // `cells[ flat ]` est un `Coords` ( des coordonnees NOMMEES ), et un tenseur en accepte
+            // un directement -- plus besoin de le deplier en entiers positionnels
+            src[ flat ] = double( dist.values( cells[ flat ] ) );
     }
 
     /// le pas de la grille sur l'axe `a` ( la longueur de `frame( a )` fois l'ecart moyen des noeuds ),
@@ -139,5 +141,5 @@ inline std::vector<double> etapes( double s0, double ratio, double s_min ) {
     return res;
 }
 
-} // namespace otplan
+} // namespace sdotplan
 } // namespace sdot

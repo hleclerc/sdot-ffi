@@ -1,5 +1,5 @@
 // L'UNITE DE DOMAINE des solveurs lineaires ( voir `Lineaire.h` ) : compilee une fois par
-// compilateur, liee par les noyaux qui nomment `sdot/otplan/Lineaire.cpp` dans leurs `sources`.
+// compilateur, liee par les noyaux qui nomment `sdot/sdotplan/Lineaire.cpp` dans leurs `sources`.
 // Eigen et AMGCL sont ceux que loom telecharge ( `sdot/__init__.py` -> `loom/compilation/externals.py`,
 // sur le chemin d'inclusion ), ou a defaut ceux du systeme ( `<eigen3/...>` ) ; ce qui manque n'est
 // simplement pas propose.
@@ -37,7 +37,7 @@
 #endif
 
 namespace sdot {
-namespace otplan {
+namespace sdotplan {
 
 static double now() {
     using namespace std::chrono;
@@ -241,5 +241,5 @@ std::unique_ptr<SolveurLineaire> solveur_lineaire( Lin methode, SI n, int dim ) 
     return std::make_unique<Cg>();
 }
 
-} // namespace otplan
+} // namespace sdotplan
 } // namespace sdot

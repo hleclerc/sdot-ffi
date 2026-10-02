@@ -16,7 +16,7 @@ class ProjectedSumOfDiracs( Distribution ):
     `points` `[ n, proj_dim ]` is SHARED across the batch (the reconstructed particles, 2D); `normal`
     `[ proj_dim ]` is PER-ITEM (batched over the angles); `weights` `[ n ]` are the masses. The C++
     struct answers the same `position(i)` / `add_position_grad(...)` contract as `SumOfDiracs`, so
-    `OtPlan1d` consumes either without knowing which (polymorphism, not a type test): `position(i)`
+    `SdotPlan1d` consumes either without knowing which (polymorphism, not a type test): `position(i)`
     is the dot `points(i)·normal`, and the backward ATOMIC-SCATTERS d cost / d position back onto the
     shared `points` gradient (many angles contribute to the same point). See [[per-thread-scratch-facility]].
     """
@@ -80,7 +80,7 @@ class ProjectedSumOfDiracs( Distribution ):
         # projection (`points·normal`) is DEFERRED (`project_fn`, `normal` routed through
         # `batched_extra`) so the caller computes it ONE ANGLE AT A TIME: materializing the
         # full `[*batch,n]` projection upfront (a plain eager `einsum` over every angle at
-        # once) is exactly the memory blow-up `Image.try_update_otplan1d`'s `lax.map` exists to
+        # once) is exactly the memory blow-up `Image.try_update_sdotplan1d`'s `lax.map` exists to
         # avoid -- confirmed as the actual cause of an OOM at n=1e8 x 5 angles that an EARLIER,
         # eager version of this method hit (the lazy `lax.map` alone did not save it, because
         # the projection was already materialized in full before `lax.map` ever ran).

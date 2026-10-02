@@ -350,7 +350,7 @@ UTP HD auto DTP::udp_at( auto &&cell_cum_mass, auto target_mass ) const {
 
 // Sequential build of `cell_cum_mass` -- exactly the cell-mass formula `udp_start`/`udp_cont` use
 // inline above, but walked once end-to-end and cached (see `Image.py`'s `cell_cum_mass`
-// `ComputedAttribute`) instead of being rebuilt by every `OtPlan1d` forward/backward call. One
+// `ComputedAttribute`) instead of being rebuilt by every `SdotPlan1d` forward/backward call. One
 // thread does a whole angle -- `nb_cells` is small enough that no cooperative scan is worth it.
 UTP HD void DTP::fill_cell_cum_mass( auto &&cell_cum_mass ) const {
     with_defaults( [&]( auto &&img ) {

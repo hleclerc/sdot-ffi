@@ -41,7 +41,7 @@ class SumOfGaussians( Distribution ):
     Une gaussienne n'en a pas, mais au-delà de quelques écarts-types il ne reste rien : le support
     que la distribution DÉCLARE ( `bounding_half_spaces` ) est le pavé `[ c_i - k s_i, c_i + k s_i ]`
     réuni sur les gaussiennes, `k = support_sigmas` ( 6 par défaut : la queue au-delà pèse 2e-9 ).
-    C'est ce qui borne le domaine d'un transport ( `OtPlan` : le domaine vient de la densité, et
+    C'est ce qui borne le domaine d'un transport ( `SdotPlanNd` : le domaine vient de la densité, et
     d'elle seule ) et ce que `PowerDiagram` ajoute à ses demi-espaces. `support_sigmas = None` : pas
     de support déclaré -- les cellules du bord restent infinies et `measures` y répond `TF::max`,
     à moins d'un `boundaries`. La masse hors du domaine est perdue, et la somme des mesures vaut la

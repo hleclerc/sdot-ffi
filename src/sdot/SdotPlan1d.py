@@ -17,7 +17,7 @@ from loom.util import Aggregate
 from loom.drivers.driver import driver
 
 
-class OtPlan1d( Aggregate ):
+class SdotPlan1d( Aggregate ):
     """
     """
 
@@ -51,7 +51,7 @@ class OtPlan1d( Aggregate ):
         src_dist = src_dist.normalized_version()
         dst_dist = dst_dist.normalized_version()
         # dispatch on CAPABILITY, not a concrete type: any `_is_dirac_source` distribution answers the
-        # C++ `position(i)` / `add_position_grad` contract OtPlan1d needs (SumOfDiracs reads a buffer,
+        # C++ `position(i)` / `add_position_grad` contract SdotPlan1d needs (SumOfDiracs reads a buffer,
         # ProjectedSumOfDiracs computes the projection on the fly). Keep the diracs on the src side.
         if getattr( dst_dist, "_is_dirac_source", False ):
             dst_dist, src_dist = src_dist, dst_dist
@@ -76,15 +76,25 @@ class OtPlan1d( Aggregate ):
         if auto_update:
             self.update_outputs()
 
+    @classmethod
+    def _solve( cls, problem, settings, verbose = False ):
+        """LE chemin : `OtProblem.solve()` et lui seul passe par ici.
+
+        Le régime DIRECT n'a ni tolérance, ni nombre d'itérations, ni point de départ : la solution
+        est un tri plus une inversion de fonction de répartition, donc exacte. `verbose` n'a donc
+        rien à tracer -- il est accepté pour que `OtProblem.solve()` ait la même signature dans les
+        deux régimes, et ignoré ici."""
+        return cls( problem.source, problem.target, with_barycenters = settings.with_barycenters )
+
     def _scratch( self ):
         """The PER-GROUP sort + sweep scratch tensors + the group axis + the group-SIZE marker tensor,
-        shared by every OtPlan1d kernel.
+        shared by every SdotPlan1d kernel.
 
         NOT per-angle: `[ num_group, num_dirac ]`, so memory scales with CONCURRENT ANGLES (a RAM
         budget), not the total angle count (2*80GB -> ~2*nt*n*8 at 1e7 diracs x 1000 angles). Each
         work-GROUP indexes its own row `scratch( group_index )`, race-free (`group_index` unique and
         STABLE over the strided item loop, see FfiCode) -- `local_size` work-items inside that
-        group then cooperate on the row via local memory + barriers (see `OtPlan1d.cxx::sort_diracs`),
+        group then cooperate on the row via local memory + barriers (see `SdotPlan1d.cxx::sort_diracs`),
         instead of one lone work-item doing it all. `nt`/`gs` are HOST decisions: `nt` (min of cores,
         a RAM budget, the batch size) is UNCHANGED by cooperation -- coop doesn't shrink the O(n)-per-
         concurrent-angle scratch, it puts more workers on each one. `gs` defaults to 1 (degenerates to
@@ -110,7 +120,7 @@ class OtPlan1d( Aggregate ):
         """
         n  = int( self.nb_diracs.value )
         nt = driver.device.nb_threads( batch_axes = self.batch_axes, nb_local_bytes_per_thread = 3 * 8 * n )
-        # `NB_BUCKETS = 256` (8-bit radix digit, see `OtPlan1d.cxx::sort_diracs`) -- MUST match that
+        # `NB_BUCKETS = 256` (8-bit radix digit, see `SdotPlan1d.cxx::sort_diracs`) -- MUST match that
         # constant by hand. The histogram is now ONE ROW PER SUB-GROUP (warp), not per work-item (see
         # `sort_diracs`'s docstring) -- `nb_shared_bytes_per_subgroup` tells `group_size` to budget
         # `ceil( gs / subgroup_size )` rows instead of `gs` of them. `2 *`: each sub-group needs TWO
@@ -133,12 +143,12 @@ class OtPlan1d( Aggregate ):
         }
 
     def update_outputs( self ):
-        # give the target distribution first refusal: e.g. `Image.try_update_otplan1d` solves
+        # give the target distribution first refusal: e.g. `Image.try_update_sdotplan1d` solves
         # the whole thing in closed-form pure JAX (no driver.call/C++ kernel at all) when the
         # combination qualifies (JAX backend, 1D, <=1 batch axis, no barycenters, a dirac
         # source that can supply plain positions/weights) -- see [[pure-jax-otplan1d]]. `False`
         # means "unsupported combination", not "error" -- fall through to the general path.
-        if self.dst_dist.try_update_otplan1d( self ):
+        if self.dst_dist.try_update_sdotplan1d( self ):
             return
 
         # second refusal, this time from the BATCH shape itself: when there is one, loop over
@@ -166,7 +176,7 @@ class OtPlan1d( Aggregate ):
         # `local_mem_elems` : `2 * ceil( local_size / subgroup_size )` lignes partagees PAR WARP --
         # une ligne histogramme/curseur ET une ligne de masque par sous-groupe cooperant au
         # histogramme/scatter radix ( voir `sort_diracs` ) -- plus une ligne pour les offsets de
-        # bucket inter-chunks ( `OtPlan1d.cxx::sort_diracs::radix_pass` ). Sans rapport avec
+        # bucket inter-chunks ( `SdotPlan1d.cxx::sort_diracs::radix_pass` ). Sans rapport avec
         # `group_scan` ( scratch global ordinaire, pas de la memoire locale ).
         #
         # C'est un CORPS de methode C++ ( voir `FfiCode` ) : les arguments de l'appel y sont en
@@ -179,7 +189,7 @@ class OtPlan1d( Aggregate ):
                                 f"        return ( 2 * ( ( gs + sg - 1 ) / sg ) + 1 ) * 256;" ),
         )
         loom.ffi_call(
-            "update_outputs_OtPlan1d",
+            "update_outputs_SdotPlan1d",
             FfiCode.per_item( # `scratch.<x>( group_index )` yields this work-GROUP's shared rank-1 row.
                 # `plan( batch_index )` still picks the angle. The backward RE-SORTS into its OWN
                 # fresh scratch, so it needs all of them -- they are no longer residuals (per-group,
@@ -207,10 +217,10 @@ class OtPlan1d( Aggregate ):
 
     def _update_outputs_via_angle_loop( self ):
         """Loop over the (single) batch axis with `jax.lax.map` + `jax.checkpoint`, building a
-        FRESH, unbatched `OtPlan1d` (one `driver.call` -- sort AND sweep, unaffected by this)
+        FRESH, unbatched `SdotPlan1d` (one `driver.call` -- sort AND sweep, unaffected by this)
         per angle, instead of one call whose internal scratch/output memory scales with how many
         CONCURRENT angles it processes at once (`_scratch`'s `nt`, or an `[ nb_angles, n, dim ]`
-        `barycenters` output). Mirrors `Image.try_update_otplan1d`'s own `lax.map`, extended to
+        `barycenters` output). Mirrors `Image.try_update_sdotplan1d`'s own `lax.map`, extended to
         the driver.call/C++ path: 'we will always have a large n', so bounding peak memory to
         ONE angle -- regardless of the total angle count -- matters more than batching several
         angles' GPU work concurrently (confirmed: `with_barycenters=True` OOMs today's single
@@ -234,7 +244,7 @@ class OtPlan1d( Aggregate ):
         def body( index ):
             src_i = self.src_dist.batch_slice( index )
             dst_i = self.dst_dist.batch_slice( index )
-            plan_i = OtPlan1d( src_i, dst_i, with_barycenters = with_barycenters )
+            plan_i = SdotPlan1d( src_i, dst_i, with_barycenters = with_barycenters )
             # `.raw`, not `.value`: `plan.nb_diracs` is itself a kernel OUTPUT (re-confirmed
             # device-side, see `update_outputs`'s `output_attributes`), so under this trace it is
             # no longer the static host int `.value` needs to slice `barycenters` down to its
@@ -260,7 +270,7 @@ class OtPlan1d( Aggregate ):
         """Sort-free variant of `update_outputs`: `sorted_indices`/`sorted_pos` are ALREADY the sorted
         order for this instance's diracs (e.g. from `jnp.argsort`, computed upstream -- one angle at a
         time under an outer `lax.scan`) -- the C++ side skips `sort_diracs` entirely and only runs the
-        sweep (`OtPlan1d.cxx::update_outputs_presorted`/`update_outputs_bwd_presorted`). Evaluates
+        sweep (`SdotPlan1d.cxx::update_outputs_presorted`/`update_outputs_bwd_presorted`). Evaluates
         whether letting XLA's own (whole-device) sort replace the per-angle single-work-group radix
         sort -- the scaling bottleneck at large n, see `sort_diracs`'s docstring -- is worthwhile; see
         [[jax-sort-lax-scan]]. `self` must be a SINGLE (unbatched) instance: one angle per call, so the
@@ -289,7 +299,7 @@ class OtPlan1d( Aggregate ):
             local_mem_elems = "return 0;",
         )
         loom.ffi_call(
-            "update_outputs_presorted_OtPlan1d",
+            "update_outputs_presorted_SdotPlan1d",
             FfiCode.per_item( code = ( "outputs.plan( batch_index ).update_outputs_presorted( inputs.sorted_indices( group_index ), inputs.sorted_pos( group_index ), "
                             "scratch.group_scan( group_index ), "
                             "local_index, local_size, group );" ),

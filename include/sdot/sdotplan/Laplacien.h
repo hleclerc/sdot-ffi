@@ -23,7 +23,7 @@
 #include <vector>
 
 namespace sdot {
-namespace otplan {
+namespace sdotplan {
 
 /// Une facette vue DEPUIS la cellule `i` : c'est elle qui en a mesure l'etendue.
 struct Facette {
@@ -108,5 +108,5 @@ struct Laplacien {
     }
 };
 
-} // namespace otplan
+} // namespace sdotplan
 } // namespace sdot

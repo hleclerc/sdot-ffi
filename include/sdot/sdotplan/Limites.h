@@ -44,7 +44,7 @@
 #include <limits>
 
 namespace sdot {
-namespace otplan {
+namespace sdotplan {
 
 constexpr double INFINI = std::numeric_limits<double>::infinity();
 
@@ -500,5 +500,5 @@ struct Limites2D {
     }
 };
 
-} // namespace otplan
+} // namespace sdotplan
 } // namespace sdot

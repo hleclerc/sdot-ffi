@@ -1,6 +1,6 @@
 """Closed-form 1D optimal-transport cost between a Dirac source and a piecewise-constant
 target density, computed with plain (differentiable) JAX ops -- no custom kernel, no
-`driver.call`. See `Image.try_update_otplan1d` for the dispatch that picks this path over
+`driver.call`. See `Image.try_update_sdotplan1d` for the dispatch that picks this path over
 the general driver.call/C++ one, and [[pure-jax-otplan1d]] for the evaluation that led here
 (1.2x-3.7x faster than the C++ kernel at n=1e6-3e7, matches it to float32 precision).
 
@@ -24,7 +24,7 @@ def cost_1d_ot( proj, weights, values, s_min, dw ):
     """`proj`: [n] projected 1D dirac positions. `weights`: [n] dirac masses (any positive
     scale). `values`: [m] target bin densities (any positive scale, piecewise-constant over
     bins of width `dw` starting at `s_min`). Both sides are normalized to mass 1 internally,
-    matching `OtPlan1d.cost`'s semantics. Returns a scalar."""
+    matching `SdotPlan1d.cost`'s semantics. Returns a scalar."""
     # des tableaux du backend, quoi qu'on ait reçu : sous `lax.map` les indices sont des traceurs,
     # et un `numpy.ndarray` indexé par un traceur essaie de le convertir ( `__array__` )
     proj, weights, values = jnp.asarray( proj ), jnp.asarray( weights ), jnp.asarray( values )

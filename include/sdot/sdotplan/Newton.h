@@ -54,7 +54,7 @@
 #include <vector>
 
 namespace sdot {
-namespace otplan {
+namespace sdotplan {
 
 struct NewtonOptions {
     double tol_abs    = 1e-8;    ///< arret : `max_i |a_i - nu_i| <= tol_abs` ...
@@ -294,5 +294,5 @@ struct Newton {
     }
 };
 
-} // namespace otplan
+} // namespace sdotplan
 } // namespace sdot

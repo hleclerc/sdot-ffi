@@ -29,7 +29,7 @@ class PowerDiagram_Plain( PowerDiagram ):
     def _grad_seeds_expr( self ):
         return "grad_of_inputs.power_diagram.positions, grad_of_inputs.power_diagram.weights"
 
-    # ---- ce que le solveur de `OtPlan` ecrit ( voir `PowerDiagram_Bsp` ) ----------------------------
+    # ---- ce que le solveur de `SdotPlanNd` ecrit ( voir `PowerDiagram_Bsp` ) ----------------------------
 
     def _solver_weights_call( self ):
         w = RealTensor[ self.num_point ]()

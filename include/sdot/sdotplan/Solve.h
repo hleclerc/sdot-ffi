@@ -1,7 +1,7 @@
 #pragma once
 
 // =====================================================================================
-// L'ENTREE DU SOLVEUR ( ce que `OtPlan.py` appelle, en UN `driver.call` ) : le point de depart, la
+// L'ENTREE DU SOLVEUR ( ce que `SdotPlanNd.py` appelle, en UN `driver.call` ) : le point de depart, la
 // continuation en largeur s'il en faut une, Newton a chaque etape, et ce qui en sort.
 //
 // = Le point de depart
@@ -43,9 +43,9 @@
 #include "Newton.h"
 
 namespace sdot {
-namespace otplan {
+namespace sdotplan {
 
-/// ce que l'appelant lit dans `stats( . )` -- meme liste cote python ( `OtPlan._STATS` )
+/// ce que l'appelant lit dans `stats( . )` -- meme liste cote python ( `SdotPlanNd._STATS` )
 enum Stat : int {
     FIN = 0, RESTE, RESTE0, NB_ITER, NB_DIAG, NB_RECUL, T_MAJ, T_DIAG, T_ASM, T_LIN, T_LIM, EPS,
     MASSE_DOMAINE, NB_DEBORDE, NB_CELL_LIM, NB_TOURS_ESSAI, LIN_NB_HIER, LIN_NB_ITER, LIN_PIRE, DEPART, T_TOTAL,
@@ -54,7 +54,7 @@ enum Stat : int {
 };
 enum Depart : int { DEPART_DONNE = 0, DEPART_VORONOI = 1, DEPART_SIMILITUDE = 2 };
 
-/// ce que chaque ligne de l'historique porte -- meme liste cote python ( `OtPlan._HISTORY` )
+/// ce que chaque ligne de l'historique porte -- meme liste cote python ( `SdotPlanNd._HISTORY` )
 enum Hist : int { H_STEP = 0, H_T, H_RESIDU_L2, H_MIN_MASSE, H_MAX_RESIDU, H_NB_DIAG, H_NB_EVALS, H_S, NB_HIST };
 
 struct OptionsSolveur {
@@ -110,10 +110,11 @@ inline double minimum( const std::vector<double> &v ) {
 
 /// LE SOLVEUR. `pd` porte des poids et des majorants INSCRIPTIBLES ( `with_weights` ) ; `nu` et `w0`
 /// sont dans l'ordre utilisateur. `weights` ( ordre utilisateur ), `hist` ( `nb_steps`, `rows [ step,
-/// NB_HIST ]`, `weights [ step, n ]` facultatif ) et `stats` sont les sorties.
+/// NB_HIST ]`, `weights [ step, n ]` facultatif ), `stats`, `masses [ n ]`, `bary [ n, D ]` et
+/// `cout` sont les sorties.
 template<class TK>
 void resoudre( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom, const auto &dist, const auto &nu_in, const auto &w0_in,
-               const OptionsSolveur &o, auto &&weights, auto &&hist, auto &&stats ) {
+               const OptionsSolveur &o, auto &&weights, auto &&hist, auto &&stats, auto &&masses, auto &&bary, auto &&cout ) {
     using PD = DECAYED_TYPE_OF( pd );
     using Dist = DECAYED_TYPE_OF( dist );
     constexpr int D = PD::ct_dim;
@@ -281,12 +282,38 @@ void resoudre( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &d
     for ( SI i = 0; i < n; ++i )
         weights( i ) = w[ i ];
 
+    // le balayage des moments ci-dessous n'est pas une EVALUATION DU RESIDU : le compte de
+    // diagrammes que l'appelant lit doit rester celui de la descente, sinon deux versions du code
+    // ne se comparent plus
+    const int nb_diag_descente = bal.nb_diag;
+
+    // ---- LES MOMENTS, sur la VRAIE densite et aux poids ajustes
+    // Un balayage de plus, et c'est tout ce que le cout de transport, les barycentres et les masses
+    // de cellule demandent : Python n'a plus a rebatir un diagramme pour les obtenir. Sur `conv.at(
+    // 0 )` explicitement -- un solve qui s'est arrete en cours de continuation laisserait sinon des
+    // moments d'une densite CONVOLEE, qui ne sont pas ceux qu'on a demandes.
+    // la MASSE d'une cellule est celle que Newton a mesuree -- pas celle du balayage des moments,
+    // qui quadrature la ou la mesure a une forme close ( voir `Balayage::moments` ).
+    for ( SI i = 0; i < n; ++i )
+        masses( i ) = a[ i ];
+    {
+        bal.dist = &conv.at( 0 );
+        bal.set_weights( w );
+        std::vector<double> bc;
+        double c = 0;
+        bal.moments( bc, c );
+        for ( SI i = 0; i < n; ++i )
+            for ( int d = 0; d < D; ++d )
+                bary( i, d ) = bc[ size_t( i ) * D + d ];
+        cout = c;
+    }
+
     auto put = [&]( int i, double v ) { stats( i ) = v; };
     put( FIN, double( total.fin ) );
     put( RESTE, total.reste );
     put( RESTE0, total.reste0 );
     put( NB_ITER, double( total.nb_iter ) );
-    put( NB_DIAG, double( bal.nb_diag ) );
+    put( NB_DIAG, double( nb_diag_descente ) );
     put( NB_RECUL, double( total.nb_recul ) );
     put( T_MAJ, bal.t_maj );
     put( T_DIAG, bal.t_diag );
@@ -307,5 +334,5 @@ void resoudre( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &d
     put( MIN_MASSE_DEPART, min_masse_depart );
 }
 
-} // namespace otplan
+} // namespace sdotplan
 } // namespace sdot

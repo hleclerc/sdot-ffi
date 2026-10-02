@@ -27,7 +27,7 @@
 #include <memory>
 
 namespace sdot {
-namespace otplan {
+namespace sdotplan {
 
 enum class Lin : int { AUTO = 0, CHOLESKY = 1, AMG = 2, CG = 3 };
 
@@ -57,5 +57,5 @@ std::unique_ptr<SolveurLineaire> solveur_lineaire( Lin methode, SI n, int dim );
 /// les methodes compilees ( un masque : bit `int( Lin::X )` )
 int methodes_lineaires_disponibles();
 
-} // namespace otplan
+} // namespace sdotplan
 } // namespace sdot

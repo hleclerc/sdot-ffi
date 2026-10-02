@@ -2,13 +2,13 @@
 
 #include <loom/support/common_macros.h> // HD
 
-#include "OtPlan1d.h"
+#include "SdotPlan1d.h"
 #include <loom/support/atomic_add.h>
 #include <cstdint>
 #include <bit>
 
-#define UTP SDOT_TEMPLATE_DECL_FOR_OtPlan1d
-#define DTP OtPlan1d<SDOT_TEMPLATE_ARGS_FOR_OtPlan1d>
+#define UTP SDOT_TEMPLATE_DECL_FOR_SdotPlan1d
+#define DTP SdotPlan1d<SDOT_TEMPLATE_ARGS_FOR_SdotPlan1d>
 
 namespace sdot {
 
@@ -101,7 +101,7 @@ UTP HD void DTP::sort_diracs( auto &&sorted_indices, auto &&radix_tmp, auto &&so
 
     // `local_scratch` layout: `num_sg` histogram/cursor rows, one fixed cross-chunk `bucket_start`
     // row, then `num_sg` MATCH-MASK rows (see the scatter phase below) -- `(2*num_sg+1)*NB_BUCKETS`
-    // elements total, all zeroed together every pass (kept in sync BY HAND with `OtPlan1d.py`'s
+    // elements total, all zeroed together every pass (kept in sync BY HAND with `SdotPlan1d.py`'s
     // `local_mem_elems`/`_scratch`'s `group_size` shared-memory budget).
     auto radix_pass = [&]( auto &&src, auto &&dst, int shift ) {
         const SI hist_row        = SI( sg_id ) * NB_BUCKETS;
@@ -262,7 +262,7 @@ UTP HD typename DTP::TF DTP::chunked_weight_prefix( auto &&sorted_indices, auto 
 // Sort-INDEPENDENT half of the forward: everything that only needs a (however obtained) sorted
 // order, shared by `update_outputs` (sorts internally, via `sort_diracs`) and
 // `update_outputs_presorted` (order already provided -- e.g. computed by `jnp.argsort` upstream of
-// this kernel, see `OtPlan1d.py`'s `update_outputs_presorted`; see [[jax-sort-lax-scan]]). Kept as
+// this kernel, see `SdotPlan1d.py`'s `update_outputs_presorted`; see [[jax-sort-lax-scan]]). Kept as
 // its own method (not inlined into both callers) so the two entry points cannot drift apart.
 UTP HD void DTP::sweep_outputs( auto &&sorted_indices, auto &&sorted_pos, auto &&group_scan,
                               int local_index, int local_size, auto &&group ) {
@@ -292,10 +292,10 @@ UTP HD void DTP::sweep_outputs( auto &&sorted_indices, auto &&sorted_pos, auto &
             TF moment = 0;
             dst_dist.udp_cont( udp, mass, [&]( auto &&item ) {
                 local_cost += item.w2_dist( dirac_pos );
-                if constexpr ( barycenters.is_valid )
+                if constexpr ( DECAYED_TYPE_OF( barycenters )::is_valid )
                     moment += item.first_moment();
             } );
-            if constexpr ( barycenters.is_valid )
+            if constexpr ( DECAYED_TYPE_OF( barycenters )::is_valid )
                 barycenters( ::num_dirac = num_dirac, dim = 0 ) = moment / mass;   // center of mass of the slice
         }
     } );
@@ -359,7 +359,7 @@ UTP HD void DTP::sweep_outputs_bwd( auto &&grad_plan, auto &&sorted_indices, aut
     // is skipped when the position gradient is not wanted; `add_position_grad` then scatters (per-angle
     // write for SumOfDiracs, atomic to the shared 2D points for a projected source).
     if constexpr ( CT_VALUE( src_dist.position_grad_wanted( grad_plan.src_dist ) ) ) {
-        if constexpr ( barycenters.is_valid ) {
+        if constexpr ( DECAYED_TYPE_OF( barycenters )::is_valid ) {
             // b_i was stored by the forward (`with_barycenters`): read it, no walk, order-independent --
             // EMBARRASSINGLY parallel over i, every work-item does its own chunk, no scratch touched.
             for( SI i = lo; i < hi; ++i ) {

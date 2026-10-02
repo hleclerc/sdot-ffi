@@ -11,7 +11,7 @@
 // avant chaque coupe qui pourrait le classer ; ici « repousser » est immediat : un bout infini est
 // toujours du bon cote, il suffit de le regarder comme tel.
 //
-// Il n'y a pas de noyau a registres ni de diagramme en 1D ( `OtPlan1d` a le sien ) : c'est la
+// Il n'y a pas de noyau a registres ni de diagramme en 1D ( `SdotPlan1d` a le sien ) : c'est la
 // forme de `Cell_1.py`, et rien de plus.
 // =====================================================================================
 

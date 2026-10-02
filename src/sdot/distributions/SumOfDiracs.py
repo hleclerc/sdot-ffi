@@ -15,8 +15,8 @@ from .Distribution import Distribution
 class SumOfDiracs( Distribution ):
     """Sum of weighted Dirac point masses."""
 
-    # a 1D-dirac source OtPlan1d can sort/sweep (see the `position(i)` C++ contract); the projected
-    # variant carries the same flag, so OtPlan1d dispatches on capability, not on a concrete type.
+    # a 1D-dirac source SdotPlan1d can sort/sweep (see the `position(i)` C++ contract); the projected
+    # variant carries the same flag, so SdotPlan1d dispatches on capability, not on a concrete type.
     _is_dirac_source = True
 
     nb_diracs        : ShapeVar
@@ -71,7 +71,7 @@ class SumOfDiracs( Distribution ):
             self.current_mass = self.nb_diracs.value
 
     def raw_1d_diracs( self ):
-        # see `Distribution.raw_1d_diracs`. Only meaningful for the 1D case `OtPlan1d`
+        # see `Distribution.raw_1d_diracs`. Only meaningful for the 1D case `SdotPlan1d`
         # consumes; `positions` carries a trailing size-1 `dim` axis to drop. `positions`
         # itself may be batched (varies per angle) -- unlike `ProjectedSumOfDiracs`'s
         # projection, reading a batched SLICE of it costs nothing extra to defer, so it goes

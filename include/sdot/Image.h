@@ -60,7 +60,7 @@ struct Image {
 
     // fills `cell_cum_mass[0..nb_cells]` (exclusive prefix of each cell's mass, sentinel = total
     // mass) -- cached on the PYTHON side as `Image.cell_cum_mass` (a `ComputedAttribute`, see
-    // `distributions/Image.py`) so `OtPlan1d` reads it ready-made instead of rebuilding it on every
+    // `distributions/Image.py`) so `SdotPlan1d` reads it ready-made instead of rebuilding it on every
     // forward/backward call. Sequential (one thread does a whole angle): `nb_cells` is small enough
     // that no cooperative scan is worth the complexity here.
     HD void   fill_cell_cum_mass( auto &&cell_cum_mass ) const;

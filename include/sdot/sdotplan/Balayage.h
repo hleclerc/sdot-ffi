@@ -35,7 +35,7 @@
 #include <vector>
 
 namespace sdot {
-namespace otplan {
+namespace sdotplan {
 
 inline double now() {
     using namespace std::chrono;
@@ -51,7 +51,7 @@ double masse_facette( const Dens &dens, const Pc &pc, int cut, double mes ) {
     else if constexpr ( requires { dens.facet_mass( pc, cut ); } )
         return double( dens.facet_mass( pc, cut ) );
     else
-        static_assert( Dens::is_constant, "otplan : cette distribution ne sait pas integrer sa densite sur une facette ( `facet_mass` )" );
+        static_assert( Dens::is_constant, "sdotplan : cette distribution ne sait pas integrer sa densite sur une facette ( `facet_mass` )" );
     return 0;
 }
 
@@ -252,7 +252,77 @@ struct Balayage {
         t_diag += now() - t0;
         ++nb_diag;
     }
+
+    /// LES MOMENTS aux poids poses : le BARYCENTRE de chaque cellule ( son germe si elle est vide )
+    /// et le cout de transport `sum_i int_{cell_i} |x - p_i|^2 rho`, deja reduit.
+    ///
+    /// Un balayage de plus, sur le MEME scratch et le meme decoupage par fil que `mesures` -- c'est
+    /// ce qui evite a l'appelant de refaire un diagramme depuis Python pour obtenir un cout
+    /// ( `integrate_moments_into` rend `int rho`, `int x rho` et `int |x|^2 rho`, en coordonnees
+    /// absolues, et le cout d'une cellule s'en deduit en une ligne ).
+    ///
+    /// LA MASSE N'EN SORT PAS, et c'est delibere : pour une densite qui n'est pas constante par
+    /// morceaux, `integrate_moments_into` quadrature la ou `integrate_into` a une forme close ( la
+    /// reduction exacte de `SumOfGaussians` ) -- mesure 7e-4 d'ecart relatif sur une gaussienne. La
+    /// masse d'une cellule, c'est celle que Newton a mesuree ( `newton.a` ), pas celle-ci.
+    void moments( std::vector<double> &bary, double &cout ) {
+        const double t0 = now();
+        const SI n = this->n();
+        std::vector<double> masse( n, 0.0 );
+        bary.assign( size_t( n ) * D, 0.0 );
+        std::vector<double> cout_th( nt, 0.0 );
+        for ( ;; ) {
+            std::atomic<bool> deborde{ false };
+            queue.run_threads( nt, [&]( int t ) {
+                Carver cv{ scratch[ t ].data(), words };
+                Local c, piece;
+                c.attach( cv, cap );
+                if constexpr ( nbc > 1 ) piece.attach( cv, cap );
+                else                     piece = c;
+                double acc = 0;
+                SI b, e;
+                tranche( n, t, nt, b, e );
+                for ( SI k = b; k < e; ++k ) {
+                    const SI i = pd.user_id( k );
+                    if ( ! diagram::make_cell( pd, c, k, dom ) ) {
+                        deborde = true;
+                        return;
+                    }
+                    TF m = 0, m2 = 0;
+                    TF mx[ D ];
+                    auto first = [&]( int d ) -> TF & { return mx[ d ]; };
+                    if ( ! diagram::integrate_moments_into<TF>( m, first, m2, c, piece, *dist ) ) {
+                        deborde = true;
+                        return;
+                    }
+                    const auto p = pd.point( k );
+                    double pp = 0, px = 0;
+                    for ( int d = 0; d < D; ++d ) {
+                        pp += double( p[ d ] ) * double( p[ d ] );
+                        px += double( p[ d ] ) * double( mx[ d ] );
+                    }
+                    masse[ i ] = double( m );
+                    acc += double( m2 ) - 2 * px + double( m ) * pp;
+                    // une cellule vide garde son germe pour barycentre -- il n'y a rien d'autre a dire,
+                    // et diviser par zero en aval serait pire
+                    for ( int d = 0; d < D; ++d )
+                        bary[ size_t( i ) * D + d ] = double( m ) > 0 ? double( mx[ d ] ) / double( m ) : double( p[ d ] );
+                }
+                cout_th[ t ] = acc;
+            } );
+            if ( ! deborde )
+                break;
+            cap *= 2;
+            redimensionne();
+            ++nb_deborde;
+        }
+        cout = 0;
+        for ( double v : cout_th )
+            cout += v;
+        t_diag += now() - t0;
+        ++nb_diag;
+    }
 };
 
-} // namespace otplan
+} // namespace sdotplan
 } // namespace sdot

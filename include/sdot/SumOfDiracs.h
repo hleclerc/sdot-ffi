@@ -12,15 +12,15 @@ struct SumOfDiracs {
     SCInt ct_dim        = DECAYED_TYPE_OF( nb_dims )::value;
     using TF            = DECAYED_TYPE_OF( positions )::TF;
 
-    // Uniform 1D-source contract consumed by OtPlan1d (polymorphic over the source type -- a
+    // Uniform 1D-source contract consumed by SdotPlan1d (polymorphic over the source type -- a
     // ProjectedSumOfDiracs answers the same two methods but computes the position on the fly and
     // scatters the gradient back to its 2D points; see [[per-thread-scratch-facility]] cousin work).
     // Here the position is a plain buffer read of dim 0, and the gradient a per-angle buffer write.
 
-    /// This dirac's 1D coordinate (the value OtPlan1d sorts and sweeps on).
+    /// This dirac's 1D coordinate (the value SdotPlan1d sorts and sweeps on).
     HD TF position( SI i ) const { return positions( ::num_dirac = i, dim = 0 ); }
 
-    /// Compile-time: is the position gradient wanted for this source? (lets OtPlan1d skip the whole
+    /// Compile-time: is the position gradient wanted for this source? (lets SdotPlan1d skip the whole
     /// re-sort + re-sweep of the positions-grad block when it is not). Returns the `is_valid`
     /// compile-time flag of the member `add_position_grad` would write.
     HD auto position_grad_wanted( auto &&grad_src ) const { return grad_src.positions.is_valid; }
@@ -35,7 +35,7 @@ struct SumOfDiracs {
 
     /// No-op: `add_position_grad` here is a plain per-angle `=` (no cross-angle accumulation), so
     /// there is nothing to clear first (mirrors `ProjectedSumOfDiracs::zero_position_grad`, called
-    /// unconditionally by `OtPlan1d.py`'s `bwd_setup_code` regardless of which source is used).
+    /// unconditionally by `SdotPlan1d.py`'s `bwd_setup_code` regardless of which source is used).
     HD void zero_position_grad( auto &&, auto && ) const {}
 };
 

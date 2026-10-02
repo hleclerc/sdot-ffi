@@ -286,7 +286,7 @@ class PowerDiagram( Aggregate ):
         = second - 2 p . first + |p|^2 mass`, et les barycentres `first / mass`. Même balayage que
         `measures`, sur une distribution constante par morceaux ( `Image`, ou rien ) seulement.
         PAS dérivable : un coût de transport se dérive par le théorème de l'enveloppe, aux poids
-        ajustés -- `2 mass_i ( p_i - b_i )` -- ce que `OtPlan` fait tout seul."""
+        ajustés -- `2 mass_i ( p_i - b_i )` -- ce que `SdotPlanNd` fait tout seul."""
         dom = self._domain_cell()
         nb_words = self._scratch_words( self._scratch_capacity, self._nb_work_cells(), False )
         nt = driver.device.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ self.num_point ] )
@@ -313,7 +313,7 @@ class PowerDiagram( Aggregate ):
         indexés comme `positions` ; négatifs pour le domaine, à ignorer ) et `vals[ i, r ] =
         int_{facette ij} rho / ( 2 | p_i - p_j | )` -- de quoi assembler la JACOBIENNE des mesures par
         rapport aux poids, `d m_i / d w_j = - vals`, `d m_i / d w_i = + sum_j vals`, qui est aussi la
-        hessienne de la fonctionnelle duale d'un transport ( `OtPlan`, `objective = "newton"` ).
+        hessienne de la fonctionnelle duale d'un transport ( `SdotPlanNd`, `objective = "newton"` ).
         Tableaux hôtes. Une distribution constante par morceaux seulement. Un appel batché sur les
         cellules, comme `cells` ( le nombre de voisins par cellule a une capacité que loom double )."""
         n, d = int( self.nb_points.value ), self.dim_count

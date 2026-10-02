@@ -11,7 +11,7 @@ backend, DÉRIVABLE : une dérivée par rapport à `sorted_positions` revient su
 
 Changer les POIDS ne change pas l'arbre, seulement le majorant affine que chaque nœud porte
 ( `refresh_weight_majorants` ) : c'est ce qui rend un diagramme réutilisable d'un pas à l'autre
-d'un ajustement ( `OtPlan` ). Changer les POSITIONS le rebâtit.
+d'un ajustement ( `SdotPlanNd` ). Changer les POSITIONS le rebâtit.
 
 LA MÉMOIRE ( `memo_nbrs [ n, K ]`, `memo_counts [ n ]`, en rangs de l'arbre ) : les voisins de
 chaque cellule au dernier `measures`, que le fournisseur propose en premier au suivant
@@ -129,7 +129,7 @@ class PowerDiagram_Bsp( PowerDiagram ):
     def _ranks_of_items( self ):
         return self._rank_of
 
-    # ---- ce que le solveur de `OtPlan` ecrit ---------------------------------------------------------
+    # ---- ce que le solveur de `SdotPlanNd` ecrit ---------------------------------------------------------
 
     def _solver_weights_call( self ):
         """`( expression C++ du diagramme aux poids INSCRIPTIBLES, kwargs de l'appel, ce qu'il faut

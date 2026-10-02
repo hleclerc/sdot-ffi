@@ -39,17 +39,17 @@ class Image( Distribution ):
     # (`nb_pieces + 1`), not expressible as an affine function of the per-dim `shape` the way
     # `num_knot` is (that one stays ragged over `dim`, fine for `knots` but wrong-shaped here). Same
     # two-field shape as `SumOfDiracs`'s `nb_diracs`/`num_dirac`. Prescribed once in
-    # `_update_cell_cum_mass`, exactly like `OtPlan1d`'s own `nb_diracs`/`nb_dims` are prescribed
+    # `_update_cell_cum_mass`, exactly like `SdotPlan1d`'s own `nb_diracs`/`nb_dims` are prescribed
     # from elsewhere. A DECLARED axis (as opposed to a bare `Tensor`, fine for the truly-scalar
     # `current_mass`) is required so the generated C++ struct's `cell_cum_mass( c )` accepts an
     # index at all -- a bare `Tensor` field only ever gets a RANK-0 call operator.
     nb_cells_cum     : ShapeVar
     num_cell_cum     : Axis[ "nb_cells_cum" ]
 
-    # exclusive prefix sum of each cell's mass ([nb_pieces+1], see `nb_pieces`) -- lets `OtPlan1d`
+    # exclusive prefix sum of each cell's mass ([nb_pieces+1], see `nb_pieces`) -- lets `SdotPlan1d`
     # jump straight into the middle of its sequential walk (`Image::udp_at`) instead of following it
     # there step by step. Depends only on `values`/`frame`/`knots`, so it is CACHED like `current_mass`
-    # (`ensure_cell_cum_mass` below) instead of being rebuilt on every `OtPlan1d` forward/backward
+    # (`ensure_cell_cum_mass` below) instead of being rebuilt on every `SdotPlan1d` forward/backward
     # call -- previously it was, twice per call, see [[otplan1d-kernel-profile]].
     cell_cum_mass    : ComputedAttribute[ RealTensor[ "num_cell_cum" ], ( "values", "frame", "knots" ) ]
 
@@ -98,7 +98,7 @@ class Image( Distribution ):
 
     @property
     def nb_pieces( self ):
-        """Total flat cell count for the 1D case `OtPlan1d` consumes (a single `dim`) -- used to
+        """Total flat cell count for the 1D case `SdotPlan1d` consumes (a single `dim`) -- used to
         size `cell_cum_mass` (`nb_pieces + 1`, see `_update_cell_cum_mass`)."""
         return self.shape.static_count()
 
@@ -152,7 +152,7 @@ class Image( Distribution ):
 
     def ensure_cell_cum_mass( self ):
         """Materializes `cell_cum_mass` (a lazy `ComputedAttribute`, mirrors `mass`/`current_mass`)
-        if not already cached. Called once by `OtPlan1d` before it reads `dst_dist.cell_cum_mass` --
+        if not already cached. Called once by `SdotPlan1d` before it reads `dst_dist.cell_cum_mass` --
         a plain method (not a same-named property) because the FIELD itself must keep the name
         `cell_cum_mass` for the C++ struct it crosses the FFI as."""
         if self.cell_cum_mass.is_undefined:
@@ -160,7 +160,7 @@ class Image( Distribution ):
 
     def _update_cell_cum_mass( self ):
         # `values`/`frame`/`knots` carry no real gradient THROUGH `cell_cum_mass`: it is a routing
-        # helper for `OtPlan1d`'s walk, and `d cost/d values` is already computed there directly (a
+        # helper for `SdotPlan1d`'s walk, and `d cost/d values` is already computed there directly (a
         # closed form, `Phi_k`/`second_moment_about`), never via `cell_cum_mass`. `stop_gradient`
         # them going INTO this call so it needs no `backward` at all, and so `cell_cum_mass` itself
         # never carries a gradient trace back to `values` wherever it is read afterwards (once, here
@@ -203,8 +203,8 @@ class Image( Distribution ):
         )
         self.cell_cum_mass.set_raw( cell_cum_mass.raw )
 
-    def try_update_otplan1d( self, plan ):
-        """Closed-form, pure-JAX fast path for `OtPlan1d.update_outputs` when `self` is its
+    def try_update_sdotplan1d( self, plan ):
+        """Closed-form, pure-JAX fast path for `SdotPlan1d.update_outputs` when `self` is its
         1D piecewise-constant target: bypasses `driver.call`/the C++ kernel entirely (ordinary
         JAX autodiff differentiates straight through `_pure_jax_cost1d.cost_1d_ot`), evaluated
         ~1.2x-6x faster than the C++ kernel from n=1e6 through 1e8 diracs (see

@@ -2,13 +2,14 @@ import numpy
 
 from errand import Param, experiment, test
 
-from sdot import Image, OtPlan, PowerDiagram, SumOfDiracs, SumOfGaussians, Visualizer, box_half_spaces, write_convergence_html
+from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                   box_half_spaces, ot_solve, write_convergence_html )
 
 
 # le domaine VIENT DE LA DENSITÉ, et d'elle seule : le pavé d'une image, `centres +- 6 sigma` pour des
 # gaussiennes ( `SumOfGaussians.bounding_half_spaces` ). La masse hors du domaine est PERDUE ( 2e-9
 # à 6 sigma ), et le solveur remet les masses cibles à l'échelle de ce que le domaine contient
-# ( `otplan/Solve.h` ). `atol` des tests : la masse cible d'un dirac est `1 / n`, et Newton converge
+# ( `sdotplan/Solve.h` ). `atol` des tests : la masse cible d'un dirac est `1 / n`, et Newton converge
 # au bruit du noyau.
 
 
@@ -40,7 +41,7 @@ def _target_masses( plan ):
 
 if test( "newton_matches_the_target_masses" ):
     # le test de base : les masses des CELLULES, une fois l'ajustement fini, doivent retomber sur
-    # les masses des DIRACS -- c'est la seule chose que `OtPlan` promet. UNE gaussienne, large et
+    # les masses des DIRACS -- c'est la seule chose que `SdotPlanNd` promet. UNE gaussienne, large et
     # bien centrée sur le nuage de diracs : le cas le plus simple, sans aucun désert de densité.
     rng = numpy.random.default_rng( 3 )
     pos = rng.uniform( 0.15, 0.85, size = ( 20, 2 ) )
@@ -48,13 +49,49 @@ if test( "newton_matches_the_target_masses" ):
     dst = SumOfGaussians( numpy.array( [ [ 0.5, 0.5 ] ] ), numpy.array( [ 0.15 ] ),
                           weights = numpy.array( [ 1.0 ] ) )
 
-    plan = OtPlan( src, dst, max_iter = 50, mass_tol = 1e-12 )
+    plan = OtProblem( src, dst ).solve( Iterative( max_iter = 50, tol = 1e-12 ) )
 
     assert plan.converged, plan.stats
     got = numpy.asarray( plan.cell_masses ).reshape( -1 )
     assert numpy.allclose( got, _target_masses( plan ), atol = 1e-10 ), numpy.abs( got - _target_masses( plan ) ).max()
     # la masse cible est celle des diracs, à la queue au-delà de 6 sigma près
     assert abs( plan.stats[ "masse_domaine" ] - 1 ) < 1e-7, plan.stats[ "masse_domaine" ]
+
+
+if test( "ot_solve_is_the_same_plan_and_the_problem_is_what_warms_up" ):
+    # `ot_solve` n'est QUE le raccourci : même plan, aux derniers chiffres près. Et ce qu'il ne fait
+    # pas, qui est la raison de ne pas s'en servir dans une boucle : garder les poids d'une
+    # résolution à la suivante -- c'est l'`OtProblem` qui les porte.
+    rng = numpy.random.default_rng( 7 )
+    pos = rng.uniform( 0.15, 0.85, size = ( 30, 2 ) )
+    dst = SumOfGaussians( numpy.array( [ [ 0.5, 0.5 ] ] ), numpy.array( [ 0.2 ] ), weights = numpy.array( [ 1.0 ] ) )
+
+    direct = OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 50, tol = 1e-12 ) )
+    court  = ot_solve( SumOfDiracs( pos ), dst, max_iter = 50, tol = 1e-12 )
+    assert court.converged, court.stats
+    assert numpy.allclose( numpy.asarray( court.weights ), numpy.asarray( direct.weights ), atol = 1e-12 )
+    assert court.stats[ "nb_diag" ] == direct.stats[ "nb_diag" ], ( court.stats[ "nb_diag" ], direct.stats[ "nb_diag" ] )
+
+    # le RÉ-ÉCHAUFFEMENT est au problème, pas au raccourci : un nuage à peine déplacé repart des
+    # poids d'avant si on garde le problème, et de zéro si on ne le garde pas.
+    bouge = pos + 1e-4 * rng.normal( size = pos.shape )
+    pb = OtProblem( SumOfDiracs( pos ), dst )
+    pb.solve( Iterative( max_iter = 50, tol = 1e-12 ) )
+    pb.source = SumOfDiracs( bouge )
+    chaud = pb.solve( Iterative( max_iter = 50, tol = 1e-12 ) )
+    froid = ot_solve( SumOfDiracs( bouge ), dst, max_iter = 50, tol = 1e-12 )
+    assert chaud.stats[ "depart" ] == "weights0", chaud.stats[ "depart" ]
+    assert froid.stats[ "depart" ] == "voronoi", froid.stats[ "depart" ]
+    assert chaud.stats[ "nb_diag" ] < froid.stats[ "nb_diag" ], ( chaud.stats[ "nb_diag" ], froid.stats[ "nb_diag" ] )
+    assert numpy.allclose( numpy.asarray( chaud.weights ), numpy.asarray( froid.weights ), atol = 1e-8 )
+
+    # un réglage qui n'est pas de ce régime-là se DIT, il n'est pas ignoré
+    try:
+        ot_solve( SumOfDiracs( pos ), dst, with_barycenters = True )
+    except TypeError as e:
+        assert "Iterative" in str( e ), str( e )
+    else:
+        raise AssertionError( "`with_barycenters` appartient au regime direct : ot_solve aurait du lever" )
 
 
 if test( "starting_from_nonzero_weights_still_converges" ):
@@ -67,7 +104,7 @@ if test( "starting_from_nonzero_weights_still_converges" ):
     dst = _overlapping_target( 2, 2, seed = 3 )
     w0 = rng.uniform( -0.003, 0.003, 18 )
 
-    plan = OtPlan( src, dst, weights0 = w0, max_iter = 50, mass_tol = 1e-12 )
+    plan = OtProblem( src, dst ).solve( Iterative( weights0 = w0, max_iter = 50, tol = 1e-12 ) )
 
     assert plan.converged and plan.stats[ "depart" ] == "weights0", plan.stats
     got = numpy.asarray( plan.cell_masses ).reshape( -1 )
@@ -84,7 +121,7 @@ if test( "no_cell_dies_even_with_scattered_targets" ):
     src = SumOfDiracs( pos )
     dst = _scattered_target( 2, 4, seed = 6 )
 
-    plan = OtPlan( src, dst, max_iter = 200, mass_tol = 1e-12 )
+    plan = OtProblem( src, dst ).solve( Iterative( max_iter = 200, tol = 1e-12 ) )
 
     assert all( h[ "min_measure" ] > 0 for h in plan.history ), min( h[ "min_measure" ] for h in plan.history )
     assert plan.converged, plan.stats
@@ -152,7 +189,7 @@ if test( "newton_converges_quadratically_on_an_image" ):
     pos = rng.uniform( 0.05, 0.95, size = ( n, 2 ) )
     img = Image( values = 1 + 0.5 * rng.random( ( 24, 24 ) ), origin = [ 0.0, 0.0 ],
                  frame = [ [ 1 / 24, 0 ], [ 0, 1 / 24 ] ] )
-    plan = OtPlan( SumOfDiracs( pos ), img, max_iter = 60, mass_tol = 1e-10 / n )
+    plan = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 60, tol = 1e-10 / n ) )
     res = [ h[ "max_abs_residual" ] * n for h in plan.history ]
     assert plan.converged and res[ -1 ] < 1e-9 and len( res ) < 30, ( plan.stats, res[ -1 ], len( res ) )
     # les deux derniers pas : au moins un ordre de grandeur chacun ( la phase quadratique )
@@ -162,13 +199,12 @@ if test( "newton_converges_quadratically_on_an_image" ):
     # un diagramme par pas : aucun recul sur ce cas doux
     assert plan.stats[ "nb_recul" ] == 0 and plan.stats[ "nb_diag" ] == len( res ), plan.stats
 
-    warm = OtPlan( SumOfDiracs( pos + 1e-4 * rng.normal( size = pos.shape ) ), img, max_iter = 60, mass_tol = 1e-10 / n,
-                   weights0 = plan.weights )
+    warm = OtProblem( SumOfDiracs( pos + 1e-4 * rng.normal( size = pos.shape ) ), img ).solve( Iterative( max_iter = 60, tol = 1e-10 / n, weights0 = plan.weights ) )
     assert warm.stats[ "depart" ] == "weights0" and len( warm.history ) <= 6, ( warm.stats, len( warm.history ) )
 
     # un départ chaud qui VIDE une cellule ( des poids qui n'ont plus rien à voir avec le nuage )
     # est abandonné pour le Voronoï, et on converge quand même
-    bad = OtPlan( SumOfDiracs( pos ), img, max_iter = 60, mass_tol = 1e-10 / n, weights0 = rng.uniform( -1, 1, n ) )
+    bad = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 60, tol = 1e-10 / n, weights0 = rng.uniform( -1, 1, n ) ) )
     assert bad.converged and bad.stats[ "depart" ] == "voronoi", bad.stats
 
 
@@ -183,7 +219,7 @@ if test( "newton_starts_from_a_similarity_when_the_voronoi_has_empty_cells" ):
                  frame = [ [ 1 / 16, 0 ], [ 0, 1 / 16 ] ] )
     voronoi = PowerDiagram( pos, numpy.zeros( n ), distribution = img, kernel_dtype = "FP64" )
     assert ( numpy.asarray( voronoi.measures ) == 0 ).any()      # le problème existe bien
-    plan = OtPlan( SumOfDiracs( pos ), img, max_iter = 80, mass_tol = 1e-10 / n, keep_weights = True )
+    plan = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 80, tol = 1e-10 / n, keep_weights = True ) )
     assert plan.stats[ "depart" ] == "similitude", plan.stats
     assert plan.history[ 0 ][ "min_measure" ] > 0                # ... et le départ l'a résolu
     assert plan.converged, plan.stats
@@ -200,9 +236,9 @@ if test( "newton_works_in_3d" ):
     rng = numpy.random.default_rng( 61 )
     n = 200
     pos = rng.uniform( 0.05, 0.95, size = ( n, 3 ) )
-    # ( `OtPlan` demande une distribution : une image constante à un pavé est la mesure de Lebesgue )
+    # ( `SdotPlanNd` demande une distribution : une image constante à un pavé est la mesure de Lebesgue )
     img = Image( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) )
-    plan = OtPlan( SumOfDiracs( pos ), img, max_iter = 60, mass_tol = 1e-10 / n )
+    plan = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 60, tol = 1e-10 / n ) )
     assert plan.converged and len( plan.history ) < 30, ( plan.stats, len( plan.history ) )
     got = numpy.asarray( plan.cell_masses ).reshape( -1 )
     assert numpy.allclose( got, _target_masses( plan ), atol = 1e-11 )
@@ -216,8 +252,8 @@ if test( "the_limits_step_reaches_the_same_plan_with_fewer_diagrams" ):
     src = SumOfDiracs( pos )
     dst = _scattered_target( 2, 4, seed = 6 )
     # ( sans la continuation : c'est le Newton direct, et ses reculs, qu'on compare ici )
-    a = OtPlan( src, dst, max_iter = 200, mass_tol = 1e-12, step = "trials", continuation = "never" )
-    b = OtPlan( src, dst, max_iter = 200, mass_tol = 1e-12, step = "limits", continuation = "never" )
+    a = OtProblem( src, dst ).solve( Iterative( max_iter = 200, tol = 1e-12, continuation = "never", tuning = Tuning( step = "trials" ) ) )
+    b = OtProblem( src, dst ).solve( Iterative( max_iter = 200, tol = 1e-12, continuation = "never", tuning = Tuning( step = "limits" ) ) )
     assert a.converged and b.converged, ( a.stats, b.stats )
     assert numpy.allclose( numpy.asarray( a.weights ), numpy.asarray( b.weights ), atol = 1e-9 )
     assert b.stats[ "nb_diag" ] <= a.stats[ "nb_diag" ], ( a.stats[ "nb_diag" ], b.stats[ "nb_diag" ] )
@@ -226,15 +262,15 @@ if test( "the_limits_step_reaches_the_same_plan_with_fewer_diagrams" ):
 
 if test( "the_continuation_solves_what_direct_newton_cannot" ):
     # des bosses ÉTROITES ( le cas dur du banc, `solvers_des_familles` README § 9 ) : des cellules sans
-    # masse au départ, Newton direct STAGNE ; la continuation en largeur ( `otplan/Continuation.h` )
+    # masse au départ, Newton direct STAGNE ; la continuation en largeur ( `sdotplan/Continuation.h` )
     # converge, et `"auto"` la déclenche toute seule sur la plus petite masse du départ
     rng = numpy.random.default_rng( 91 )
     pos = rng.uniform( 0, 1, size = ( 400, 2 ) )
     centres = numpy.array( [ [ 0.3, 0.3 ], [ 0.7, 0.35 ], [ 0.4, 0.75 ], [ 0.75, 0.7 ] ] )
     dst = SumOfGaussians( centres, 0.04 * numpy.array( [ 1, 0.7, 1.3, 1 ] ), weights = numpy.array( [ 0.35, 0.25, 0.25, 0.15 ] ) )
-    direct = OtPlan( SumOfDiracs( pos ), dst, max_iter = 100, mass_rtol = 1e-6, continuation = "never" )
+    direct = OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 100, continuation = "never", tuning = Tuning( mass_rtol = 1e-6 ) ) )
     assert not direct.converged, direct.stats
-    plan = OtPlan( SumOfDiracs( pos ), dst, max_iter = 100, mass_rtol = 1e-6 )
+    plan = OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 100, tuning = Tuning( mass_rtol = 1e-6 ) ) )
     assert plan.converged and plan.stats[ "nb_etapes" ] > 1, plan.stats
     got = numpy.asarray( plan.cell_masses ).reshape( -1 )
     assert numpy.allclose( got, _target_masses( plan ), rtol = 1e-5 ), numpy.abs( got / _target_masses( plan ) - 1 ).max()
@@ -247,7 +283,7 @@ if test( "the_continuation_solves_what_direct_newton_cannot" ):
     values[ 6:10, 6:10 ] = 1.0
     values[ 20:26, 18:24 ] = 0.7
     img = Image( values = values, origin = [ 0.0, 0.0 ], frame = [ [ 1 / 32, 0 ], [ 0, 1 / 32 ] ] )
-    plan = OtPlan( SumOfDiracs( pos ), img, max_iter = 100, mass_rtol = 1e-6 )
+    plan = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 100, tuning = Tuning( mass_rtol = 1e-6 ) ) )
     assert plan.converged and plan.stats[ "nb_etapes" ] > 1, plan.stats
     got = numpy.asarray( plan.cell_masses ).reshape( -1 )
     assert numpy.allclose( got, _target_masses( plan ), rtol = 1e-5 ), numpy.abs( got / _target_masses( plan ) - 1 ).max()
@@ -260,7 +296,7 @@ if test( "the_domain_comes_from_the_density_alone" ):
     rng = numpy.random.default_rng( 3 )
     pos = rng.uniform( 0.4, 0.6, size = ( 60, 2 ) )
     dst = SumOfGaussians( numpy.array( [ [ 0.5, 0.5 ] ] ), numpy.array( [ 0.15 ] ), weights = numpy.array( [ 1.0 ] ) )
-    plan = OtPlan( SumOfDiracs( pos ), dst, max_iter = 100, mass_tol = 1e-12 )
+    plan = OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 100, tol = 1e-12 ) )
     assert plan.converged, plan.stats
     pd = plan._pd
     assert pd.box_min.is_defined and not pd.bnd_offsets.is_defined
@@ -271,7 +307,7 @@ if test( "the_domain_comes_from_the_density_alone" ):
     assert bary.min() < 0.3 and bary.max() > 0.7, ( bary.min(), bary.max() )
     # sans support déclaré, pas de domaine : on le dit
     try:
-        OtPlan( SumOfDiracs( pos ), SumOfGaussians( numpy.array( [ [ 0.5, 0.5 ] ] ), numpy.array( [ 0.15 ] ), support_sigmas = None ) )
+        OtProblem( SumOfDiracs( pos ), SumOfGaussians( numpy.array( [ [ 0.5, 0.5 ] ] ), numpy.array( [ 0.15 ] ), support_sigmas = None ) ).solve()
         assert False, "un domaine non borne devrait etre refuse"
     except ValueError:
         pass
@@ -284,8 +320,8 @@ if test( "the_plain_storage_gives_the_same_plan" ):
     n = 60
     pos = rng.uniform( 0.05, 0.95, size = ( n, 2 ) )
     img = Image( values = 1 + 0.5 * rng.random( ( 8, 8 ) ), origin = [ 0.0, 0.0 ], frame = [ [ 1 / 8, 0 ], [ 0, 1 / 8 ] ] )
-    a = OtPlan( SumOfDiracs( pos ), img, max_iter = 60, mass_tol = 1e-12 )
-    b = OtPlan( SumOfDiracs( pos ), img, max_iter = 60, mass_tol = 1e-12, accelerator = "plain" )
+    a = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 60, tol = 1e-12 ) )
+    b = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 60, tol = 1e-12, tuning = Tuning( accelerator = "plain" ) ) )
     assert a.converged and b.converged
     assert numpy.allclose( numpy.asarray( a.weights ), numpy.asarray( b.weights ), atol = 1e-10 )
 
@@ -337,7 +373,7 @@ if test( "the_transport_cost_derives_by_the_envelope_theorem" ):
     img = Image( values = 1 + 0.5 * rng.random( ( 12, 12 ) ), origin = [ 0.0, 0.0 ], frame = [ [ 1 / 12, 0 ], [ 0, 1 / 12 ] ] )
 
     def plan_at( p, w0 = None ):
-        return OtPlan( SumOfDiracs( p ), img, weights0 = w0, max_iter = 100, mass_tol = 1e-14 )
+        return OtProblem( SumOfDiracs( p ), img ).solve( Iterative( weights0 = w0, max_iter = 100, tol = 1e-14 ) )
 
     plan = plan_at( pos )
     cost, grad = plan.cost_and_position_grad()
@@ -359,7 +395,7 @@ if test( "the_transport_cost_derives_by_the_envelope_theorem" ):
 
 # -- ce qu'on REGARDE ------------------------------------------------------------------------
 #
-#   ./run experiment test_OtPlan
+#   ./run experiment test_SdotPlanNd
 
 def _report( p, plan, pos, stem ):
     """Commun aux deux expériences ci-dessous : la même paire ( courbe, animation ), la même
@@ -374,12 +410,12 @@ def _report( p, plan, pos, stem ):
           "résidu max":                       [ h[ "max_abs_residual" ] for h in plan.history ],
           "mesure minimale (jamais 0)":       [ h[ "min_measure" ] for h in plan.history ] },
         p.out_dir / f"{ stem }_convergence.html",
-        title = f"OtPlan 2D -- { len( pos ) } diracs" )
+        title = f"SdotPlanNd 2D -- { len( pos ) } diracs" )
 
     idx = numpy.unique( numpy.linspace(
         0, len( plan.history ) - 1, min( 40, len( plan.history ) ) ).astype( int ) )
 
-    viz = Visualizer( title = f"OtPlan 2D, { len( pos ) } diracs -- convergence", frame_axis = "pas" )
+    viz = Visualizer( title = f"SdotPlanNd 2D, { len( pos ) } diracs -- convergence", frame_axis = "pas" )
     for j, i in enumerate( idx ):
         if j:
             viz.new_frame( int( plan.history[ i ][ "step" ] ) )
@@ -394,7 +430,7 @@ if p := experiment( "ot 2D newton",
                     nb_gaussians = Param( 2, help = "nombre de gaussiennes de la cible" ),
                     max_iter     = Param( 100, help = "nombre de pas" ),
                     seed         = Param( 5, help = "graine du tirage" ) ):
-    # ce que fait `OtPlan` : PARTIR des poids nuls ( le Voronoï -- chaque cellule prend sa part
+    # ce que fait `SdotPlanNd` : PARTIR des poids nuls ( le Voronoï -- chaque cellule prend sa part
     # purement géométrique ) et les faire GLISSER jusqu'à ce que chaque cellule pèse, contre la
     # densité cible, exactement ce que pèse son dirac. La courbe de convergence dit SI ça converge
     # et à quelle vitesse ; l'animation montre COMMENT : les PLANS glissent d'un pas à l'autre,
@@ -403,7 +439,7 @@ if p := experiment( "ot 2D newton",
     src = SumOfDiracs( pos )
     dst = _overlapping_target( 2, p.nb_gaussians, seed = p.seed + 1 )
 
-    plan = OtPlan( src, dst, max_iter = p.max_iter, keep_weights = True, verbose = True )
+    plan = OtProblem( src, dst ).solve( Iterative( max_iter = p.max_iter, keep_weights = True ), verbose = True )
     _report( p, plan, pos, "ot_2d_newton" )
 
 
@@ -419,5 +455,5 @@ if p := experiment( "ot 2D newton scattered",
     src = SumOfDiracs( pos )
     dst = _scattered_target( 2, p.nb_gaussians, seed = p.seed + 1 )
 
-    plan = OtPlan( src, dst, max_iter = p.max_iter, keep_weights = True, verbose = True )
+    plan = OtProblem( src, dst ).solve( Iterative( max_iter = p.max_iter, keep_weights = True ), verbose = True )
     _report( p, plan, pos, "ot_2d_newton_scattered" )

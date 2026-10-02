@@ -14,7 +14,7 @@ struct ProjectedSumOfDiracs {
     SCInt ct_proj = DECAYED_TYPE_OF( proj_dims )::value;  // ambient space: 2
     using TF      = DECAYED_TYPE_OF( points )::TF;
 
-    // Same 1D-source contract as SumOfDiracs, consumed polymorphically by OtPlan1d -- but the position
+    // Same 1D-source contract as SumOfDiracs, consumed polymorphically by SdotPlan1d -- but the position
     // is computed ON THE FLY (no materialized [nb_angles, n] projection) and the gradient scatters
     // back to the shared ambient points.
 
@@ -40,7 +40,7 @@ struct ProjectedSumOfDiracs {
     }
 
     /// Clear the whole `grad_points` buffer -- called ONCE, as a pre-pass BEFORE `add_position_grad`'s
-    /// atomic adds (see `OtPlan1d.py`'s `bwd_setup_code`). Needed because the points gradient
+    /// atomic adds (see `SdotPlan1d.py`'s `bwd_setup_code`). Needed because the points gradient
     /// ACCUMULATES ACROSS EVERY ANGLE sharing this buffer (unlike a per-angle value): a fresh Jax/XLA
     /// FFI output buffer is NOT guaranteed to start zeroed, so without this the atomic adds land on
     /// whatever device memory happened to be there before. Routed through `Tensor::fill_with( queue,

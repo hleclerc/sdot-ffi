@@ -1,13 +1,13 @@
 #pragma once
 
-#include <sdot/generated/aggregates/OtPlan1d.h>
+#include <sdot/generated/aggregates/SdotPlan1d.h>
 #include <loom/support/common_macros.h>
 
 namespace sdot {
 
-SDOT_TEMPLATE_DECL_FOR_OtPlan1d
-struct OtPlan1d {
-    SDOT_ATTRIBUTES_OF_OtPlan1d
+SDOT_TEMPLATE_DECL_FOR_SdotPlan1d
+struct SdotPlan1d {
+    SDOT_ATTRIBUTES_OF_SdotPlan1d
 
     SCInt ct_dim        = DECAYED_TYPE_OF( nb_dims )::value;
     using TF            = DECAYED_TYPE_OF( cost )::TF;
@@ -37,7 +37,7 @@ struct OtPlan1d {
     // Sort-independent halves of the forward/backward -- the sweep only, given a (however obtained)
     // sorted order. Shared by the internally-sorting entry points below and by the `_presorted` ones,
     // which take that order as already provided (e.g. from `jnp.argsort`, see
-    // `OtPlan1d.py::update_outputs_presorted`; [[jax-sort-lax-scan]]).
+    // `SdotPlan1d.py::update_outputs_presorted`; [[jax-sort-lax-scan]]).
     HD void  sweep_outputs( auto &&sorted_indices, auto &&sorted_pos, auto &&group_scan,
                           int local_index, int local_size, auto &&group );
     HD void  sweep_outputs_bwd( auto &&grad_plan, auto &&sorted_indices, auto &&sorted_pos, auto &&group_scan,
@@ -58,4 +58,4 @@ struct OtPlan1d {
 
 }
 
-#include "OtPlan1d.cxx"
+#include "SdotPlan1d.cxx"

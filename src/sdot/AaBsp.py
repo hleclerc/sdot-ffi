@@ -255,7 +255,7 @@ class AaBsp( SpatialAccelerator ):
         étant donnés DANS L'ORDRE DE L'ARBRE ( ce que `PowerDiagram_Bsp` stocke ), une tranche par
         nœud. Un kernel, un work-item par nœud ( `AaBsp.h::refresh_majorant` ).
 
-        C'est ce qui rend un arbre RÉUTILISABLE quand seuls les poids changent ( un pas de `OtPlan`,
+        C'est ce qui rend un arbre RÉUTILISABLE quand seuls les poids changent ( un pas de `SdotPlanNd`,
         où les positions sont les constantes du problème ) : la forme de l'arbre ne dépend que des
         positions, et la seule chose qui parle des poids est ce majorant. Il accepte des poids
         TRACÉS ( les nœuds sortent alors tracés eux aussi ) et coupe le gradient : le majorant est
@@ -272,7 +272,7 @@ class AaBsp( SpatialAccelerator ):
                            weights = driver.stop_gradient( getattr( sorted_weights, "raw", sorted_weights ) ) )
 
         # l'arbre n'est PAS un argument : ses majorants courants sont ce qu'on remplace, et sous
-        # une trace ils peuvent être des traceurs d'une trace close ( voir `OtPlan` ). Seules les
+        # une trace ils peuvent être des traceurs d'une trace close ( voir `SdotPlanNd` ). Seules les
         # tranches entrent.
         loom.ffi_call(
             "bsp_refresh_majorants",

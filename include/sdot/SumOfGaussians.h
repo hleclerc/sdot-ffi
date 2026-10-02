@@ -31,7 +31,7 @@ struct SumOfGaussians {
 
     /// LA CONVOLUTION par une gaussienne de largeur `conv_s` ( `with_convolution` ) : sur une somme de
     /// gaussiennes elle ne change que les largeurs, `sigma_i' = sqrt( sigma_i^2 + conv_s^2 )`, rien
-    /// d'autre -- ce que la continuation en largeur de `OtPlan` parcourt ( `otplan/Continuation.h` ).
+    /// d'autre -- ce que la continuation en largeur de `SdotPlanNd` parcourt ( `sdotplan/Continuation.h` ).
     /// Un membre A PART des attributs generes : `0` par defaut, donc absent de tout appel ordinaire.
     TF conv_s = 0;
 
@@ -118,7 +118,7 @@ struct SumOfGaussians {
     HD auto kernel_at( SI i, const auto &x ) const;
 
     /// `Int_{arete} rho ds` sur l'arete `cut` de la cellule 2D `pc` ( `[ v_cut, v_cut+1 ]` ) -- ce que le
-    /// laplacien d'un transport lit ( `otplan/Balayage.h` ) : une gaussienne le long d'un segment est
+    /// laplacien d'un transport lit ( `sdotplan/Balayage.h` ) : une gaussienne le long d'un segment est
     /// un `erf`, la distance au segment etant constante. 2D seulement.
     HD TF   facet_mass    ( const auto &pc, int cut ) const;
 
