@@ -9,15 +9,16 @@ appel. On peut rebrancher une entrée et redemander la solution :
     pb = OtProblem( SumOfDiracs( pos ), image )
     sol = pb.solve()
     pb.source = SumOfDiracs( pos_suivantes )      # une entrée change
-    sol = pb.solve()                              # et les poids d'avant servent de départ
+    sol = pb.solve()                              # et la SOLUTION d'avant sert de départ
 
 `solve()` rend une SOLUTION, un objet à part -- `SdotPlan1d` ou `SdotPlanNd`. Un problème peut
 avoir plusieurs solutions ( deux tolérances, deux départs ) et ne doit donc pas en porter une.
 
 Pour un transport qu'on ne résout QU'UNE FOIS, `ot_solve( source, target, ... )` fait les deux en
 une expression. Ce n'est un raccourci que dans ce cas-là : dès qu'on résout plusieurs fois, c'est
-l'`OtProblem` gardé qui porte les poids de la fois d'avant, et c'est lui qui fait qu'un transport
-voisin coûte quelques pas de Newton au lieu de quelques dizaines.
+l'`OtProblem` gardé qui porte la SOLUTION de la fois d'avant, et c'est lui qui fait qu'un transport
+voisin coûte quelques pas de Newton au lieu de quelques dizaines. Un plan et non des poids, parce
+que des poids seuls ne décrivent pas une solution dès qu'il y a des germes confondus ( § 23.11 ).
 
 = Direct ou itératif : le problème a déjà choisi
 
@@ -95,10 +96,19 @@ class Iterative:
     `tol` : on s'arrête dès que `max_i | m_i - nu_i | <= tol`, ABSOLU, dans l'unité des masses
     normalisées ( la masse cible d'un dirac est `1 / n` ). `max_iter` : pas de Newton, au plus.
 
-    `weights0` : le départ. `None` demande à `OtProblem` ce qu'il a gardé de la dernière solution
-    ( voir `OtProblem.solve` ) ; les poids d'un ajustement voisin sont ce dont vit une
-    reconstruction. Un départ qui vide une cellule n'est pas une erreur : le C++ compare lui-même
-    les départs qu'il connaît et garde le meilleur ( `stats[ "depart" ]` ).
+    `ot_plan` : LE DÉPART, sous la forme d'une SOLUTION précédente -- ce dont vit une reconstruction,
+    où un transport voisin coûte quelques pas de Newton au lieu de quelques dizaines. C'est un plan et
+    non un vecteur de poids, et c'est structurel : dès qu'il y a des germes confondus, les poids seuls
+    NE DÉCRIVENT PAS la solution ( § 23.11 -- c'est le couple ( problème réduit, plans de coupe ) qui
+    porte la précision ), donc un départ qui n'est que `w` perd l'agrégat. Un plan le porte, et il
+    porte aussi les POSITIONS pour lesquelles il a été résolu : quand elles n'ont pas changé, les
+    grappes n'ont pas à être redétectées ( ce que l'étape 7 exploitera ).
+
+    `weights0` : les poids NUS, quand c'est tout ce qu'on a ( un fichier, un essai délibéré ).
+    `ot_plan` est la bonne façon ; donner les deux lève. Sans l'un ni l'autre, `OtProblem` propose la
+    dernière solution qu'il a rendue ( voir `OtProblem.solve` ). Un départ qui vide une cellule n'est
+    pas une erreur : le C++ compare lui-même les départs qu'il connaît et garde le meilleur
+    ( `stats[ "depart" ]`, et `stats[ "repris" ]` dit ce que le départ à chaud a fourni ).
 
     `continuation` : la CONTINUATION EN LARGEUR -- résoudre d'abord pour la densité convolée par une
     gaussienne large, puis de plus en plus étroite, chaque étape partant des poids de la précédente.
@@ -123,12 +133,17 @@ class Iterative:
 
     regime = "iterative"
 
-    def __init__( self, tol = 1e-8, max_iter = 100, weights0 = None, continuation = "auto",
-                  precision = "auto", aggregate = True, keep_weights = False, tuning = None ):
+    def __init__( self, tol = 1e-8, max_iter = 100, ot_plan = None, weights0 = None,
+                  continuation = "auto", precision = "auto", aggregate = True, keep_weights = False,
+                  tuning = None ):
         if precision not in _PRECISIONS:
             raise ValueError( f"precision inconnue : { precision !r } ( { ', '.join( _PRECISIONS ) } )" )
         if continuation not in ( "auto", "always", "never" ):
             raise ValueError( f"continuation inconnue : { continuation !r } ( 'auto', 'always' ou 'never' )" )
+        if ot_plan is not None and weights0 is not None:
+            raise ValueError( "Iterative : `ot_plan` ET `weights0` -- il n'y a qu'un depart. `ot_plan` "
+                              "est celui a garder ( il porte l'agregat et les positions, voir la docstring )" )
+        self.ot_plan      = ot_plan
         self.tol          = float( tol )
         self.max_iter     = int( max_iter )
         self.weights0     = weights0
@@ -175,7 +190,7 @@ class OtProblem:
         SEULE -- il n'y a pas de second endroit où le dire."""
         if target is None:
             raise ValueError( "OtProblem : il faut une cible -- c'est elle qui donne le domaine" )
-        self._warm = None                                # les poids de la dernière solution
+        self._last = None                                # la dernière solution rendue ( pas ses poids )
         self._source = None
         self._target = None
         self.source = source
@@ -193,9 +208,9 @@ class OtProblem:
         if source is None:
             raise ValueError( "OtProblem : il faut une source" )
         source = source.normalized_version()
-        # un nuage qui a changé de TAILLE périme les poids gardés ( un étage de multi-échelle )
+        # un nuage qui a changé de TAILLE périme la solution gardée ( un étage de multi-échelle )
         if self._source is not None and self._nb_diracs_of( source ) != self._nb_diracs_of( self._source ):
-            self._warm = None
+            self._last = None
         self._source = source
 
     @property
@@ -248,9 +263,10 @@ class OtProblem:
         `settings` : `None` pour les défauts du régime, ou un `Direct` / `Iterative` -- et son TYPE
         doit être celui du régime, sans quoi on lève ( voir la docstring du module ).
 
-        Un `Iterative` sans `weights0` repart des poids de la dernière solution de CE problème,
-        quand il y en a une et que le nombre de diracs n'a pas changé : c'est ce dont vit une
-        reconstruction, et ça n'a plus à être recopié à la main par l'appelant."""
+        Un `Iterative` qui n'impose pas de départ ( ni `ot_plan` ni `weights0` ) repart de la
+        dernière SOLUTION de CE problème, quand il y en a une et que le nombre de diracs n'a pas
+        changé : c'est ce dont vit une reconstruction, et ça n'a plus à être recopié à la main par
+        l'appelant."""
         regime = self.regime
         if settings is None:
             settings = { "direct": Direct, "iterative": Iterative }[ regime ]()
@@ -265,11 +281,12 @@ class OtProblem:
             return SdotPlan1d._solve( self, settings, verbose )
 
         from .SdotPlanNd import SdotPlanNd
-        # le RE-ECHAUFFEMENT : les poids de la derniere solution, quand l'appelant n'en impose pas
-        # d'autres. Passe a part, et non ecrit dans `settings` -- un objet de reglages que l'appelant
-        # garde ne doit pas se mettre a porter l'etat du probleme.
-        sol = SdotPlanNd._solve( self, settings, verbose, warm = self._warm )
-        self._warm = sol.weights
+        # le RE-ECHAUFFEMENT : la derniere SOLUTION, quand l'appelant n'impose pas de depart.
+        # Un plan et non des poids -- il porte l'agregat, que `w` seul ne sait pas decrire
+        # ( README § 23.11 ). Passe a part, et non ecrit dans `settings` : un objet de reglages que
+        # l'appelant garde ne doit pas se mettre a porter l'etat du probleme.
+        sol = SdotPlanNd._solve( self, settings, verbose, warm = self._last )
+        self._last = sol
         return sol
 
     # -- les détails -----------------------------------------------------------------------------
@@ -302,6 +319,7 @@ def ot_solve( source, target, *, verbose = False, **settings ):
 
         sol = ot_solve( SumOfDiracs( pos ), image )
         sol = ot_solve( SumOfDiracs( pos ), image, tol = 1e-10 )     # d >= 2 : un `Iterative`
+        sol = ot_solve( SumOfDiracs( pos2 ), image, ot_plan = sol )   # en repartant du plan d'avant
         sol = ot_solve( diracs_1d, image_1d, with_barycenters = True )   # d = 1 : un `Direct`
 
     Les réglages se donnent ici en MOTS-CLEFS, et non comme un objet : le régime est déduit des
@@ -309,17 +327,21 @@ def ot_solve( source, target, *, verbose = False, **settings ):
     Un nom qui n'appartient pas au régime lève, en disant lequel c'est et ce qu'il accepte --
     jamais ignoré en silence.
 
-    **À ne pas utiliser dans une boucle.** Ce qui fait qu'un transport voisin coûte quelques pas de
-    Newton au lieu de quelques dizaines, c'est de repartir des poids de la fois d'avant, et c'est
-    l'`OtProblem` qui les garde. Une reconstruction, une descente, un balayage de paramètre gardent
-    donc le problème et rebranchent ses entrées :
+    Pour repartir d'une résolution précédente, `ot_plan = la_solution_d_avant` -- un PLAN et non des
+    poids, parce que les poids seuls ne décrivent pas une solution dès qu'il y a des germes confondus
+    ( voir `Iterative` ).
+
+    **Mais dans une boucle, garder le problème est mieux.** Il propose la dernière solution tout seul,
+    il la périme tout seul quand le nuage change de taille, et c'est un `ot_plan` de moins à faire
+    circuler. Une reconstruction, une descente, un balayage de paramètre gardent donc le problème et
+    rebranchent ses entrées :
 
         pb = OtProblem( SumOfDiracs( pos ), image )
         for _ in range( nb_pas ):
             sol = pb.solve()                      # repart des poids d'avant
             pb.source = SumOfDiracs( deplace( pos, sol ) )
 
-    `ot_solve` refait un `OtProblem` neuf à chaque appel, donc repart de zéro à chaque fois."""
+    `ot_solve` refait un `OtProblem` neuf à chaque appel : sans `ot_plan`, il repart de zéro."""
     pb = OtProblem( source, target )
     cls = { "direct": Direct, "iterative": Iterative }[ pb.regime ]
     try:

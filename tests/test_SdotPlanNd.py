@@ -58,10 +58,11 @@ if test( "newton_matches_the_target_masses" ):
     assert abs( plan.stats[ "masse_domaine" ] - 1 ) < 1e-7, plan.stats[ "masse_domaine" ]
 
 
-if test( "ot_solve_is_the_same_plan_and_the_problem_is_what_warms_up" ):
-    # `ot_solve` n'est QUE le raccourci : même plan, aux derniers chiffres près. Et ce qu'il ne fait
-    # pas, qui est la raison de ne pas s'en servir dans une boucle : garder les poids d'une
-    # résolution à la suivante -- c'est l'`OtProblem` qui les porte.
+if test( "ot_solve_and_the_warm_start_is_a_PLAN_not_weights" ):
+    # `ot_solve` n'est QUE le raccourci : même plan, aux derniers chiffres près. Et le départ à chaud
+    # est un PLAN -- soit donné par `ot_plan`, soit proposé par l'`OtProblem` qui garde sa dernière
+    # solution. Un plan et non des poids : dès qu'il y a des germes confondus, `w` seul ne décrit pas
+    # la solution ( README § 23.11 ), et le plan porte aussi de quoi ne pas redétecter les grappes.
     rng = numpy.random.default_rng( 7 )
     pos = rng.uniform( 0.15, 0.85, size = ( 30, 2 ) )
     dst = SumOfGaussians( numpy.array( [ [ 0.5, 0.5 ] ] ), numpy.array( [ 0.2 ] ), weights = numpy.array( [ 1.0 ] ) )
@@ -84,6 +85,36 @@ if test( "ot_solve_is_the_same_plan_and_the_problem_is_what_warms_up" ):
     assert froid.stats[ "depart" ] == "voronoi", froid.stats[ "depart" ]
     assert chaud.stats[ "nb_diag" ] < froid.stats[ "nb_diag" ], ( chaud.stats[ "nb_diag" ], froid.stats[ "nb_diag" ] )
     assert numpy.allclose( numpy.asarray( chaud.weights ), numpy.asarray( froid.weights ), atol = 1e-8 )
+
+    # `ot_plan` : le départ EST un plan, et il donne le même résultat que le problème gardé
+    repris = ot_solve( SumOfDiracs( bouge ), dst, ot_plan = direct, max_iter = 50, tol = 1e-12 )
+    assert repris.stats[ "repris" ] == "ot_plan", repris.stats[ "repris" ]
+    assert repris.stats[ "depart" ] == "weights0", repris.stats[ "depart" ]
+    assert repris.stats[ "nb_diag" ] == chaud.stats[ "nb_diag" ], ( repris.stats[ "nb_diag" ], chaud.stats[ "nb_diag" ] )
+    assert froid.stats[ "repris" ] == "rien", froid.stats[ "repris" ]
+
+    # un plan qui ne porte pas le bon nombre de poids ne peut pas servir : IMPOSÉ, ça lève ( l'appelant
+    # croit repartir à chaud ) ; proposé par le problème, c'est abandonné et DIT
+    try:
+        ot_solve( SumOfDiracs( pos[ :20 ] ), dst, ot_plan = direct )
+    except ValueError as e:
+        assert "ot_plan" in str( e ), str( e )
+    else:
+        raise AssertionError( "un ot_plan de la mauvaise taille aurait du lever" )
+    pb2 = OtProblem( SumOfDiracs( pos ), dst )
+    pb2.solve( Iterative( max_iter = 50, tol = 1e-12 ) )
+    pb2.source = SumOfDiracs( pos[ :20 ] )                        # un étage de multi-échelle
+    moins = pb2.solve( Iterative( max_iter = 50, tol = 1e-12 ) )
+    assert moins.stats[ "repris" ] == "rien", moins.stats[ "repris" ]
+    assert moins.stats[ "depart" ] == "voronoi", moins.stats[ "depart" ]
+
+    # les deux départs à la fois n'ont pas de sens
+    try:
+        Iterative( ot_plan = direct, weights0 = numpy.zeros( len( pos ) ) )
+    except ValueError as e:
+        assert "ot_plan" in str( e ), str( e )
+    else:
+        raise AssertionError( "ot_plan ET weights0 aurait du lever" )
 
     # un réglage qui n'est pas de ce régime-là se DIT, il n'est pas ignoré
     try:

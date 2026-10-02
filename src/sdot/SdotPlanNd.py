@@ -134,8 +134,9 @@ class SdotPlanNd:
 
     @classmethod
     def _solve( cls, problem, settings, verbose, warm = None ):
-        """LE chemin : `OtProblem.solve()` et lui seul passe par ici. `warm` sont les poids que le
-        problème a gardés de sa dernière solution -- le départ quand `settings.weights0` est `None`."""
+        """LE chemin : `OtProblem.solve()` et lui seul passe par ici. `warm` est la dernière SOLUTION
+        que le problème a rendue -- le départ quand les réglages n'en imposent pas ( voir
+        `_depart_du_plan` )."""
         self = cls.__new__( cls )
         self._build( problem, settings, verbose, warm )
         return self
@@ -187,9 +188,21 @@ class SdotPlanNd:
         if tun.linear_solver not in _LIN:
             raise ValueError( f"linear_solver inconnu : { tun.linear_solver !r } ( { ', '.join( _LIN ) } )" )
 
+        # LE DÉPART. Trois sources, dans cet ordre : le plan donné, les poids nus donnés, le dernier
+        # plan du problème. `_depart_du_plan` dit ce qu'il a pu en tirer, et `stats[ "repris" ]` le
+        # rapporte -- un départ à chaud silencieusement jeté est exactement ce qui fait perdre une
+        # après-midi.
+        plan = settings.ot_plan if settings.ot_plan is not None else warm
+        impose = settings.ot_plan is not None
+        if settings.weights0 is not None:
+            w0_given, self._repris = settings.weights0, "weights0"
+        elif plan is not None:
+            w0_given, self._repris = self._depart_du_plan( plan, src_dist, impose )
+        else:
+            w0_given, self._repris = None, "rien"
+
         # LE diagramme, bâti une fois sur les positions ( voir la docstring du module ) ; les poids
         # qu'il porte à un instant donné sont les derniers posés
-        w0_given = settings.weights0 if settings.weights0 is not None else warm
         self._pd = PowerDiagram( src_dist.positions,
                                  RealTensor[ src_dist.num_dirac ].full( 0.0 ) if w0_given is None else w0_given,
                                  accelerator = tun.accelerator, kernel_dtype = settings.kernel_dtype,
@@ -293,6 +306,29 @@ class SdotPlanNd:
         self._read_stats( stats, settings )
         self._read_history( history, settings, pd )
 
+    @staticmethod
+    def _depart_du_plan( plan, src_dist, impose ):
+        """Ce qu'un PLAN précédent fournit comme départ : `( weights0, ce_qu_on_a_repris )`.
+
+        Un plan dont le nombre de diracs ne correspond plus ne vaut rien ( le cas courant : un étage
+        de multi-échelle ). On le laisse tomber, mais on le DIT -- et si l'appelant l'avait imposé
+        explicitement par `ot_plan`, on lève, parce qu'il croit repartir à chaud et ne le fait pas.
+
+        Les GRAPPES ne sont pas encore reprises : il n'y en a pas ( l'agrégation est l'étape 7 de
+        `notes/2026-10-02-sdotplan.md` ). Quand elles arriveront, c'est ici qu'elles passent -- et
+        c'est pourquoi le départ est un plan et non un vecteur de poids : `plan.clusters` et les
+        positions pour lesquelles il a été résolu sont ce qui permet de ne pas redétecter les
+        grappes quand les germes n'ont pas bougé ( README § 23.11, § 23.8 )."""
+        n_plan = int( plan.weights.shape[ 0 ] )
+        n = int( src_dist.nb_diracs.value )
+        if n_plan != n:
+            if impose:
+                raise ValueError( f"Iterative( ot_plan = ... ) : ce plan porte { n_plan } poids et la "
+                                  f"source en a { n } -- il ne peut pas servir de depart. Le retirer, "
+                                  "ou garder un `OtProblem` ( il perime sa solution tout seul )" )
+            return None, f"rien ( le plan garde porte { n_plan } poids, la source en a { n } )"
+        return plan.weights, "ot_plan"
+
     def _read_stats( self, stats, settings ):
         #: ce que le solveur rapporte ( voir `sdotplan/Solve.h::Stat` ), plus `fin` et `depart` en clair
         st = stats.raw
@@ -307,6 +343,8 @@ class SdotPlanNd:
         # plafonne alors vers `1e-6` sans le moindre message ( README § 23.11 ).
         self.stats[ "agregation" ] = ( "demandee, pas encore branchee ( etape 7 )" if settings.aggregate
                                        else "non demandee" )
+        #: ce que le départ à chaud a fourni : `"ot_plan"`, `"weights0"`, ou `"rien"` ( et pourquoi )
+        self.stats[ "repris" ] = self._repris
 
     def _read_history( self, history, settings, pd ):
         #: un dict par pas ACCEPTÉ -- `step = 0` est le point de départ : `t`, `residual_l2`,
