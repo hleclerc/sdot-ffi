@@ -20,7 +20,7 @@ import socket
 #: the variables that change what is measured, and are therefore printed with each result
 ENV_VARS = ( "LOOM_NB_THREADS", "SDOT_NB_THREADS", "SDOT_PIN_THREADS", "SDOT_CPU_VARIANT", "SDOT_NO_MARCH_NATIVE", "SDOT_CXXFLAGS",
              "LOOM_CXX", "LOOM_CXXFLAGS", "LOOM_FRAMEWORK", "LOOM_DEVICE", "SDOT_KTYPE", "SDOT_CATALOGUE_DIR",
-             "SDOT_CASES_DIR", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS" )
+             "SDOT_CASES_DIR", "LOOM_KERNEL_TIMING", "LOOM_BUILD_DIR", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS" )
 
 
 def set_threads( threads, pin ):
@@ -83,3 +83,65 @@ def driver_line():
     """the loom framework and device in use ( import loom late: call it AFTER `set_threads` )"""
     from loom.drivers.driver import driver
     return f"driver { driver.framework }, device { driver.device }"
+
+
+# -- GPU ------------------------------------------------------------------------------------------------
+
+def set_kernel_timing( on = True ):
+    """`LOOM_KERNEL_TIMING=1`: CUDA events around each kernel launch ( `loom/devices/kernel_timing.py` ). Read ONCE
+    per library, at its first launch: call it before anything runs. Without effect on the CPU. A value already in
+    the environment is left alone."""
+    os.environ.setdefault( "LOOM_KERNEL_TIMING", "1" if on else "0" )
+
+
+class KernelTiming:
+    """the kernel-only time of a window: `reset()`, the calls, `read()` -> `{ ms, count, main, all }`, `main` being
+    the kernel that took the longest ( its registers, local bytes, occupancy... ), `all` every kernel that ran"""
+
+    def __init__( self ):
+        from loom.devices import kernel_timing
+        self.kt = kernel_timing
+
+    def reset( self ):
+        self.kt.reset()
+
+    def read( self ):
+        ran = [ k for k in self.kt.read() if k[ "count" ] > 0 ]
+        if not ran:
+            return None
+        return dict( ms = sum( k[ "ms" ] for k in ran ), count = sum( k[ "count" ] for k in ran ),
+                     main = max( ran, key = lambda k: k[ "ms" ] ), all = ran )
+
+    @staticmethod
+    def missing():
+        from loom.devices import kernel_timing
+        return kernel_timing.missing()
+
+
+def block_until_ready( x ):
+    """waits for an asynchronous result ( a jax array ); nothing for the others"""
+    f = getattr( x, "block_until_ready", None )
+    if f is not None:
+        f()
+    return x
+
+
+def dtype_of( tensor ):
+    raw = getattr( tensor, "raw", tensor )
+    return str( getattr( raw, "dtype", type( raw ).__name__ ) )
+
+
+def accuracy( m, ref ):
+    """`| m - ref | / ref` per cell, over the cells where `ref > 0`: median, p99.99, max ( and how many cells had none )"""
+    import numpy
+    m = numpy.asarray( m, dtype = float ).reshape( -1 )
+    ref = numpy.asarray( ref, dtype = float ).reshape( -1 )
+    ok = ref > 0
+    rel = numpy.abs( m[ ok ] - ref[ ok ] ) / ref[ ok ]
+    return dict( median = float( numpy.median( rel ) ), p9999 = float( numpy.quantile( rel, 0.9999 ) ), max = float( rel.max() ),
+                 empty_cells = int( ( ~ok ).sum() ), sum_diff = float( abs( m.sum() - ref.sum() ) ) )
+
+
+def accuracy_line( acc ):
+    return ( f"median { acc[ 'median' ] :.1e}, p99.99 { acc[ 'p9999' ] :.1e}, max { acc[ 'max' ] :.1e} "
+             f"( { acc[ 'empty_cells' ] } empty cells left out; | sum - sum_double | = { acc[ 'sum_diff' ] :.1e} )" )

@@ -7,9 +7,10 @@ the python package `sdot`, so that a number measured here can be set next to the
 |---|---|
 | `cases.py` | the six clouds: loader of the reference text files, numpy generators, `case( name, n )` |
 | `reference_lmo.py` | the old headline numbers as data, each with its README line |
+| `reference_lmo_gpu.py` | the same for the old GPU campaign (`nsdot/gpu_des_familles`, kernel-only ns/seed), each with its doc line |
 | `bench_diagram.py` | errand `bench`: the cost of **one diagram** ( ns/seed ) |
 | `bench_newton.py` | errand `bench`: a **whole Newton solve** ( iterations, diagrams, time split ) |
-| `benchlib.py` | threads, environment report, table printing (declares no work) |
+| `benchlib.py` | threads, environment report, table printing, kernel timing and accuracy helpers (declares no work) |
 
 `cgal/` and `cuda/` are older, unrelated comparison programs.
 
@@ -52,7 +53,7 @@ micromamba --root-prefix ~/.mamba run -n prj-jax errand -k bench --env jax --no-
 On `lmo` (an rsync of the whole `~/Projects` tree to `/home/leclerc/Projects-rsync`, environments
 `lmo-numpy`, `lmo-torch`, `lmo-jax` of `errand-envs.py`). **The solver and the diagram timed here run on the
 CPU**: use `lmo-numpy` (CPU by construction) -- `lmo-jax` is the GPU environment, and `SdotPlanNd` refuses a GPU driver
-(`LOOM_DEVICE=cpu` would be needed in it).
+(`LOOM_DEVICE=cpu` would be needed in it). `bench_diagram` alone also runs on the card: see "On the GPU" below.
 
 ```bash
 errand -k bench --env lmo-numpy "bench_diagram" --case=uniform --dim=2 --n=1000000 --threads=8 --pin=yes --kernel=double --reps=3
@@ -86,6 +87,24 @@ Each run prints one table row: case, n, threads, kernel, time, ns/seed (diagram)
 new/old** (> 1: we are slower), the sources of the old value, and the active environment (`LOOM_NB_THREADS`,
 `SDOT_NB_THREADS`, `SDOT_PIN_THREADS`, `SDOT_CPU_VARIANT`, `SDOT_CXXFLAGS`, `LOOM_CXXFLAGS`, driver and device...).
 Numbers also go to `result.yaml`; `summary.yaml` compares a matrix.
+
+### On the GPU (`lmo-jax`)
+
+`bench_diagram` sees a CUDA device and switches to the protocol of the old GPU campaign (`nsdot/gpu_des_familles`,
+`doc/07-methode.md`): `pd.measures` in a loop for `--warmup=0.3` s, then the minimum of `--reps` (10 by default) of the
+**kernel-only** time (CUDA events around every launch of the call: `LOOM_KERNEL_TIMING=1`, which the bench sets,
+`loom/devices/kernel_timing.py`) and of the wall time of the call. It prints the registers, local bytes and occupancy of
+the main kernel, and with `--kernel=float` the accuracy against a `double` kernel on the same tree (median, p99.99, max of
+the relative gap per cell). The old numbers are `reference_lmo_gpu.py`; the positions stay `float64` (`TF`, jax x64).
+
+```bash
+errand -k bench --env lmo-jax bench_diagram --case=uniform --dim=2 --kernel=float,double     # 2D uniform 1e6
+errand -k bench --env lmo-jax bench_diagram --case=lines_voronoi,lines_equal --kernel=float,double
+errand -k bench --env lmo-jax bench_diagram --case=uniform --dim=3 --kernel=float,double     # 3D uniform 1e6
+errand -k bench --env lmo-jax bench_diagram --case=planes_voronoi,planes_equal --kernel=float,double
+```
+
+The first run compiles every kernel with `nvcc` (minutes each). Results: `bench/calibration_lmo_today.md`, section GPU.
 
 ### Threads
 

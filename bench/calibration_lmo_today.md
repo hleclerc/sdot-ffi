@@ -311,3 +311,123 @@ mg projects it away. At n = 5e5 that was the whole difference (Cholesky, 2D 5e5:
 * Without OpenMP (a compiler without it, or a link that drops it) every loop is sequential: `auto` still picks mg in 3D (AMGCL would be sequential too), not measured.
 * The tree order assumes the median-cut BSP (`AaBsp`): an aligned window of 8 ranks is a subtree up to odd-size halves; `accelerator = "plain"` falls back on the identifier order (correct, weaker aggregation: tested for correctness only).
 * Hierarchy reuse (4 solves) is keyed on the system size only; the graph moves by a few edges per iteration, which a Newton step with a large backtrack count may exceed: not seen on the 6 cases.
+
+# GPU: the baseline of the new code on the card (2026-10-03, evening)
+
+Step 1 of the GPU work: MEASUREMENT only, nothing optimized. The question: where the new `PowerDiagram.measures` stands on
+`lmo`'s RTX 2080 Ti against the old GPU campaign (`nsdot/gpu_des_familles`), with the same protocol.
+
+## Protocol
+
+* Machine `lmo`, RTX 2080 Ti (Turing sm_75, 68 SM, FP64 at 1/32), env `lmo-jax` (jax[cuda13], loom's pip `nvcc`, kernels
+  `-O3`, no fast-math), through errand's exclusive queue (each run waited for the machine to be alone: two jobs of
+  `tl24_LMO` held it before the 2D and the 3D series). Positions `float64` (`TF`, jax x64), the kernel float by `--kernel`.
+* `bench/bench_diagram.py` switches to the protocol of `gpu_des_familles` (`doc/07-methode.md` l.3-5) when the loom device is a
+  `CudaGpu`: two calls (compile, memory), then `pd.measures` in a loop for >= 300 ms, then the MINIMUM of 10 runs of
+  * **kernel only**: CUDA events around every launch of the `measures` call, summed (`LOOM_KERNEL_TIMING=1`, new in loom:
+    `CudaQueue.h::detail::CudaQueueTiming` + `loom/devices/kernel_timing.py`) -- what the old bench times;
+  * **wall**: the whole call until the result is ready on the card (`block_until_ready`).
+* Registers, local bytes, resident blocks per SM (`cudaFuncGetAttributes`, `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, at the
+  launch's 128-thread block) of the MAIN kernel (the longest); occupancy = theoretical (blocks x 128 / 1024).
+* Accuracy (`--kernel=float`): a second `PowerDiagram` with `kernel_dtype = FP64` on the same tree; median, p99.99, max of
+  `|m_float - m_double| / m_double` per cell (the old campaign compared with the CPU double witness: same quantity).
+* Old numbers: `bench/reference_lmo_gpu.py` (each with its doc line). `old` below = the old campaign's best for the case and float.
+* Commands: `errand -k bench --env lmo-jax bench_diagram --case=uniform,lines_voronoi,lines_equal --dim=2 --kernel=float,double`
+  and the same with `--case=uniform,planes_voronoi,planes_equal --dim=3`. Runs: `runs/bench_diagram/diagram/2026-10-03_20h01m27-lmo-jax*`
+  (2D), `2026-10-03_20h04m20-lmo-jax*` (3D).
+
+## Baseline table (min of 10, kernel only unless said)
+
+| case | n | kernel | kernel ns/seed | wall ns/seed | regs | occupancy (blocks x 128) | local B | accuracy med / p99.99 / max | old best (variant) | new/old |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2D uniform | 1e6 | float | **78.1** | 86.5 | 88 | 62 % (5) | 552 | 3.7e-5 / 8.3e-4 / 2.4e-3 | 7.6 (filnrm8); 10.6 accurate (filmsk8m) | **10.3** (7.4 vs filmsk8m) |
+| 2D uniform | 1e6 | double | **183.0** | 191.2 | 114 | 50 % (4) | 552 | - | 96.7 (filmsk8g) | **1.89** |
+| 2D lines Voronoi | 99 944 | float | **102.1** | 166.7 | 88 | 62 % (5) | 552 | 3.5e-5 / 5.5e-3 / 1.2e-2 | 18.5 (filnrm8) | **5.52** |
+| 2D lines Voronoi | 99 944 | double | **190.7** | 255.5 | 114 | 50 % (4) | 552 | - | 132 (filnrm8) | **1.45** |
+| 2D lines equal | 1e5 | float | **403.7** | 467.3 | 90 | 62 % (5) | 552 | 1.5e-5 / 1.4e-3 / 1.9e-3 | 45.2 (filnrm8) | **8.93** |
+| 2D lines equal | 1e5 | double | **962.7** | 1027.2 | 118 | 50 % (4) | 552 | - | 385 (filmix6) | **2.50** |
+| 3D uniform | 1e6 | float | **2077** | 2216 | 96 | 62 % (5) | 952 | 3.6e-6 / 4.6e-5 / 9.3e-5 | 229 (voies) | **9.07** |
+| 3D uniform | 1e6 | double | **3020** | 3168 | 128 | 50 % (4) | 1008 | - | 1103 (voies) | **2.74** |
+| 3D planes Voronoi | 1e5 | float | **1991** | 2123 | 96 | 62 % (5) | 952 | 2.6e-6 / 3.3e-5 / 8.7e-5 | 231 (voies) | **8.62** |
+| 3D planes Voronoi | 1e5 | double | **3374** | 3506 | 128 | 50 % (4) | 1008 | - | 1066 (voies) | **3.17** |
+| 3D planes equal | 1e5 | float | **3859** | 3988 | 96 | 62 % (5) | 952 | 1.7e-6 / 1.6e-5 / 2.1e-5 | 405 (voies) | **9.53** |
+| 3D planes equal | 1e5 | double | **11217** | 11359 | 128 | 50 % (4) | 1008 | - | 2926 (voies) | **3.83** |
+
+Against the CPU: the new GPU float kernel is x1.9 (2D uniform) / x1.4 (lines V) / x1.7 (lines equal) over the old CPU witness at 8
+threads in the same float, and x0.8-0.9 in 3D (SLOWER than 8 CPU threads); in double it is slower than the CPU everywhere (x0.3-0.8).
+The new CPU code itself is ~143 ns/seed in 2D uniform (8 threads, double, this file above).
+
+What the numbers say before any lever:
+
+* **float buys almost nothing**: double / float = 2.3 (2D uniform), 1.9 (lines V), 2.4 (lines equal), 1.45 (3D uniform),
+  1.7 (planes V), 2.9 (planes equal). The old kernels had 12.7 (2D: 96.7 / 7.6) and 4.8 (3D: 1103 / 229). On a card with
+  FP64 at 1/32, a float kernel that is only 2x faster than its double twin is not limited by its float arithmetic.
+* **the main kernel is everything**: the other launches of the call (a zero fill of the scratch, the output seeding, the error
+  buffer) are 2 % of the kernel time in 2D uniform (fill: 1.6 ms of 78 ms, a 0.93 G-word scratch: 278 528 threads x 832 words),
+  5.6 % on the lines (0.58 ms), 0.5 % in 3D (a 1.42 G-word scratch, 5.7 GB: 230 912 threads x 6144 words, 9.7 ms).
+* **wall - kernel** is 6-8 ms per call in 2D, 13 ms for the 3D planes (1e5) and **139-148 ms for 3D uniform 1e6**: the dispatch
+  and XLA's allocation of the scratch output (3.3 KB per thread in 2D, 24 KB in 3D, sized on the whole card: 0.93 G words in 2D,
+  2.4 GB for the planes, 5.7 GB for 3D uniform) -- 64 ns/seed at n = 1e5 in 2D, i.e. 60 % of the lines kernel.
+* **local memory** is 552 B in 2D (the provider's `SI stack[ 64 ]`, 512 B of int64, + 40) and 952 / 1008 B in 3D; no
+  launch is limited by the grid (2176 blocks of 128 for 1e6 seeds, ~3.6 seeds per thread, strided in tree order).
+* **accuracy**: the new float kernel is at the level of the old FAST kernels (2D uniform median 3.7e-5 against filnrm8
+  3.2e-5, max 2.4e-3 against 4.8e-3), NOT of the accurate one (filmsk8m: 4.9e-14 median, 4.6e-8 max) -- although its bisector
+  is already computed in double: the float error is made in the cut (the vertices interpolated in float) and in the area taken on
+  float vertices, which is exactly what the old "three repairs" + "the measure on the resolved vertex" fixed.
+  Lines equal and 3D are better than the old float numbers (lines equal max 1.9e-3 against 2.7).
+
+## Gap analysis, per case (levers ranked by expected gain; to be confirmed with `ncu` before each change)
+
+**2D uniform 1e6 (float x10.3, double x1.9).** The cell lives in the work-item's SCRATCH, i.e. in global memory (`run_memory`,
+`Local2`: 8 arrays of `cap = 64` per thread, one 3.3 KB row per thread), where the old kernels kept the 8 vertices in REGISTERS
+(`filnrm8` / `filmsk8`: 6 rows of 8 lanes, `NB` a state). Every cut reads and rewrites the cell, every pruning test loops over its
+vertices from memory; the touched part of the 43 520 resident cells (~0.5 KB each, the arrays being 256 B apart) is ~20 MB against
+5.5 MB of L2, so the cell goes back and forth to DRAM. That explains why float barely beats double. Ranking:
+(1) **the cell in registers** (the `Engine2Reg` state machine has the shape; on the GPU it needs fixed-size per-thread arrays with
+immediate indices, the barrel shifts of `filnrm8` or the masks of `filmsk8`), with (2) **the overflow second pass** that it
+requires (a cell over 8 vertices, 1.6 % of the states, is flagged and redone by a memory kernel on the side; this also removes the
+0.93 G-word scratch, its fill and most of the 8 ms of wall overhead); (3) **AoS tree nodes in the kernel type** (a node is now
+read from three arrays: `node_box` in double, `node_begin` / `node_end` in int64 -- 48 B in 3 sectors instead of one 24 B float
+record; `proximity` re-reads both children's boxes in double); (4) **the bisector in the kernel type with the float accuracy
+fixes** (the bisector and `proximity` run in FP64 at 1/32 today, and the positions are read as 16 B doubles; the old recipe --
+fixed-point or centred frame, the weight difference in double, the vertex resolved from its two planes, the measure on the
+resolved vertex -- gave 4.9e-14 median for +5 %); (5) **a smaller int stack** (`SI stack[ 64 ]` in int64 = 512 B of local memory;
+int32 and depth-bounded: 2 x depth <= 64 entries of 4 B, packed index + height; the old kernels had a 192 B stack). Registers
+(88 -> 62 % occupancy) should fall with (3)-(5); the old `filmsk8f` ran at 63 registers and 100 %.
+
+**2D lines Voronoi (float x5.5, double x1.45).** The same kernel, a cloud whose cells are thin and long (more cuts, more pruning
+tests per cell): the smaller ratio comes from the old kernel being slower there (18.5 against 7.6), not from the new being better.
+Same ranking; here (2) matters more than its share suggests because n = 1e5 makes the fixed per-call cost (scratch allocation +
+fill, 6.5 ms of wall, 64 ns/seed) as large as half of the kernel.
+
+**2D lines equal areas (float x8.9, double x2.5).** The weighted kernel (90 / 118 registers) on the degenerate cloud: 4x the
+Voronoi lines in float (the old: 2.4x). The weighted pruning reads three more doubles per node (`node_wa`, `node_wb`) and loops over
+the cell's vertices in memory, so (1) and (3) gain more here than on Voronoi; (4) includes the weight difference (old: in
+double, the rest in float). Note also `pd.weights = w` costs 61 ms (gather + majorant refresh on the card), 1.5x the diagram, not
+in the kernel time but in any Newton step.
+
+**3D uniform 1e6 (float x9.1, double x2.7).** The cell is a polytope in a 24 KB scratch row per thread (`LocalN`, `cap = 128`),
+952-1008 B of local memory, 96 / 128 registers: one thread per 3D cell has no chance of holding its cell in registers. The old
+answer was **warp-per-cell (`voies`, V = 8 lanes per cell)**: the cell is spread over the lanes, each cut is a few shuffles, and
+the old profile shows 27 active threads per warp in 3D (`doc/05-profils.md` l.51). That is lever (1) in 3D, and it carries the
+"cell in registers" with it. Then (5) the int stack (shared by the 8 lanes: 1/8 of the local memory per thread), (3) AoS nodes in
+float, (4) the bisector in the kernel type. The 5.7 GB scratch (half of the card) also caps the threads in flight (230 912
+instead of the 278 528 the card could host) and goes with 139 ms of wall per call (most likely its allocation, not measured apart): it would disappear with (1).
+
+**3D planes Voronoi (float x8.6, double x3.2).** Same kernel, same diagnosis; the planes cloud has fewer neighbours per cell than
+its anisotropy suggests (231 against 229 in the old engine), and the new one is equal on both (1991 against 2077). Same ranking:
+warp-per-cell first.
+
+**3D planes equal volumes (float x9.5, double x3.8).** The weighted 3D kernel: x1.9 the Voronoi planes in float, x3.3 in
+double (the old: 1.75x and 2.7x). The double weighted case is the worst ratio of the table: the majorant terms in FP64 on top of
+a memory-resident polytope. Same ranking, with (4) worth more than in the Voronoi cases (the weighted pruning and the bisector
+both carry the weights).
+
+## Caveats
+
+* Kernel-only = the sum of all the launches of the `measures` call (the main kernel is 97-99.5 % of it); the events are recorded
+  on XLA's stream, so the time between them is the GPU time of the launch even when the stream was busy before.
+* The occupancy is the theoretical one at the block size of the launch (128), not the achieved one (`ncu` gives that).
+* The 3D runs are 1 call per rep; 3D double at 11 s per call is 2 minutes of measurement per case.
+* The accuracy reference is the GPU double kernel, not the CPU witness (the old one): GPU double against CPU double differs by
+  ~1e-10 (old campaign, `doc/03-chiffres.md`), far below the float errors measured here.
