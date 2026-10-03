@@ -188,6 +188,20 @@ struct Newton {
         }
     }
 
+    /// `L d = b` is solvable only if `b` sums to zero ( the kernel of `L` is the constants ). The log residual sums to zero by
+    /// construction; `nu - a` only up to rounding and to the conservation of the sweep -- and the solvers that strike seed 0 out
+    /// ( the gauge ) dump that remainder as a POINT SOURCE on seed 0, whose response the next diagram sees. Measured: at n = 5e5 ( 2D
+    /// and 3D ) Cholesky and AMG stagnate at 6.5e-6 -- 44 diagrams, 34 backtracks -- and converge in 10 diagrams ( 2D ) once `b` is
+    /// projected. The multigrid, whose gauge is the zero mean, always did.
+    static void project_on_range( std::vector<double> &b ) {
+        if ( b.empty() )
+            return;
+        double s = 0;
+        for ( double v : b ) s += v;
+        s /= double( b.size() );
+        for ( double &v : b ) v -= s;
+    }
+
     /// the merit of the damping: `| a - nu |_2` for LIN, `| g( a / nu ) - mean |_2` otherwise
     double merit( const std::vector<double> &A ) const {
         const SI n = SI( A.size() );
@@ -246,6 +260,7 @@ struct Newton {
                     std::printf( "      switch: residual -> lin ( max|a-nu|/nu %.3e <= %.3e )\n", worst_rel, o.switch_residual );
             }
             rhs( a, b );
+            project_on_range( b );
             if ( it == 0 ) {                             // the mass floor of the damping
                 double am = a[ 0 ], nm = nu[ 0 ];
                 for ( SI i = 0; i < n; ++i ) { am = std::min( am, a[ i ] ); nm = std::min( nm, nu[ i ] ); }

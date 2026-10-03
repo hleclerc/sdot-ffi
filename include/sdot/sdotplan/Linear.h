@@ -17,6 +17,9 @@
 //             picks its coarse nodes edge by edge and holds on the clouds where smoothed aggregation
 //             fails ( incomparable edge weights ). The builtin backend of AMGCL is parallel through
 //             OPENMP only: see `Linear.cpp` for what that takes.
+//   MG        the in-house multigrid of the old campaign ( `Multigrid.h` ): aggregation by the order of the BSP
+//             tree, smoothed prolongation, Chebyshev smoother, direct bottom, and a hierarchy and a recycled subspace
+//             REUSED from one Newton iteration to the next. Needs OpenMP to be parallel ( like the AMGCL backend ).
 //   CG        the conjugate gradient preconditioned by Jacobi, written here: what remains when neither
 //             Eigen nor AMGCL are there ( `__has_include` ). Five times slower than Cholesky, but
 //             always available.
@@ -32,7 +35,7 @@
 namespace sdot {
 namespace sdotplan {
 
-enum class Lin : int { AUTO = 0, CHOLESKY = 1, AMG = 2, CG = 3 };
+enum class Lin : int { AUTO = 0, CHOLESKY = 1, AMG = 2, CG = 3, MG = 4 };
 
 /// what a linear solver reports, accumulated over all its solves.
 struct LinearStats {
@@ -50,6 +53,9 @@ struct LinearSolver {
     /// `d[ 0 ] == 0` on output. Returns `false` if the solver could not.
     virtual bool solves( const Laplacian &L, const std::vector<double> &b, std::vector<double> &d ) = 0;
     virtual const char *name() const = 0;
+    /// the ORDER OF THE TREE: `rank_of[ i ]` is the rank of seed `i` in the BSP tree ( consecutive ranks are neighbours in
+    /// space ). Only the multigrid uses it ( aggregation by rank ); called once, before the first solve.
+    virtual void order( const std::vector<SI> &rank_of ) { (void) rank_of; }
     LinearStats st;
 };
 
@@ -57,10 +63,15 @@ struct LinearSolver {
 struct LinearOptions {
     double tol = 0;           ///< AMG, CG: the RELATIVE residual to reach ( AMG default: 1e-6, README § 17.2; the old `newton` bench ran 1e-10 )
     int    amg_variant = -1;  ///< AMG: 0 aggregation + spai0 ( the default ), 1 aggregation + Gauss-Seidel, 2 Ruge-Stuben + Gauss-Seidel
+    int    mg_pack = 0;       ///< MG: seeds per aggregate, a power of two ( default 8 )
+    int    mg_recycle = -1;   ///< MG: solutions kept for the start by projection ( default 2, 0: off )
+    int    mg_nu = 0;         ///< MG: Chebyshev smoothing steps per level ( default 1 in 3D, 3 in 2D )
+    int    mg_stop = 0;       ///< MG: coarsening stops under this many unknowns ( default 1000 )
+    int    mg_rebuild = 0;    ///< MG: the hierarchy is rebuilt every that many solves ( default 4 )
 };
 
-/// THE solver for `method` -- AUTO: AMG when it is compiled with OpenMP ( parallel ), else Cholesky in 2D up to 3e5 seeds, AMG if it is
-/// there, CG otherwise. A requested method that is absent falls back on the next available one.
+/// THE solver for `method` -- AUTO: the multigrid in 3D; in 2D AMG when it is compiled with OpenMP ( parallel ), else Cholesky up to 3e5
+/// seeds, AMG if it is there, CG otherwise. A requested method that is absent falls back on the next available one.
 std::unique_ptr<LinearSolver> linear_solver( Lin method, SI n, int dim, const LinearOptions &opts = {} );
 
 /// the compiled methods ( a mask: bit `int( Lin::X )` )

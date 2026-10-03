@@ -25,7 +25,7 @@ HOW THE OPTIONS MAP onto the old ones ( more in `bench/README.md` ):
   `--residu log` + switch to lin ( the old default ) --residual=log ( the default ), --residual-switch=2
   `--residu lin`                                     --residual=lin
   `--residu puissance --puis p`                      --residual=power --residual-power=p
-  `--solver chol | amg | cg`                         --linear-solver=cholesky | amg | cg  ( `auto`: see Linear.cpp ); --amg-variant, --linear-tol
+  `--solver chol | amg | cg | mg`                    --linear-solver=cholesky | amg | cg | mg  ( `auto`: see Linear.cpp ); --amg-variant, --linear-tol
   `--newton-tol 1e-6` ( relative )                   --rtol=1e-6 --tol=0
   `--newton-max`                                     --max-iter
   `--kernel double | float`                          --kernel=double | float  ( no `mixte` )
@@ -48,13 +48,18 @@ if p := bench( "newton",
                pin           = Param( "yes", choices = [ "yes", "no", "env" ], help = "pin worker w to core w ( SDOT_PIN_THREADS ); `env`: leave the variable alone" ),
                kernel        = Param( "double", choices = [ "double", "float" ], help = "the kernel float type ( the campaign: double )" ),
                step          = Param( "trials", choices = [ "trials", "limits", "auto" ], help = "trials = KMT damping ( the old base ), limits = the limits step ( 2D ), auto = the library's choice" ),
-               linear_solver = Param( "auto", choices = [ "auto", "cholesky", "amg", "cg" ], help = "the linear solver" ),
+               linear_solver = Param( "auto", choices = [ "auto", "cholesky", "amg", "cg", "mg" ], help = "the linear solver ( mg: the in-house multigrid, `sdotplan/Multigrid.h` )" ),
                residual      = Param( "log", choices = [ "log", "lin", "power" ], help = "the residual of the direction and of the merit: log + switch to lin ( the old default ), lin ( KMT ), power ( g_p )" ),
                residual_power = Param( 0.5, help = "the exponent p of `--residual=power` ( the old `--puis` )" ),
                residual_switch = Param( 2.0, help = "back to lin once max|a-nu|/nu <= this ( the old `--bascule-residu`; 0: never )" ),
                restart_factor = Param( 4.0, help = "TRIALS: the next trial starts from this times the last step ( the old KMT restarts from 1: use 1e9 )" ),
                amg_variant   = Param( "auto", choices = [ "auto", "sa_spai0", "sa_gs", "rs_gs" ], help = "AMGCL: auto = aggregation + spai0 ( the old default )" ),
                linear_tol    = Param( 0.0, help = "relative tolerance of the AMG / CG ( 0: 1e-6 for the AMG; the old `newton` default was 1e-10 )" ),
+               mg_pack       = Param( 0, help = "MG: seeds per aggregate, a power of two ( 0: 8 )" ),
+               mg_recycle    = Param( -1, help = "MG: solutions kept for the start by projection ( -1: 2, 0: off )" ),
+               mg_rebuild    = Param( 0, help = "MG: solves per hierarchy ( 0: 4 )" ),
+               mg_stop       = Param( 0, help = "MG: coarsening stops under this many unknowns ( 0: 1000 )" ),
+               mg_nu         = Param( 0, help = "MG: Chebyshev smoothing steps per level ( 0: 1 in 3D, 3 in 2D )" ),
                openmp        = Param( -1, help = "EXPERIMENT: compile with -fopenmp for the AMG ( -1: no; 0: OMP_NUM_THREADS left alone, all the hardware threads like the old binary; k: OMP_NUM_THREADS=k )" ),
                rtol          = Param( 1e-6, help = "stop on max|a-nu|/nu <= rtol ( the campaign: 1e-6 )" ),
                tol           = Param( 0.0, help = "or on max|a-nu| <= tol, in normalized masses ( 0: off ); the library's default is 1e-8" ),
@@ -89,6 +94,8 @@ if p := bench( "newton",
                           tuning = Tuning( step = p.step, linear_solver = p.linear_solver, mass_rtol = p.rtol,
                                            residual = p.residual, residual_power = p.residual_power, residual_switch = p.residual_switch,
                                            restart_factor = p.restart_factor, amg_variant = p.amg_variant, linear_tol = p.linear_tol or None,
+                                           mg_pack = p.mg_pack or None, mg_recycle = None if p.mg_recycle < 0 else p.mg_recycle,
+                                           mg_rebuild = p.mg_rebuild or None, mg_stop = p.mg_stop or None, mg_nu = p.mg_nu or None,
                                            memory = None if p.memory < 0 else p.memory ) )
 
     # warm-up on a small prefix: the first solve of the process compiles the kernels

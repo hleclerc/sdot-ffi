@@ -259,3 +259,55 @@ Final diagram table (min of 3 per run, ns/seed), see report: u2 143, lv 165, le 
 planes_equal mem0 3153, u3 mem32 1237 (old today: 143 / 144 / 680 / 1734 / 1875 / 1808 / 3281).
 Newton diagram stage (t_diag; old default/kmt numbers in (b)): planes_voronoi 5.13 s / 17 diag = 0.30 s per diagram (old 0.319), lines_voronoi 2.12 s / 32 = 66 ms (old 71),
 uniform3d 1.41 s / 6 = 235 ms (old 219), uniform2d 0.257 s / 8 = 32 ms (old 28).
+
+
+# The in-house multigrid `mg` ported (2026-10-03, evening)
+
+Code: `include/sdot/sdotplan/Multigrid.h` (header comment = the algorithm and the differences with the old one), wired in `Linear.cpp`
+(`Lin::MG`, `LinearSolver::order( rank_of )` called by `Solve.h` with `Sweep::rank_of` = the tree order), python `Tuning( linear_solver = "mg",
+mg_pack, mg_recycle, mg_rebuild, mg_stop, mg_nu )`, bench `--linear-solver=mg --mg-pack --mg-recycle --mg-rebuild --mg-stop --mg-nu`.
+`auto` = `mg` in 3D, unchanged in 2D (AMG with OpenMP, Cholesky without). Tests: `the_multigrid_reaches_the_cholesky_plan_in_2d_and_3d`,
+`the_multigrid_without_a_tree_order_and_the_unknown_solver`.
+
+Ported as is: aggregation `rank >> 3` (packets of 8, the tree order = `Sweep::rank_of`, the Laplacian stays indexed by user id: only the map
+`m[ i ] = rank_of[ i ] >> 3` and the packet members `ord[ 8a + t ]` use it), smoothed prolongation (w = 0.7, truncated at 0.2, renormalized), Galerkin product
+in two passes with one dense accumulator per thread, `P^t` without a transposition, Chebyshev smoother on spai0 (lmin = lmax / 10, Gershgorin lmax; `nu` = 1 in 3D, 3 in 2D),
+Eigen LDLT at the bottom (<= 1000 unknowns, seed 0 struck out), outer CG in the zero-mean gauge and translation to `d[ 0 ] = 0`, recycled subspace (2 solutions, Galerkin
+start), hierarchy reused for 4 solves (only the fine level is re-pointed and its relaxation coefficients recomputed). NOT ported (lost in the old README): unsmoothed
+aggregation, strength filter, damped Jacobi / plain spai0 smoothers, K-cycle. Differences: the initial residual after the recycled start is the true one (the old code
+assumed `|b|`); a single-level hierarchy (n <= 1000) goes through the same direct bottom (one CG iteration) instead of a Jacobi-like diagonal preconditioner; no OpenMP -> same
+loops, sequential.
+
+## t_lin, 8 pinned threads, double, n = 1e5, min of 3 (quiet runs: 0.07-0.8 busy cores before the run; lmo-numpy through the exclusive queue)
+
+| case | new mg tol 1e-6 (default) | new mg tol 1e-10 (old protocol) | new AMG+OpenMP tol 1e-6 | old mg today (tol 1e-10) | old amg | it / diag |
+|---|---|---|---|---|---|---|
+| 3D uniform | **0.530** (98 CG it) | **0.780** (170) | 1.067 (68) | 0.772 (173) | 1.156 | 5 / 6, same as before |
+| 3D planes Voronoi | **1.123** (188) | **1.448** (324) | 1.962 (126) | 1.421 | - | 9 / 17, same |
+| 2D uniform (limits) | 0.773 (160) | - | **0.583** (131) | 0.763 (amg 1e-10) | - | 6 / 7 |
+| 2D lines Voronoi (limits) | 3.274 (603) | - | **1.997** (465), Cholesky 2.12 | 2.549 | - | 12 / 19 |
+
+Whole-solve totals with `auto` (3D): uniform 2.29 s (old mg binary 2.246; t_diag 1.42), planes 6.67 s (old 7.186). Measured later under 1 other busy core of lmo
+(someone compiles there): the same runs read 0.70 / 1.33 s of t_lin, t_diag +35 %: compare only inside a run.
+
+* mg beats the old mg at the same tolerance (planes 1.45 against 1.42 is a tie, uniform 0.78 against 0.772 a tie) and beats AMGCL+OpenMP by 2.0x / 1.75x at the shipped tol 1e-6.
+  The AMG variant measured here: tol 1e-6 vs 1e-10 changes no iteration or diagram count for either solver.
+* Weights agree with Cholesky to 1e-8 on the tests (`atol = 1e-8` on the weights, 1e-10 on the masses), and the runs converge to the same 1e-6 relative residual.
+* Tried, mg 2D uniform 1e5 (t_lin / CG it): nu 3 (default) 0.773 / 160, nu 2 0.818 / 187, nu 1 0.762 / 262, pack 16 0.891 / 211; lines: nu 1 3.26, 2 3.36, 3 3.27. mg does NOT help in 2D at n = 1e5
+  (as in the old README: -6 % at best, here -25 %), no setting reverses it: AMGCL stays `auto` in 2D.
+* n = 5e5 (lmo carrying 1-2 foreign busy cores, one rep): 2D uniform limits: mg 8 it / 10 diag, t_lin 8.34 s (nu 2: 7.32), total 11.8 s; 3D uniform: mg 5.05 s (old README 4.79), 5 / 6.
+  Before the fix below, AMG and Cholesky STAGNATED there (2D and 3D alike: 44 / 40 diagrams, 34 backtracks, residual 6.46e-6, whatever the AMG tolerance, 1e-8 included), mg converged.
+
+## A defect found on the way, fixed: the right-hand side was not on the range of the Laplacian
+
+`L d = b` is solvable only for `sum b = 0`. The solvers that strike seed 0 out (Cholesky, AMG) dump any remainder of `sum( nu - a )` as a point source on seed 0; the zero-mean gauge of
+mg projects it away. At n = 5e5 that was the whole difference (Cholesky, 2D 5e5: 44 diagrams, stagnation; with `b -= mean( b )`: AMG 8 it / 10 diag, 6.8 s of t_lin, converged to 4e-10).
+`Newton.h::project_on_range` now projects `b` for every solver. Counts unchanged at n = 1e5 (2D uniform 6 / 7, lines Voronoi 12 / 19 for AMG-auto and Cholesky, lines equal 13 / 53 stagnating as before,
+3D uniform 5 / 6 AMG and mg, planes 9 / 17); 3D uniform 5e5 with AMG now converges in 5 / 6 (t_lin 7.15 s against mg 5.05 s).
+
+## What remains / risks
+* 2D: AMGCL is still better than mg at 1e5 (0.58 against 0.77 uniform, 2.0 against 3.3 lines); at 5e5 uniform mg 7.3-8.3 s against AMG 6.8 s (both converged since the fix): no gain, 2D `auto` unchanged.
+* The mg smoothers and the pack were tuned by the old campaign (2D image density and 3D); `nu = 1` in 3D, 3 in 2D. The hard 3D cloud (planes) takes 188 CG iterations in 9 Newton iterations (324 at 1e-10).
+* Without OpenMP (a compiler without it, or a link that drops it) every loop is sequential: `auto` still picks mg in 3D (AMGCL would be sequential too), not measured.
+* The tree order assumes the median-cut BSP (`AaBsp`): an aligned window of 8 ranks is a subtree up to odd-size halves; `accelerator = "plain"` falls back on the identifier order (correct, weaker aggregation: tested for correctness only).
+* Hierarchy reuse (4 solves) is keyed on the system size only; the graph moves by a few edges per iteration, which a Newton step with a large backtrack count may exceed: not seen on the 6 cases.

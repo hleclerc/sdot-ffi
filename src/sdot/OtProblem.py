@@ -69,6 +69,10 @@ class Tuning:
                   # the AMG: `auto` = aggregation + spai0 ( the old `newton` default ), `rs_gs`, `sa_gs`; the relative
                   # tolerance of the iterative solvers ( `None`: 1e-6 for AMG, README § 17.2 )
                   amg_variant = "auto", linear_tol = None,
+                  # the in-house multigrid ( `linear_solver = "mg"`, `sdotplan/Multigrid.h` ): seeds per aggregate ( a power of 2,
+                  # `None`: 8 ), solutions kept for the start by projection ( `None`: 2 ), solves per hierarchy ( `None`: 4 ),
+                  # coarsening stops under that many unknowns ( `None`: 1000 )
+                  mg_pack = None, mg_recycle = None, mg_rebuild = None, mg_stop = None, mg_nu = None,
                   # the scale of the width continuation ( § 9.2 : the ratio sqrt( 2 ) is measured )
                   conv_start = None, conv_ratio = 2 ** 0.5, conv_min = None, conv_threshold = 1e-2,
                   # the damping safeguards ( § 3 : `restart_factor = 4` is measured )
@@ -85,6 +89,11 @@ class Tuning:
         self.linear_solver     = linear_solver
         self.amg_variant       = amg_variant
         self.linear_tol        = linear_tol
+        self.mg_pack           = mg_pack
+        self.mg_recycle        = mg_recycle
+        self.mg_rebuild        = mg_rebuild
+        self.mg_stop           = mg_stop
+        self.mg_nu             = mg_nu
         self.conv_start        = conv_start
         self.conv_ratio        = conv_ratio
         self.conv_min          = conv_min

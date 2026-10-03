@@ -79,7 +79,7 @@ _STATS = [ "status", "residual", "residual0", "nb_iter", "nb_diag", "nb_backtrac
 _HISTORY = [ "step", "t", "residual_l2", "min_measure", "max_abs_residual", "nb_diag", "nb_evals", "s" ]
 _STATUS = { 0: "running", 1: "converged", 2: "max iterations", 3: "stagnation", 4: "linear solver failure" }
 _START = { 0: "weights0", 1: "voronoi", 2: "similarity" }
-_LIN = { "auto": 0, "cholesky": 1, "amg": 2, "cg": 3 }
+_LIN = { "auto": 0, "cholesky": 1, "amg": 2, "cg": 3, "mg": 4 }
 _AMG_VARIANT = { "auto": -1, "sa_spai0": 0, "sa_gs": 1, "rs_gs": 2 }
 _STEP = { "trials": 0, "limits": 1 }
 _RESIDUAL = { "lin": 0, "log": 1, "power": 2 }
@@ -113,6 +113,11 @@ class _Options( Aggregate ):
     max_backtracks : IntTensor
     lin            : IntTensor
     amg_variant    : IntTensor
+    mg_pack        : IntTensor
+    mg_recycle     : IntTensor
+    mg_rebuild     : IntTensor
+    mg_stop        : IntTensor
+    mg_nu          : IntTensor
     step           : IntTensor
     residual       : IntTensor
     trace          : IntTensor
@@ -232,6 +237,7 @@ class SdotPlanNd:
             conv_min = float( tun.conv_min or 0.0 ), conv_threshold = float( tun.conv_threshold ),
             residual_power = float( tun.residual_power ), lin_tol = float( tun.linear_tol or 0.0 ), residual_switch = float( tun.residual_switch ),
             max_iter = int( settings.max_iter ), max_backtracks = int( tun.max_backtracks ), lin = _LIN[ tun.linear_solver ], amg_variant = _AMG_VARIANT[ tun.amg_variant ],
+            mg_pack = int( tun.mg_pack or 0 ), mg_recycle = -1 if tun.mg_recycle is None else int( tun.mg_recycle ), mg_rebuild = int( tun.mg_rebuild or 0 ), mg_stop = int( tun.mg_stop or 0 ), mg_nu = int( tun.mg_nu or 0 ),
             step = _STEP[ step ], residual = _RESIDUAL[ tun.residual ], trace = int( bool( verbose ) ), continuation = _CONTINUATION[ settings.continuation ],
             cap0 = int( pd._scratch_capacity ),
             kernel_fp_size = fp_size( pd.kernel_dtype ),
@@ -281,6 +287,7 @@ class SdotPlanNd:
                     "no.residual = int( SI( inputs.options.residual ) ); no.power = double( inputs.options.residual_power ); no.switch_residual = double( inputs.options.residual_switch );",
                     "os.lin = sdotplan::Lin( int( SI( inputs.options.lin ) ) ); os.cap0 = SI( inputs.options.cap0 );",
                     "os.lin_options.tol = double( inputs.options.lin_tol ); os.lin_options.amg_variant = int( SI( inputs.options.amg_variant ) );",
+                    "os.lin_options.mg_pack = int( SI( inputs.options.mg_pack ) ); os.lin_options.mg_recycle = int( SI( inputs.options.mg_recycle ) ); os.lin_options.mg_rebuild = int( SI( inputs.options.mg_rebuild ) ); os.lin_options.mg_stop = int( SI( inputs.options.mg_stop ) ); os.lin_options.mg_nu = int( SI( inputs.options.mg_nu ) );",
                     "os.continuation = int( SI( inputs.options.continuation ) ); os.continuation_threshold = double( inputs.options.conv_threshold );",
                     "os.conv_s0 = double( inputs.options.conv_s0 ); os.conv_ratio = double( inputs.options.conv_ratio ); os.conv_min = double( inputs.options.conv_min );",
                     f"sdotplan::solve<TK_sdotplan>( queue, pd_sdotplan, inputs.power_diagram, inputs.dom_cell, { dist_expr }, inputs.nu, inputs.w0, os, "

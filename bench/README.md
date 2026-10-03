@@ -108,7 +108,7 @@ The whole solve is timed from a cold start, tree included (the old `TOTAL` inclu
 | KMT damping, `--pas essais --residu lin` | `--step=trials` (the default of the library in 3D) |
 | `--pas essai-limites --facteur 0.9` | `--step=limits` (2D only; the library's `auto` in 2D) |
 | `--residu log` + switch to `lin` (the old default after § 24.5) | `--residual=log` (the default), `--residual-switch=2`; `--residual=lin` is KMT, `--residual=power --residual-power=p` the exponent residual |
-| `--solver chol \| amg \| cg` | `--linear-solver=cholesky \| amg \| cg` (`auto`: Cholesky if d = 2 and n <= 3e5, else AMG) |
+| `--solver chol \| amg \| cg` | `--linear-solver=cholesky \| amg \| cg \| mg` (see `Linear.cpp` for `auto`; `mg` = `Multigrid.h`, options `--mg-pack --mg-recycle --mg-rebuild --mg-stop`) |
 | `--newton-tol`, `--newton-max` | `--rtol`, `--max-iter` |
 | `--kernel double \| float` | `--kernel=double \| float` |
 | `--threads`, `--no-pin`, `--leaf` | `--threads`, `--pin`, (`bench_diagram` only: `--leaf-size`) |

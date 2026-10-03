@@ -125,6 +125,7 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
     Convolved<Dist> conv( dist );
     Sweep<PD,DECAYED_TYPE_OF( dom ),Dist,TK> bal( queue, pd, pd_in, dom, dist, o.cap0 );
     auto lin = linear_solver( o.lin, n, D, o.lin_options );
+    lin->order( bal.rank_of );                           // the tree order, for the aggregation of the multigrid
     Newton<decltype( bal )> newton( bal, *lin, o.newton );
 
     // ---- the history, one row per accepted step

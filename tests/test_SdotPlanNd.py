@@ -457,6 +457,46 @@ if test( "the_transport_cost_derives_by_the_envelope_theorem" ):
         assert abs( fd - grad[ i, c ] ) < 1e-4 * max( 1.0, abs( fd ) ), ( i, c, fd, grad[ i, c ] )
 
 
+if test( "the_multigrid_reaches_the_cholesky_plan_in_2d_and_3d" ):
+    need( "cpu" )
+    # `linear_solver = "mg"` ( `sdotplan/Multigrid.h` ): the in-house multigrid. `mg_stop` small, so that the hierarchy has SEVERAL
+    # levels on a test-sized problem ( the default stops coarsening under 1000 unknowns ): aggregation by the tree order,
+    # smoothed prolongation, Galerkin product, Chebyshev, the recycled start and the reused hierarchy are all exercised.
+    # The solver changes the path, never the solution: the same plan as Cholesky to the Newton tolerance.
+    img3 = Image( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) )
+    img2 = Image( values = numpy.ones( ( 1, 1 ) ), origin = [ 0.0, 0.0 ], frame = numpy.eye( 2 ) )
+    for d, n, img in ( ( 2, 600, img2 ), ( 3, 500, img3 ) ):
+        rng = numpy.random.default_rng( 91 + d )
+        src = SumOfDiracs( rng.uniform( 0.05, 0.95, size = ( n, d ) ) )
+        ref = OtProblem( src, img ).solve( Iterative( max_iter = 60, tol = 1e-12, continuation = "never",
+                                                      tuning = Tuning( linear_solver = "cholesky", step = "trials" ) ) )
+        for options in ( dict(), dict( mg_pack = 4, mg_recycle = 0, mg_rebuild = 1 ) ):
+            got = OtProblem( src, img ).solve( Iterative( max_iter = 60, tol = 1e-12, continuation = "never",
+                                                          tuning = Tuning( linear_solver = "mg", step = "trials", linear_tol = 1e-9, mg_stop = 40, **options ) ) )
+            assert ref.converged and got.converged, ( d, options, ref.stats, got.stats )
+            assert got.stats[ "lin_nb_hierarchies" ] >= 1 and got.stats[ "lin_nb_iter" ] > 0, got.stats
+            assert numpy.allclose( numpy.asarray( got.weights ), numpy.asarray( ref.weights ), atol = 1e-8 ), ( d, options )
+            assert numpy.allclose( numpy.asarray( got.cell_masses ), numpy.asarray( ref.cell_masses ), atol = 1e-10 ), ( d, options )
+
+
+if test( "the_multigrid_without_a_tree_order_and_the_unknown_solver" ):
+    need( "cpu" )
+    # the `plain` storage has no tree: the aggregation then follows the order of the identifiers ( worse, but exact )
+    rng = numpy.random.default_rng( 17 )
+    pos = rng.uniform( 0.1, 0.9, size = ( 300, 2 ) )
+    img2 = Image( values = numpy.ones( ( 1, 1 ) ), origin = [ 0.0, 0.0 ], frame = numpy.eye( 2 ) )
+    a = OtProblem( SumOfDiracs( pos ), img2 ).solve( Iterative( max_iter = 60, tol = 1e-12, tuning = Tuning( linear_solver = "cholesky" ) ) )
+    b = OtProblem( SumOfDiracs( pos ), img2 ).solve( Iterative( max_iter = 60, tol = 1e-12, tuning = Tuning( accelerator = "plain", linear_solver = "mg", linear_tol = 1e-9, mg_stop = 30 ) ) )
+    assert a.converged and b.converged, ( a.stats, b.stats )
+    assert numpy.allclose( numpy.asarray( a.weights ), numpy.asarray( b.weights ), atol = 1e-8 )
+    try:
+        OtProblem( SumOfDiracs( pos ), img2 ).solve( Iterative( tuning = Tuning( linear_solver = "nope" ) ) )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError( "an unknown linear_solver must be refused" )
+
+
 # -- what we LOOK AT -------------------------------------------------------------------------
 #
 #   ./run experiment test_SdotPlanNd

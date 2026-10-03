@@ -41,6 +41,8 @@
 #  include <eigen3/Eigen/SparseCore>
 #endif
 
+#include "Multigrid.h"                   // the in-house multigrid: needs the OpenMP / Eigen switches above
+
 namespace sdot {
 namespace sdotplan {
 
@@ -229,7 +231,7 @@ struct Cholesky : LinearSolver {
 // ---- the choice -----------------------------------------------------------------------------------
 
 int available_linear_methods() {
-    int res = 1 << int( Lin::CG );
+    int res = ( 1 << int( Lin::CG ) ) | ( 1 << int( Lin::MG ) );
 #ifdef SDOT_EIGEN
     res |= 1 << int( Lin::CHOLESKY );
 #endif
@@ -241,17 +243,30 @@ int available_linear_methods() {
 
 std::unique_ptr<LinearSolver> linear_solver( Lin method, SI n, int dim, const LinearOptions &opts ) {
     const int available = available_linear_methods();
-    // AUTO. The builtin backend of AMGCL is parallel through OpenMP ONLY. With it ( `-fopenmp` ), AMG wins from 2D
-    // uniform on ( 0.84 s of linear algebra against 1.78 s for Cholesky, 8 pinned threads, n = 1e5 ) and
-    // everywhere in 3D; the old bench chose it in 2D too. Without it, AMG is sequential and 4x slower than
-    // that ( 3.6 s ): Cholesky stays the choice in 2D up to a few hundred thousand seeds.
+    // AUTO. 3D: the in-house multigrid ( `Multigrid.h` ), as in the old `newton` bench -- measured, 8 pinned threads, n = 1e5, linear
+    // part: uniform 0.53 s against 1.07 s for AMGCL, planes 1.12 s against 1.96 s; at n = 5e5 AMGCL stagnates where it converges.
+    // 2D: the builtin backend of AMGCL is parallel through OpenMP ONLY. With it ( `-fopenmp` ), AMG wins from 2D uniform on
+    // ( 0.58 s of linear algebra against 0.77 s for MG and 1.78 s for Cholesky, n = 1e5; lines: 2.0 / 3.3 / 2.0 ) -- the old bench chose it
+    // in 2D too. Without it, AMG is sequential and 4x slower than that ( 3.6 s ): Cholesky stays the choice in 2D up to a few hundred
+    // thousand seeds.
 #ifdef _OPENMP
     constexpr bool amg_is_parallel = true;
 #else
     constexpr bool amg_is_parallel = false;
 #endif
     if ( method == Lin::AUTO )
-        method = ( dim <= 2 && n <= 300000 && ! amg_is_parallel ) ? Lin::CHOLESKY : Lin::AMG;
+        method = dim >= 3 ? Lin::MG : ( n <= 300000 && ! amg_is_parallel ) ? Lin::CHOLESKY : Lin::AMG;
+    if ( method == Lin::MG ) {
+        auto res = std::make_unique<Mg>();
+        if ( dim >= 3 ) res->nu = 1;                     // measured: a 15-entry row carries information far enough ( see `Multigrid.h` )
+        if ( opts.tol > 0 ) res->tol = opts.tol;
+        if ( opts.mg_pack > 0 ) res->pack = opts.mg_pack;
+        if ( opts.mg_recycle >= 0 ) res->recycle = opts.mg_recycle;
+        if ( opts.mg_nu > 0 ) res->nu = opts.mg_nu;
+        if ( opts.mg_stop > 0 ) res->stop = opts.mg_stop;
+        if ( opts.mg_rebuild > 0 ) res->rebuild = opts.mg_rebuild;
+        return res;
+    }
     if ( method == Lin::CHOLESKY && ! ( available & ( 1 << int( Lin::CHOLESKY ) ) ) ) method = Lin::AMG;
     if ( method == Lin::AMG      && ! ( available & ( 1 << int( Lin::AMG      ) ) ) ) method = Lin::CHOLESKY;
     if ( ! ( available & ( 1 << int( method ) ) ) )                                   method = Lin::CG;
