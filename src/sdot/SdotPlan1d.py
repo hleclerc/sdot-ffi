@@ -78,12 +78,12 @@ class SdotPlan1d( Aggregate ):
 
     @classmethod
     def _solve( cls, problem, settings, verbose = False ):
-        """LE chemin : `OtProblem.solve()` et lui seul passe par ici.
+        """THE path: `OtProblem.solve()` and nothing else goes through here.
 
-        Le régime DIRECT n'a ni tolérance, ni nombre d'itérations, ni point de départ : la solution
-        est un tri plus une inversion de fonction de répartition, donc exacte. `verbose` n'a donc
-        rien à tracer -- il est accepté pour que `OtProblem.solve()` ait la même signature dans les
-        deux régimes, et ignoré ici."""
+        The DIRECT regime has no tolerance, no iteration count, no starting point: the solution
+        is a sort plus an inversion of the cumulative distribution function, hence exact. `verbose` therefore has
+        nothing to trace -- it is accepted so that `OtProblem.solve()` has the same signature in the
+        two regimes, and ignored here."""
         return cls( problem.source, problem.target, with_barycenters = settings.with_barycenters )
 
     def _scratch( self ):
@@ -164,24 +164,24 @@ class SdotPlan1d( Aggregate ):
         # `barycenters` is produced only when asked for: including it in `output_attributes` binds it
         # as an OUTPUT (the forward writes it, guarded on `is_valid` C++-side); leaving it out keeps
         # it a NoneTensor, and the backward recomputes b_i. This is what the flag decides.
-        # CE QUE LE NOYAU ECRIT DANS `plan`, nomme POSITIVEMENT. `barycenters` n'est produit que
-        # si on le demande : ne pas le nommer le laisse `NoneTensor` ( le forward le garde sous
-        # `is_valid` cote C++ ) et l'adjoint recalcule b_i. C'est ce que le drapeau decide.
-        ecrit = [ "cost", "nb_diracs" ] + ( [ "barycenters" ] if self._with_barycenters else [] )
-        group_size_expr = "scratch.num_local_marker.shape( 0 )"   # une expression C++, lue sur un argument
+        # WHAT THE KERNEL WRITES INTO `plan`, named POSITIVELY. `barycenters` is only produced
+        # if asked for: not naming it leaves it a `NoneTensor` ( the forward guards it with
+        # `is_valid` C++-side ) and the adjoint recomputes b_i. This is what the flag decides.
+        written = [ "cost", "nb_diracs" ] + ( [ "barycenters" ] if self._with_barycenters else [] )
+        group_size_expr = "scratch.num_local_marker.shape( 0 )"   # a C++ expression, read off an argument
 
-        # LA GEOMETRIE DE LANCEMENT, ecrite une fois et donnee aux DEUX sens. Ici ils la partagent,
-        # mais ce n'est plus impose : un adjoint est un `FfiCode` entier et peut avoir la sienne.
+        # THE LAUNCH GEOMETRY, written once and given to BOTH directions. Here they share it,
+        # but that is no longer imposed: an adjoint is a whole `FfiCode` and can have its own.
         #
-        # `local_mem_elems` : `2 * ceil( local_size / subgroup_size )` lignes partagees PAR WARP --
-        # une ligne histogramme/curseur ET une ligne de masque par sous-groupe cooperant au
-        # histogramme/scatter radix ( voir `sort_diracs` ) -- plus une ligne pour les offsets de
-        # bucket inter-chunks ( `SdotPlan1d.cxx::sort_diracs::radix_pass` ). Sans rapport avec
-        # `group_scan` ( scratch global ordinaire, pas de la memoire locale ).
+        # `local_mem_elems`: `2 * ceil( local_size / subgroup_size )` shared rows PER WARP --
+        # one histogram/cursor row AND one mask row per sub-group cooperating in the
+        # radix histogram/scatter ( see `sort_diracs` ) -- plus one row for the inter-chunk
+        # bucket offsets ( `SdotPlan1d.cxx::sort_diracs::radix_pass` ). Unrelated to
+        # `group_scan` ( ordinary global scratch, not local memory ).
         #
-        # C'est un CORPS de methode C++ ( voir `FfiCode` ) : les arguments de l'appel y sont en
-        # portee sous leurs noms -- donc sous leur GROUPE -- et le calcul se lit.
-        geometrie_cooperative = dict(
+        # This is the BODY of a C++ method ( see `FfiCode` ): the call's arguments are in
+        # scope there under their names -- hence under their GROUP -- and the computation reads naturally.
+        cooperative_geometry = dict(
             max_nb_threads = "return scratch.sorted_indices.shape( 0 );",
             group_size = f"return { group_size_expr };",
             local_mem_elems = ( f"const int gs = { group_size_expr };\n"
@@ -200,18 +200,18 @@ class SdotPlan1d( Aggregate ):
                 code = ( "outputs.plan( batch_index ).update_outputs( scratch.sorted_indices( group_index ), scratch.radix_tmp( group_index ), scratch.sorted_pos( group_index ), "
                             "scratch.group_scan( group_index ), "
                             "local_index, local_size, group, local_scratch, sub_group );" ),
-                **geometrie_cooperative ),
+                **cooperative_geometry ),
             FfiCode.per_item( code = ( "outputs.plan( batch_index ).update_outputs_bwd( grad_of_outputs.plan( batch_index ), scratch.sorted_indices( group_index ), scratch.radix_tmp( group_index ), scratch.sorted_pos( group_index ), "
                             "scratch.group_scan( group_index ), "
                             "local_index, local_size, group, local_scratch, sub_group );" ),
                     prologue = "outputs.plan.src_dist.zero_position_grad( queue, grad_of_outputs.plan.src_dist );",
-                    **geometrie_cooperative ),
-            plan = loom.out( self, writes = ecrit ),
-            # les tampons sont transitoires PAR GROUPE : l'adjoint les re-alloue frais au lieu de
-            # lire les valeurs ( perimees ) de l'aller comme des residus -- voir `_call_backward`.
+                    **cooperative_geometry ),
+            plan = loom.out( self, writes = written ),
+            # the buffers are transient PER GROUP: the adjoint re-allocates them fresh instead of
+            # reading the ( stale ) forward values as residuals -- see `_call_backward`.
             **{ n: loom.scratch( t ) for n, t in self._scratch().items() },
-            # chaque compte de sortie est prescrit depuis `nb_diracs`, donc aucune capacite ne peut
-            # deborder : on saute le test d'execution ( une synchro device -> hote par appel ).
+            # every output count is prescribed from `nb_diracs`, so no capacity can
+            # overflow: we skip the run-time test ( one device -> host sync per call ).
             has_dynamic_capacity = False,
         )
 
@@ -228,19 +228,20 @@ class SdotPlan1d( Aggregate ):
         (returns False, caller keeps the single batched call) when: not JAX, more than one batch
         axis, or either distribution cannot slice itself (`batch_slice`).
         """
-        if len( self.batch_axes ) != 1 or driver.framework.module_name != "jax":
+        framework = driver.framework.module_name
+        if len( self.batch_axes ) != 1 or framework not in ( "jax", "torch" ):
             return False
         # probed with a concrete Python int (outside any trace, so this is free): confirms both
         # sides know how to slice themselves before committing to the loop.
         if self.src_dist.batch_slice( 0 ) is None or self.dst_dist.batch_slice( 0 ) is None:
             return False
 
-        import jax
-        import jax.numpy as jnp
-
         with_barycenters = self._with_barycenters
 
-        @jax.checkpoint
+        # `driver.checkpoint` is `jax.checkpoint` under Jax. Under Torch the angles are looped over in
+        # Python ( eager autograd: one angle's buffers live at a time once checkpointed ), which also
+        # keeps every `driver.call` unbatched -- the path the C++ backward is exercised on.
+        @driver.checkpoint
         def body( index ):
             src_i = self.src_dist.batch_slice( index )
             dst_i = self.dst_dist.batch_slice( index )
@@ -257,7 +258,14 @@ class SdotPlan1d( Aggregate ):
             return plan_i.cost.raw
 
         n_batch = self.batch_axes[ 0 ].max
-        result = jax.lax.map( body, jnp.arange( n_batch ) )
+        if framework == "jax":
+            import jax
+            import jax.numpy as jnp
+            result = jax.lax.map( body, jnp.arange( n_batch ) )
+        else:
+            outs = [ body( i ) for i in range( int( n_batch ) ) ]
+            result = tuple( driver.stack( list( column ), axis = 0 ) for column in zip( *outs ) ) if with_barycenters \
+                     else driver.stack( outs, axis = 0 )
         if with_barycenters:
             cost, barycenters = result
             self.barycenters = barycenters
@@ -281,7 +289,7 @@ class SdotPlan1d( Aggregate ):
         `positions[jnp.argsort(positions)]` upstream).
         """
         self.dst_dist.ensure_cell_cum_mass()
-        group_size_expr = "scratch.num_local_marker.shape( 0 )"   # une expression C++, lue sur un argument
+        group_size_expr = "scratch.num_local_marker.shape( 0 )"   # a C++ expression, read off an argument
         gs = driver.device.group_size( nb_shared_bytes_per_subgroup = 0, nb_shared_bytes_fixed = 0 )
         # ONE group only: this call handles a SINGLE angle (the caller's `lax.scan` supplies the outer
         # angle loop), so there is no "concurrent angles" axis to size `num_group` on (contrast
@@ -290,10 +298,10 @@ class SdotPlan1d( Aggregate ):
         num_local = Axis( ShapeVar( gs ), name = "num_local" )
         num_scan  = Axis( ShapeVar( gs + 1 ), name = "num_local_scan" )
 
-        # la geometrie de lancement, ecrite une fois et donnee aux DEUX sens : ici ils la partagent,
-        # mais ce n'est plus impose -- un adjoint est un `FfiCode` entier et peut avoir la sienne.
+        # the launch geometry, written once and given to BOTH directions: here they share it,
+        # but that is no longer imposed -- an adjoint is a whole `FfiCode` and can have its own.
         # no `sort_diracs` here (order already given) -> no radix-bucket local scratch needed.
-        geometrie_presortee = dict(
+        presorted_geometry = dict(
             max_nb_threads = "return inputs.sorted_indices.shape( 0 );",
             group_size = f"return { group_size_expr };",
             local_mem_elems = "return 0;",
@@ -303,13 +311,13 @@ class SdotPlan1d( Aggregate ):
             FfiCode.per_item( code = ( "outputs.plan( batch_index ).update_outputs_presorted( inputs.sorted_indices( group_index ), inputs.sorted_pos( group_index ), "
                             "scratch.group_scan( group_index ), "
                             "local_index, local_size, group );" ),
-                **geometrie_presortee,
+                **presorted_geometry,
             ),
             FfiCode.per_item( code = ( "outputs.plan( batch_index ).update_outputs_bwd_presorted( grad_of_outputs.plan( batch_index ), inputs.sorted_indices( group_index ), inputs.sorted_pos( group_index ), "
                             "scratch.group_scan( group_index ), "
                             "local_index, local_size, group );" ),
                     prologue = "outputs.plan.src_dist.zero_position_grad( queue, grad_of_outputs.plan.src_dist );",
-                    **geometrie_presortee ),
+                    **presorted_geometry ),
             plan = loom.out( self, writes = ( "cost", "nb_diracs" ) ),
             # `Tensor.wrap` only takes axis NAME strings (it mints fresh, detached axes) -- use the SAME
             # names as `num_group`/`self.num_dirac` above so `CallArgsAnalysis` unifies them by name

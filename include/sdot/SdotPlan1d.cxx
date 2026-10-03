@@ -78,20 +78,20 @@ UTP HD void DTP::sort_diracs( auto &&sorted_indices, auto &&radix_tmp, auto &&so
     // when `sgs == 1` (always true on CPU, where `group_size` -- hence `local_size` -- is itself
     // always 1, see `Cpu.group_size`): `num_sg == local_size`, one lane per "sub-group", every wave
     // below is a single element with `intra_rank == 0`, i.e. the same sequential increment idiom.
-    // `sg_id`/`sg_lid` sont DERIVES de `local_index`, jamais demandes au backend.
+    // `sg_id`/`sg_lid` are DERIVED from `local_index`, never asked of the backend.
     //
-    // `sub_group.get_group_linear_id()` n'est pas fiable : le backend `omp.library-only` rapporte
-    // 0 pour TOUTE voie (mesure : `test_group_kernel::the_lane_to_subgroup_mapping_is_linear`),
-    // alors qu'il rapporte bien des `local_index` distincts. Le decoupage `[lo_s,hi_s)` ci-dessous
-    // s'effondrait alors sur le meme premier morceau pour toutes les voies : elles triaient toutes
-    // la meme tranche vers les memes destinations, et le reste de la sortie n'etait jamais ecrit --
-    // `sorted_indices`/`sorted_pos` uniformement remplis d'une seule entree, donc un cout de
-    // transport faux de quelques pourcents, sans le moindre accès hors bornes pour le signaler.
+    // `sub_group.get_group_linear_id()` is not reliable: the `omp.library-only` backend reports
+    // 0 for EVERY lane (measured: `test_group_kernel::the_lane_to_subgroup_mapping_is_linear`),
+    // while it does report distinct `local_index` values. The `[lo_s,hi_s)` split below
+    // then collapsed onto the same first chunk for all lanes: they all sorted
+    // the same slice towards the same destinations, and the rest of the output was never written --
+    // `sorted_indices`/`sorted_pos` uniformly filled with a single entry, hence a wrong transport
+    // cost by a few percent, without any out-of-bounds access to flag it.
     //
-    // La derivation vaut sur les deux backends : SYCL numerote les work-items d'un `nd_range` 1D
-    // lineairement dans leurs sous-groupes, donc `local_index / sgs` EST l'indice de sous-groupe et
-    // `local_index % sgs` la voie dedans -- ce que CUDA rapportait deja, et ce qui degenere
-    // correctement a `sgs == 1` (un sous-groupe par voie), le cas que le code croyait tenir.
+    // The derivation holds on every backend: work-items of a 1D launch are numbered
+    // linearly within their sub-groups, so `local_index / sgs` IS the sub-group index and
+    // `local_index % sgs` the lane within it -- which CUDA already reported, and which degenerates
+    // correctly at `sgs == 1` (one sub-group per lane), the case the code believed it was handling.
     const int sgs    = int( sub_group.get_local_linear_range() );
     const int sg_id  = local_index / sgs;
     const int sg_lid = local_index % sgs;
@@ -152,7 +152,7 @@ UTP HD void DTP::sort_diracs( auto &&sorted_indices, auto &&radix_tmp, auto &&so
         // SCATTER, wave by wave (one `sgs`-sized wave per iteration, in increasing index order --
         // deterministic, the same property that makes the outer chunking stable). Finding each lane's
         // STABLE rank among same-digit lanes of THIS wave in O(1) (not O(sgs)) needs a CUDA warp-match
-        // intrinsic in the textbook version (`__match_any_sync`) -- unavailable portably in SYCL, so
+        // intrinsic in the textbook version (`__match_any_sync`) -- unavailable portably, so
         // this replicates it via the ATOMIC-OR technique CUB itself falls back to when match-any isn't
         // used (`cub::BlockRadixRankMatch`'s `WARP_MATCH_ATOMIC_OR` path, see
         // cub/block/block_radix_rank.cuh): `match_row[b]` is a per-bucket bitmask, one bit per lane --
@@ -164,7 +164,7 @@ UTP HD void DTP::sort_diracs( auto &&sorted_indices, auto &&radix_tmp, auto &&so
         // bumps the shared per-digit cursor -- ONE atomic per DISTINCT digit in the wave, not one per
         // lane. The reservation base itself needs no shuffle: `hist_row[b]` is already shared local
         // memory, so EVERY matching lane just reads it directly (redundant across ties, but cheap and
-        // avoids relying on `sycl::select_from_group`'s availability). `dest = bucket_start_row[b]`
+        // avoids any shuffle). `dest = bucket_start_row[b]`
         // (this bucket's GROUP-global base, fixed since the scan above) `+ base` (the shared
         // reservation, read before the leader's bump) `+ popcount - 1` (this lane's 0-indexed rank
         // within the reservation) -- the same quantity a sequential `local_scratch[hist_row+b]++`
@@ -342,7 +342,7 @@ UTP HD void DTP::update_outputs_presorted( auto &&sorted_indices, auto &&sorted_
 //
 // Each gradient below is guarded at compile time on `is_valid`: an unperturbed input reaches
 // us as a `NoneTensor` (no `operator=`), so its block must vanish -- see [[differentiation]].
-// Everything runs inside a SYCL kernel, so NO std::vector / dynamic allocation: the per-dirac
+// Everything runs inside a kernel, so NO std::vector / dynamic allocation: the per-dirac
 // suffix sum is carried by two scalars instead of an array.
 UTP HD void DTP::sweep_outputs_bwd( auto &&grad_plan, auto &&sorted_indices, auto &&sorted_pos, auto &&group_scan,
                                   int local_index, int local_size, auto &&group ) const {
@@ -350,8 +350,8 @@ UTP HD void DTP::sweep_outputs_bwd( auto &&grad_plan, auto &&sorted_indices, aut
     const SI nb = src_dist.weights.size();
     const SI lo = ( nb * SI( local_index ) ) / local_size;
     const SI hi = ( nb * SI( local_index + 1 ) ) / local_size;
-    constexpr bool need_weight_value_grad = grad_plan.src_dist.weights.is_valid
-                                          || grad_plan.dst_dist.values.is_valid;
+    constexpr bool need_weight_value_grad = DECAYED_TYPE_OF( grad_plan.src_dist.weights )::is_valid
+                                          || DECAYED_TYPE_OF( grad_plan.dst_dist.values )::is_valid;
 
     // --- d cost / d positions -------------------------------------------------------------------
     //   d cost / d p_i = Integral_{S_i} 2 (p_i - x) y dx = 2 w_i ( p_i - b_i ),  b_i the barycenter of
@@ -418,7 +418,7 @@ UTP HD void DTP::sweep_outputs_bwd( auto &&grad_plan, auto &&sorted_indices, aut
             // view `src_dist.weights( ... )` directly would decrement the shared weights buffer and
             // corrupt every later read (the forward avoids this via its own `const TF mass`).
 
-            if constexpr ( grad_plan.dst_dist.values.is_valid ) {
+            if constexpr ( DECAYED_TYPE_OF( grad_plan.dst_dist.values )::is_valid ) {
                 // cooperative zeroing, chunked over CELLS -- accumulated below via atomic `+=`,
                 // one per piece.
                 const SI nb_cells = img.values.size();
@@ -479,10 +479,10 @@ UTP HD void DTP::sweep_outputs_bwd( auto &&grad_plan, auto &&sorted_indices, aut
                 }
                 const TF Phi_k = phi_total - pref;
 
-                if constexpr ( grad_plan.src_dist.weights.is_valid )
+                if constexpr ( DECAYED_TYPE_OF( grad_plan.src_dist.weights )::is_valid )
                     grad_plan.src_dist.weights( ::num_dirac = di ) = g * Phi_k;
 
-                if constexpr ( grad_plan.dst_dist.values.is_valid )
+                if constexpr ( DECAYED_TYPE_OF( grad_plan.dst_dist.values )::is_valid )
                     // `udp.index` is the cell of the piece being emitted (read before the walker
                     // advances); every piece lives in a single cell. ATOMIC: unlike the sequential
                     // original, a cell straddling a CHUNK BOUNDARY now gets one write from the end of
@@ -514,9 +514,9 @@ UTP HD void DTP::update_outputs_bwd( auto &&grad_plan, auto &&sorted_indices, au
     // `sorted_indices`/`sorted_pos` (via `sweep_outputs_bwd`), instead of paying a full redundant
     // radix sort per block.
     constexpr bool need_position_resort  = CT_VALUE( src_dist.position_grad_wanted( grad_plan.src_dist ) )
-                                         && ! barycenters.is_valid;
-    constexpr bool need_weight_value_grad = grad_plan.src_dist.weights.is_valid
-                                          || grad_plan.dst_dist.values.is_valid;
+                                         && ! DECAYED_TYPE_OF( barycenters )::is_valid;
+    constexpr bool need_weight_value_grad = DECAYED_TYPE_OF( grad_plan.src_dist.weights )::is_valid
+                                          || DECAYED_TYPE_OF( grad_plan.dst_dist.values )::is_valid;
     if constexpr ( need_position_resort || need_weight_value_grad )
         sort_diracs( sorted_indices, radix_tmp, sorted_pos, local_index, local_size, group, local_scratch, sub_group );
     sweep_outputs_bwd( grad_plan, sorted_indices, sorted_pos, group_scan, local_index, local_size, group );

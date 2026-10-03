@@ -1,8 +1,8 @@
-"""Un SEGMENT -- ou une demi-droite, ou la droite entière.
+"""A SEGMENT -- or a half-line, or the whole line.
 
-Deux sommets, `vertex_positions[ 0 ] <= vertex_positions[ 1 ]`, une coupe par bout ( `cut_ids[ 0 ]`
-porte le bout gauche, `cut_ids[ 1 ]` le droit ). Un bout marqué `INFINITE` est posé à une distance
-inventée. Côté noyau : `cell/Local1.h`.
+Two vertices, `vertex_positions[ 0 ] <= vertex_positions[ 1 ]`, one cut per end ( `cut_ids[ 0 ]`
+carries the left end, `cut_ids[ 1 ]` the right one ). An end marked `INFINITE` is placed at an
+invented distance. Kernel side: `cell/Local1.h`.
 """
 
 import numpy as np
@@ -26,7 +26,7 @@ class Cell_1( Cell ):
     default_nb_dims = 1
     _GEOMETRY = ( "vertex_positions", "cut_ids" )
 
-    # ---- ce que le noyau demande ---------------------------------------------------------------
+    # ---- what the kernel asks for -----------------------------------------------------------
 
     @staticmethod
     def scratch_words( cap, fp_size ):
@@ -37,27 +37,27 @@ class Cell_1( Cell ):
         return 2
 
     def _cut_capacities( self ):
-        """une coupe déplace un bout : jamais plus de deux sommets"""
+        """a cut moves one end: never more than two vertices"""
         return 2, 2
 
-    # ---- lire un item, et ce qui s'en dérive -------------------------------------------------------
+    # ---- reading an item, and what is derived from it ----------------------------------------
 
     def _item( self, b ):
-        if self.vertex_positions.raw is None:              # jamais écrite : pas un sommet
+        if self.vertex_positions.raw is None:              # never written: not a vertex
             return Item( np.zeros( ( 0, 1 ) ), np.zeros( 0, int ) )
         nv, nc = self._count( self.nb_vertices, b ), self._count( self.nb_cuts, b )
         return Item( self._rows( self.vertex_positions, b, nv ).astype( float ),
                      self._rows( self.cut_ids, b, nc ).astype( int ) )
 
     def _vertex_cut_indices_of( self, it ):
-        """le bout `i` est le coin de la coupe `i`"""
+        """end `i` is the corner of cut `i`"""
         return np.arange( it.nb_vertices )[ :, None ]
 
     def _edges_of( self, it ):
         return np.array( [ [ 0, 1 ] ] ) if it.nb_vertices == 2 else np.zeros( ( 0, 2 ), int )
 
     def _edge_cuts_of( self, it ):
-        """l'arête -- le segment -- n'est portée par aucune coupe"""
+        """the edge -- the segment -- is carried by no cut"""
         return np.zeros( ( 1 if it.nb_vertices == 2 else 0, 0 ), int )
 
     def _faces_of( self, it ):

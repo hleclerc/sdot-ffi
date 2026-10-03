@@ -1,52 +1,52 @@
 #pragma once
 
 // =====================================================================================
-// LE TRANSPORT SEMI-DISCRET, RESOLU : trouver `w` tel que `masse( Lag_i( w ) ) = nu_i` pour tout `i`.
-// Le Newton amorti de `solvers_des_familles` ( `src/solver/Newton.h`, README § 3, § 7, § 10 ), qui a
-// gagne contre tout ce qui a ete essaye -- L-BFGS et gradient conjugue sur le dual ( 2 a 4x plus de
-// diagrammes ), la continuation par serie, le multi-echelle, la barriere -- repris ici sur les
-// diagrammes de `Balayage.h`.
+// THE SEMI-DISCRETE TRANSPORT, SOLVED: find `w` such that `mass( Lag_i( w ) ) = nu_i` for every `i`.
+// The damped Newton of `solvers_des_familles` ( `src/solver/Newton.h`, README § 3, § 7, § 10 ), which
+// won against everything that was tried -- L-BFGS and conjugate gradient on the dual ( 2 to 4x more
+// diagrams ), series continuation, multiscale, the barrier -- taken up here on the
+// diagrams of `Sweep.h`.
 //
-// = Le dual, et pourquoi Newton
+// = The dual, and why Newton
 //
-//     Phi( w ) = integrale min_i ( |x - p_i|^2 - w_i ) rho( x ) dx + sum_i w_i nu_i
+//     Phi( w ) = integral min_i ( |x - p_i|^2 - w_i ) rho( x ) dx + sum_i w_i nu_i
 //
-// est CONCAVE, de gradient `nu_i - masse( Lag_i( w ) )`, et sa hessienne est au signe pres le
-// laplacien du graphe de Laguerre ( `Laplacien.h` ). Son noyau est les constantes : on fixe `w_0 = 0`.
+// is CONCAVE, with gradient `nu_i - mass( Lag_i( w ) )`, and its hessian is, up to sign, the
+// laplacian of the Laguerre graph ( `Laplacian.h` ). Its kernel is the constants: we fix `w_0 = 0`.
 //
-// = L'amortissement ( Kitagawa-Merigot-Thibert ), et ce qu'il protege
+// = The damping ( Kitagawa-Merigot-Thibert ), and what it protects
 //
-// La hessienne n'est definie que tant qu'aucune cellule n'est vide. Le pas essaye doit donc
-// garder toute masse au-dessus d'un plancher `eps` fixe au depart ( la moitie de la plus petite
-// masse, de depart ou cible ), et faire decroitre le residu d'au moins `1 - t / 2`. Le depart doit
-// etre admissible ( aucune cellule vide ) : c'est l'affaire de l'appelant ( `Solve.h` ).
+// The hessian is only defined as long as no cell is empty. The trial step must therefore
+// keep every mass above a floor `eps` fixed at the start ( half the smallest
+// mass, initial or target ), and decrease the residual by at least `1 - t / 2`. The start must
+// be admissible ( no empty cell ): that is the caller's business ( `Solve.h` ).
 //
-// La decroissance est demandee STRICTE ( `n2 < nr` ) : sans cela un pas qui tend vers zero passe
-// le test par egalite des que `t` est negligeable, et Newton tourne sur place indefiniment
-// ( mesure : 54 diagrammes par iteration a residu constant ). On sort alors en STAGNATION -- le
-// plancher numerique, pas un echec, et la difference se lit sur `reste`.
+// The decrease is required STRICT ( `n2 < nr` ): without that, a step that tends to zero passes
+// the test by equality as soon as `t` is negligible, and Newton spins in place forever
+// ( measured: 54 diagrams per iteration at constant residual ). We then exit in STAGNATION -- the
+// numerical floor, not a failure, and the difference is read on `residual`.
 //
-// = Le pas d'essai
+// = The trial step
 //
-// ESSAIS : `t` repart de `mult_ok` fois le dernier pas accepte ( plafonne a 1 ), et se divise par
-// deux tant que le pas est refuse. Repartir de 1 a chaque iteration coutait dix diagrammes par
-// pas dans la phase lineaire ( `t ~ 1e-3`, des cellules presque vides ) pour retomber au meme `t`.
+// TRIALS: `t` restarts from `mult_ok` times the last accepted step ( capped at 1 ), and is halved
+// as long as the step is refused. Restarting from 1 at each iteration cost ten diagrams per
+// step in the linear phase ( `t ~ 1e-3`, nearly empty cells ) only to fall back to the same `t`.
 //
-// ESSAI_LIMITES ( 2D ) : l'essai `t = beta` d'abord ; si des cellules y passent sous `eps`, leurs
-// LIMITES le long de `d` ( `Limites.h` : une cellule exacte par tour, a chaud, le polynome ou la
-// bissection en masse ), le pas ramene sous la plus petite, et on recommence. Le meilleur pas
-// mesure ( -37 % de diagrammes sur les lignes, les reculs disparaissent sur les densites ) ; il
-// demande une passe de limites que seul le 2D sait faire aujourd'hui.
+// LIMITS ( 2D ): the trial `t = beta` first; if some cells fall below `eps` there, their
+// LIMITS along `d` ( `Bounds.h`: one exact cell per round, warm, the polynomial or the
+// mass bisection ), the step brought back under the smallest, and we start again. The best step
+// measured ( -37 % of diagrams on the lines, the backtracks disappear on the densities ); it
+// requires a limits pass that only 2D knows how to do today.
 //
-// = Ce que coute une iteration
+// = What an iteration costs
 //
-// UN diagramme par pas essaye, et rien de plus : le pas accepte livre a la fois les mesures ( le
-// residu ) et les facettes ( la hessienne suivante ). Le temps est compte par poste -- majorants,
-// diagrammes, assemblage, resolution -- parce que c'est la REPARTITION qu'on veut lire.
+// ONE diagram per trial step, and nothing more: the accepted step delivers both the measures ( the
+// residual ) and the facets ( the next hessian ). Time is counted per item -- majorants,
+// diagrams, assembly, solve -- because it is the BREAKDOWN we want to read.
 // =====================================================================================
 
-#include "Balayage.h"
-#include "Lineaire.h"
+#include "Sweep.h"
+#include "Linear.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -57,135 +57,135 @@ namespace sdot {
 namespace sdotplan {
 
 struct NewtonOptions {
-    double tol_abs    = 1e-8;    ///< arret : `max_i |a_i - nu_i| <= tol_abs` ...
-    double tol_rel    = 0;       ///< ... ou `max_i |a_i - nu_i| / nu_i <= tol_rel` ( 0 : jamais )
+    double tol_abs    = 1e-8;    ///< stop: `max_i |a_i - nu_i| <= tol_abs` ...
+    double tol_rel    = 0;       ///< ... or `max_i |a_i - nu_i| / nu_i <= tol_rel` ( 0: never )
     int    maxit      = 100;
-    int    max_reculs = 60;      ///< divisions par deux du pas, au plus, par iteration
-    double t_min      = 1e-10;   ///< en dessous, on declare la STAGNATION
-    double mult_ok    = 4;       ///< ESSAIS : le prochain essai part de `mult_ok * t` ( plafonne a 1 )
+    int    max_backtracks = 60; ///< halvings of the step, at most, per iteration
+    double t_min      = 1e-10;   ///< below this, we declare STAGNATION
+    double mult_ok    = 4;       ///< TRIALS: the next trial starts from `mult_ok * t` ( capped at 1 )
     bool   trace      = false;
-    enum Pas : int { ESSAIS = 0, ESSAI_LIMITES = 1 };
-    int    pas        = ESSAIS;
-    double facteur    = 0.9;     ///< ESSAI_LIMITES : `t = facteur * alpha*`
-    double beta0      = 0.25;    ///< ESSAI_LIMITES : le tout premier essai
-    double mult_lim   = 2;       ///< ESSAI_LIMITES : apres un essai passe DIRECT, `beta *= mult_lim`
-    double confiance  = 0;       ///< ESSAI_LIMITES : apres un pas CORRIGE, le prochain essai est au moins `confiance * t`
-    /// appele apres chaque pas ACCEPTE ( et au depart, `it = 0` ) : `w` et `a` sont ceux du pas
-    std::function<void( int it, double t, int nb_evals )> apres_pas;
+    enum Step : int { TRIALS = 0, LIMITS = 1 };
+    int    step       = TRIALS;
+    double factor     = 0.9;     ///< LIMITS: `t = factor * alpha*`
+    double beta0      = 0.25;    ///< LIMITS: the very first trial
+    double mult_lim   = 2;       ///< LIMITS: after a trial that passed DIRECTLY, `beta *= mult_lim`
+    double confidence = 0;       ///< LIMITS: after a CORRECTED step, the next trial is at least `confidence * t`
+    /// called after each ACCEPTED step ( and at the start, `it = 0` ): `w` and `a` are those of the step
+    std::function<void( int it, double t, int nb_evals )> after_step;
 };
 
 struct NewtonStats {
-    int    fin = 0;              ///< pourquoi la boucle s'est arretee ( `Fin` )
-    enum Fin : int { EN_COURS = 0, CONVERGE = 1, MAX_ITERATIONS = 2, STAGNATION = 3, ECHEC_LINEAIRE = 4 };
-    double reste  = 0;           ///< le `max_i |a_i - nu_i|` atteint
-    double reste0 = 0;           ///< le meme AU DEPART
-    double eps    = 0;           ///< le plancher de masse de l'amortissement
-    int    nb_iter = 0, nb_recul = 0;
-    SI     nb_cell_lim = 0;      ///< cellules calculees par les passes de limites, en tout
-    int    nb_tours_essai = 0;   ///< ESSAI_LIMITES : essais corriges par des limites locales
+    int    status = 0;              ///< why the loop stopped ( `Status` )
+    enum Status : int { RUNNING = 0, CONVERGED = 1, MAX_ITERATIONS = 2, STAGNATION = 3, LINEAR_FAILURE = 4 };
+    double residual  = 0;           ///< the `max_i |a_i - nu_i|` reached
+    double residual0 = 0;           ///< the same AT THE START
+    double eps    = 0;           ///< the mass floor of the damping
+    int    nb_iter = 0, nb_backtracks = 0;
+    SI     nb_cell_lim = 0;      ///< cells computed by the limits passes, in all
+    int    nb_limit_rounds = 0;   ///< LIMITS: trials corrected by local limits
     double t_asm = 0, t_lin = 0, t_lim = 0;
-    static const char *texte( int fin ) {
-        switch ( fin ) {
-            case CONVERGE:       return "CONVERGE";
+    static const char *text( int status ) {
+        switch ( status ) {
+            case CONVERGED:      return "CONVERGED";
             case MAX_ITERATIONS: return "MAX ITERATIONS";
             case STAGNATION:     return "STAGNATION";
-            case ECHEC_LINEAIRE: return "SOLVEUR LINEAIRE EN ECHEC";
+            case LINEAR_FAILURE: return "LINEAR SOLVER FAILURE";
             default:             return "?";
         }
     }
 };
 
-/// CE QU'UNE PASSE DE LIMITES rend a Newton ( `Limites.h`, 2D ) : `alpha` par cellule demandee.
-/// Un `Balayage` qui n'en a pas ( `limites == nullptr` ) prend le pas par ESSAIS.
-struct LimitesLocales {
-    /// les limites des cellules `mauvaises` ( identifiants ) le long de `d` depuis `w`, sous
-    /// `horizon`, au niveau `eps` ; rend `min_i alpha_i` et le nombre de cellules calculees
-    std::function<double( const std::vector<double> &w, const std::vector<double> &d, const std::vector<SI> &mauvaises,
-                          double horizon, double eps, const Laplacien &L, SI &nb_cellules )> alpha_min;
+/// WHAT A LIMITS PASS returns to Newton ( `Bounds.h`, 2D ): `alpha` per requested cell.
+/// A `Sweep` that has none ( `bounds == nullptr` ) takes the step by TRIALS.
+struct LocalBounds {
+    /// the limits of the `bad_cells` ( bad ) cells ( identifiers ) along `d` from `w`, under
+    /// `horizon`, at level `eps`; returns `min_i alpha_i` and the number of cells computed
+    std::function<double( const std::vector<double> &w, const std::vector<double> &d, const std::vector<SI> &bad_cells,
+                          double horizon, double eps, const Laplacian &L, SI &nb_cells )> alpha_min;
 };
 
 template<class Bal>
 struct Newton {
     Bal                &bal;
-    SolveurLineaire    &lin;
+    LinearSolver    &lin;
     NewtonOptions       o;
-    const LimitesLocales *limites = nullptr;
+    const LocalBounds *bounds = nullptr;
 
-    std::vector<double> nu;      ///< la masse cible, par germe
-    std::vector<double> w;       ///< les poids courants, `w[ 0 ] == 0`
-    std::vector<double> a;       ///< les masses courantes
-    std::vector<double> d;       ///< la derniere direction de Newton ( `d[ 0 ] == 0` )
-    std::vector<Facette> fa;     ///< les facettes du diagramme courant ( celui de `w` )
+    std::vector<double> nu;      ///< the target mass, per seed
+    std::vector<double> w;       ///< the current weights, `w[ 0 ] == 0`
+    std::vector<double> a;       ///< the current masses
+    std::vector<double> d;       ///< the last Newton direction ( `d[ 0 ] == 0` )
+    std::vector<Facet> fa;     ///< the facets of the current diagram ( that of `w` )
     NewtonStats         st;
-    double              t_dernier = 1;   ///< le dernier pas accepte
-    int                 nb_evals_dernier = 0;
-    double              beta;            ///< ESSAI_LIMITES : le prochain essai -- GARDE d'un `resout` a l'autre ( les
-                                         ///< etapes d'une continuation : un depart proche accepte `t = 1` d'emblee )
+    double              t_last = 1;   ///< the last accepted step
+    int                 nb_evals_last = 0;
+    double              beta;            ///< LIMITS: the next trial -- KEPT from one `solves` to the next ( the
+                                         ///< steps of a continuation: a close start accepts `t = 1` right away )
 
-    Newton( Bal &bal, SolveurLineaire &lin, NewtonOptions o = {} ) : bal( bal ), lin( lin ), o( o ), beta( o.beta0 ) {}
+    Newton( Bal &bal, LinearSolver &lin, NewtonOptions o = {} ) : bal( bal ), lin( lin ), o( o ), beta( o.beta0 ) {}
 
-    static double norme2( const std::vector<double> &v ) {
+    static double norm2( const std::vector<double> &v ) {
         double s = 0;
         for ( double x : v ) s += x * x;
         return std::sqrt( s );
     }
 
-    /// `| a - nu |_2`, le merite de l'amortissement
-    double merite( const std::vector<double> &A ) const {
+    /// `| a - nu |_2`, the merit of the damping
+    double merit( const std::vector<double> &A ) const {
         double s = 0;
         for ( SI i = 0; i < SI( A.size() ); ++i ) s += ( nu[ i ] - A[ i ] ) * ( nu[ i ] - A[ i ] );
         return std::sqrt( s );
     }
 
-    /// LES MESURES ET LES FACETTES pour les poids `W`
-    void mesures_et_facettes( const std::vector<double> &W, std::vector<double> &res, std::vector<Facette> &f ) {
+    /// THE MEASURES AND THE FACETS for the weights `W`
+    void measures_and_facets( const std::vector<double> &W, std::vector<double> &res, std::vector<Facet> &f ) {
         bal.set_weights( W );
-        bal.mesures( res, &f );
+        bal.measures( res, &f );
     }
 
-    /// LA BOUCLE, depuis `w_init` ( `a` et `fa` DEJA calcules pour `w_init` si `deja_mesure` ).
-    /// Rend `true` si le critere d'arret est atteint. Le diagramme porte les poids ACCEPTES en sortie.
-    bool resout( const std::vector<double> &w_init, bool deja_mesure = false ) {
+    /// THE LOOP, from `w_init` ( `a` and `fa` ALREADY computed for `w_init` if `already_measured` ).
+    /// Returns `true` if the stopping criterion is reached. The diagram carries the ACCEPTED weights on output.
+    bool solves( const std::vector<double> &w_init, bool already_measured = false ) {
         const SI n = bal.n();
         std::vector<double> a2, b, w2;
-        std::vector<Facette> fa2;
-        Laplacien L;
+        std::vector<Facet> fa2;
+        Laplacian L;
 
         w = w_init;
-        const double jauge = w[ 0 ];
-        for ( SI i = 0; i < n; ++i )                     // la jauge, imposee ici et maintenue par
-            w[ i ] -= jauge;                             // `d[ 0 ] = 0` ensuite
-        if ( ! deja_mesure )
-            mesures_et_facettes( w, a, fa );
-        t_dernier = 1;
-        nb_evals_dernier = 1;
-        if ( o.apres_pas ) o.apres_pas( 0, 0, 1 );
+        const double gauge = w[ 0 ];
+        for ( SI i = 0; i < n; ++i )                     // the gauge, imposed here and maintained by
+            w[ i ] -= gauge;                             // `d[ 0 ] = 0` afterwards
+        if ( ! already_measured )
+            measures_and_facets( w, a, fa );
+        t_last = 1;
+        nb_evals_last = 1;
+        if ( o.after_step ) o.after_step( 0, 0, 1 );
 
         double eps = 0;
         for ( int it = 0; it < o.maxit; ++it ) {
-            double pire = 0, pire_rel = 0;
-            SI nvide = 0;
+            double worst = 0, worst_rel = 0;
+            SI nb_empty = 0;
             b.assign( n, 0.0 );
             for ( SI i = 0; i < n; ++i ) {
-                nvide += ! ( a[ i ] > 0 );
-                pire = std::max( pire, std::fabs( nu[ i ] - a[ i ] ) );
-                pire_rel = std::max( pire_rel, std::fabs( nu[ i ] - a[ i ] ) / nu[ i ] );
-                b[ i ] = nu[ i ] - a[ i ];               // `-r`, le second membre de Newton
+                nb_empty += ! ( a[ i ] > 0 );
+                worst = std::max( worst, std::fabs( nu[ i ] - a[ i ] ) );
+                worst_rel = std::max( worst_rel, std::fabs( nu[ i ] - a[ i ] ) / nu[ i ] );
+                b[ i ] = nu[ i ] - a[ i ];               // `-r`, the right-hand side of Newton
             }
-            if ( it == 0 ) {                             // le plancher de masse de l'amortissement
+            if ( it == 0 ) {                             // the mass floor of the damping
                 double am = a[ 0 ], nm = nu[ 0 ];
                 for ( SI i = 0; i < n; ++i ) { am = std::min( am, a[ i ] ); nm = std::min( nm, nu[ i ] ); }
                 eps = 0.5 * std::min( nm, am );
                 st.eps = eps;
-                st.reste0 = pire;
+                st.residual0 = worst;
             }
-            const double nr = merite( a );
-            st.reste = pire;
+            const double nr = merit( a );
+            st.residual = worst;
 
-            if ( pire <= o.tol_abs || ( o.tol_rel > 0 && pire_rel <= o.tol_rel ) ) {
+            if ( worst <= o.tol_abs || ( o.tol_rel > 0 && worst_rel <= o.tol_rel ) ) {
                 if ( o.trace )
-                    std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  CONVERGE\n", it, nr, pire );
-                st.fin = NewtonStats::CONVERGE;
+                    std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  CONVERGED\n", it, nr, worst );
+                st.status = NewtonStats::CONVERGED;
                 return true;
             }
             ++st.nb_iter;
@@ -195,101 +195,101 @@ struct Newton {
             L.assemble( n, fa );
             st.t_asm += now() - t0;
             t0 = now();
-            const bool fait = lin.resout( L, b, d );
+            const bool solved = lin.solves( L, b, d );
             st.t_lin += now() - t0;
-            if ( ! fait ) {
-                st.fin = NewtonStats::ECHEC_LINEAIRE;
+            if ( ! solved ) {
+                st.status = NewtonStats::LINEAR_FAILURE;
                 return false;
             }
 
-            // ---- L'ESSAI PUIS LES LIMITES LOCALES : le diagramme du pas d'abord, et si des cellules
-            // y passent sous `eps`, leurs limites ( a elles seules ), le pas ramene sous la plus
-            // petite, et on recommence -- la non-monotonie peut en reveler d'autres
-            double t = std::min( 1.0, o.mult_ok * t_dernier );
-            bool deja = false;                           // le diagramme en `t` est deja fait
+            // ---- THE TRIAL THEN THE LOCAL LIMITS: the diagram of the step first, and if some cells
+            // fall below `eps` there, their limits ( on their own ), the step brought back under the
+            // smallest, and we start again -- non-monotonicity may reveal others
+            double t = std::min( 1.0, o.mult_ok * t_last );
+            bool already = false;                           // the diagram at `t` is already done
             double alpha_lim = -1;
             int nb_evals = 0;
-            if ( o.pas == NewtonOptions::ESSAI_LIMITES && limites ) {
+            if ( o.step == NewtonOptions::LIMITS && bounds ) {
                 t = beta;
-                std::vector<SI> mauvaises;
+                std::vector<SI> bad_cells;
                 w2.resize( n );
-                double t_fait = -1;                      // le pas dont le diagramme est dans `a2`
-                for ( int tour = 0; tour < 8; ++tour ) {
+                double t_done = -1;                      // the step whose diagram is in `a2`
+                for ( int limit_round = 0; limit_round < 8; ++limit_round ) {
                     for ( SI i = 0; i < n; ++i ) w2[ i ] = w[ i ] + t * d[ i ];
                     w2[ 0 ] = 0;
-                    mesures_et_facettes( w2, a2, fa2 );
+                    measures_and_facets( w2, a2, fa2 );
                     ++nb_evals;
-                    t_fait = t;
-                    mauvaises.clear();
-                    for ( SI i = 0; i < n; ++i ) if ( a2[ i ] < eps ) mauvaises.push_back( i );
-                    if ( mauvaises.empty() ) break;
-                    ++st.nb_tours_essai;
+                    t_done = t;
+                    bad_cells.clear();
+                    for ( SI i = 0; i < n; ++i ) if ( a2[ i ] < eps ) bad_cells.push_back( i );
+                    if ( bad_cells.empty() ) break;
+                    ++st.nb_limit_rounds;
                     t0 = now();
                     bal.set_weights( w );
                     SI nb_cel = 0;
-                    const double al = std::min( t, limites->alpha_min( w, d, mauvaises, t, eps, L, nb_cel ) );
+                    const double al = std::min( t, bounds->alpha_min( w, d, bad_cells, t, eps, L, nb_cel ) );
                     st.nb_cell_lim += nb_cel;
                     st.t_lim += now() - t0;
                     if ( o.trace )
-                        std::printf( "      essai t %.3e : %d cellules sous eps, limite locale %.3e ( %lld cellules calculees )\n",
-                                     t, int( mauvaises.size() ), al, ( long long ) nb_cel );
-                    t = o.facteur * al;
+                        std::printf( "      trial t %.3e : %d cells below eps, local limit %.3e ( %lld cells computed )\n",
+                                     t, int( bad_cells.size() ), al, ( long long ) nb_cel );
+                    t = o.factor * al;
                     if ( t < o.t_min ) break;
                 }
-                // une limite nulle n'est pas une raison de stagner : on rend la main aux essais,
-                // depuis la moitie du dernier pas calcule
-                if ( t < o.t_min ) t = t_fait / 2;
-                deja = t == t_fait;
+                // a zero limit is no reason to stagnate: we hand back to the trials,
+                // from half of the last computed step
+                if ( t < o.t_min ) t = t_done / 2;
+                already = t == t_done;
                 alpha_lim = t;
                 const bool direct = t >= beta;
-                beta = std::min( 1.0, std::max( direct ? o.mult_lim * beta : beta, o.confiance * t ) );
+                beta = std::min( 1.0, std::max( direct ? o.mult_lim * beta : beta, o.confidence * t ) );
             }
 
-            // ---- L'AMORTISSEMENT
-            bool pris = false;
+            // ---- THE DAMPING
+            bool taken = false;
             const double t_lim0 = t;
             w2.resize( n );
-            for ( int essai = 0; essai < o.max_reculs; ++essai ) {
-                if ( ! ( essai == 0 && deja ) ) {        // sinon, deja fait en `t`
+            for ( int trial = 0; trial < o.max_backtracks; ++trial ) {
+                if ( ! ( trial == 0 && already ) ) {        // otherwise, already done at `t`
                     for ( SI i = 0; i < n; ++i ) w2[ i ] = w[ i ] + t * d[ i ];
-                    w2[ 0 ] = 0;                         // la jauge, imposee et non esperee
-                    mesures_et_facettes( w2, a2, fa2 );
+                    w2[ 0 ] = 0;                         // the gauge, imposed and not hoped for
+                    measures_and_facets( w2, a2, fa2 );
                     ++nb_evals;
                 }
-                double m2 = a2[ 0 ];                     // le plancher `eps` est une masse ABSOLUE
+                double m2 = a2[ 0 ];                     // the `eps` floor is an ABSOLUTE mass
                 for ( SI i = 0; i < n; ++i ) m2 = std::min( m2, a2[ i ] );
-                const double n2r = merite( a2 );
-                if ( m2 >= eps && std::isfinite( n2r ) && n2r <= ( 1 - t / 2 ) * nr && n2r < nr ) { pris = true; break; }
+                const double n2r = merit( a2 );
+                if ( m2 >= eps && std::isfinite( n2r ) && n2r <= ( 1 - t / 2 ) * nr && n2r < nr ) { taken = true; break; }
                 t /= 2;
-                ++st.nb_recul;
+                ++st.nb_backtracks;
                 if ( t < o.t_min )
                     break;
             }
             if ( o.trace ) {
-                std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  %lld vides  pas %.2e  %d diag  [maj %.2f  diag %.2f  asm %.2f  lin %.2f]",
-                             it, nr, pire, ( long long ) nvide, t, bal.nb_diag - g0, bal.t_maj, bal.t_diag, st.t_asm, lin.st.total() );
+                std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  %lld empty  step %.2e  %d diag  [majorant %.2f  diag %.2f  asm %.2f  lin %.2f]",
+                             it, nr, worst, ( long long ) nb_empty, t, bal.nb_diag - g0, bal.t_majorant, bal.t_diag, st.t_asm, lin.st.total() );
                 if ( alpha_lim >= 0 )
-                    std::printf( "  alpha* %.2e%s", alpha_lim, t < t_lim0 ? " REFUSE" : "" );
+                    std::printf( "  alpha* %.2e%s", alpha_lim, t < t_lim0 ? " REFUSED" : "" );
                 std::printf( "\n" );
                 std::fflush( stdout );
             }
-            if ( ! pris ) {
-                bal.set_weights( w );                    // le diagramme reprend les poids acceptes
-                st.fin = NewtonStats::STAGNATION;        // le plancher numerique, pas un echec
+            if ( ! taken ) {
+                bal.set_weights( w );                    // the diagram takes the accepted weights back
+                st.status = NewtonStats::STAGNATION;        // the numerical floor, not a failure
                 return false;
             }
-            t_dernier = t;
-            nb_evals_dernier = nb_evals;
+            t_last = t;
+            nb_evals_last = nb_evals;
             w.swap( w2 );
             a.swap( a2 );
             fa.swap( fa2 );
-            if ( o.apres_pas ) o.apres_pas( it + 1, t, nb_evals );
+            if ( o.after_step ) o.after_step( it + 1, t, nb_evals );
         }
-        // le dernier point : ce qu'il vaut
-        double pire = 0;
-        for ( SI i = 0; i < n; ++i ) pire = std::max( pire, std::fabs( nu[ i ] - a[ i ] ) );
-        st.reste = pire;
-        st.fin = NewtonStats::MAX_ITERATIONS;
+        // the last point: what it is worth
+        double worst = 0;
+        for ( SI i = 0; i < n; ++i ) worst = std::max( worst, std::fabs( nu[ i ] - a[ i ] ) );
+        st.residual = worst;
+        st.status = NewtonStats::MAX_ITERATIONS;
         return false;
     }
 };

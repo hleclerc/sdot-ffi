@@ -30,11 +30,11 @@ UTP HD auto DTP::with_defaults( auto &&cont ) const {
     // frame, knots, current_mass, nb_cells_cum, cell_cum_mass. `::sdot::Image` (qualified) names the
     // TEMPLATE so CTAD re-deduces; bare `Image` would mean the current instantiation and defeat the
     // substitution.
-    if constexpr ( ! origin.is_valid )
+    if constexpr ( ! DECAYED_TYPE_OF( origin )::is_valid )
         return ::sdot::Image{ target_mass, nb_dims, shape, values, Vector<TF,ct_dim>::zeros(), frame, knots, current_mass, nb_cells_cum, cell_cum_mass }.with_defaults( FORWARD( cont ) );
-    else if constexpr ( ! frame.is_valid )
+    else if constexpr ( ! DECAYED_TYPE_OF( frame )::is_valid )
         return ::sdot::Image{ target_mass, nb_dims, shape, values, origin, Matrix<TF,ct_dim>::identity(), knots, current_mass, nb_cells_cum, cell_cum_mass }.with_defaults( FORWARD( cont ) );
-    else if constexpr ( ! knots.is_valid )
+    else if constexpr ( ! DECAYED_TYPE_OF( knots )::is_valid )
         return ::sdot::Image{ target_mass, nb_dims, shape, values, origin, frame, IotaTensor<TF>{}, current_mass, nb_cells_cum, cell_cum_mass }.with_defaults( FORWARD( cont ) );
     else
         return cont( *this );
@@ -59,8 +59,8 @@ UTP HD typename DTP::TF DTP::measure() const {
         CartesianIndices<DECAYED_TYPE_OF( shape )> cells{ shape };
         TF sum = 0;
         for ( PI flat = 0; flat < cells.size(); ++flat ) {
-            // `cells[ flat ]` rend desormais un `Coords` ( un multi-indice NOMME ) et non plus le
-            // tuple nu : le depaquetage se demande a ses `values`.
+            // `cells[ flat ]` now returns a `Coords` ( a NAMED multi-index ) and no longer the
+            // bare tuple: unpacking is requested from its `values`.
             const TF cell = cells[ flat ].values.apply_values( [&]( auto ...i ) {
                 // running axis counter over the index pack (axes 0..d-1, in order)
                 PI axis = 0;
@@ -75,9 +75,9 @@ UTP HD typename DTP::TF DTP::measure() const {
 }
 
 namespace detail {
-    /// Un multi-indice RUNTIME (`Vector<SI,d>`) rendu en `Tuple`, que `TensorView::offset` déplie
-    /// tout seul -- de quoi écrire `values( k )` avec un `k` dont les composantes sont calculées.
-    /// Même récursion `Ct` que `unravel_index` (voir `CartesianIndices.h`).
+    /// A RUNTIME multi-index (`Vector<SI,d>`) turned into a `Tuple`, which `TensorView::offset` unpacks
+    /// by itself -- enough to write `values( k )` with a `k` whose components are computed.
+    /// Same `Ct` recursion as `unravel_index` (see `CartesianIndices.h`).
     HD auto image_index_tuple( const auto &k, auto &&acc, auto done ) {
         constexpr int i = DECAYED_TYPE_OF( done )::value;
         constexpr int n = DECAYED_TYPE_OF( k.size() )::value;
@@ -89,7 +89,7 @@ namespace detail {
 }
 
 UTP HD SI DTP::knot_index( SI axis, TF t, SI nb_cells ) const {
-    SI b = 0, e = nb_cells;                 // on cherche dans [ b, e ), invariant : la réponse y est
+    SI b = 0, e = nb_cells;                 // we search in [ b, e ), invariant: the answer is in it
     while ( e - b > 1 ) {
         const SI m = ( b + e ) / 2;
         if ( TF( knots( axis, m ) ) <= t ) b = m;
@@ -109,26 +109,26 @@ UTP HD void DTP::_for_each_piece( const auto &cell, auto &&ws, auto &&func ) con
     if ( cell.nb_vertices() == 0 )
         return;
 
-    // ---- les plans de la grille, en coordonnées PHYSIQUES.
-    // La convention est celle de `measure` : `x = origin + F^T t`, donc `t = ( F^T )^-1 ( x - origin )`
-    // et la ligne `a` de `( F^T )^-1` est la COLONNE `a` de `F^-1`, c.-à-d. `solve_ge( F, e_a )`.
-    // On n'inverse donc rien : d résolutions, une par axe, et le pavé `k` est l'intersection des
-    // bandes `knots( a, k_a ) <= n_a . ( x - origin ) <= knots( a, k_a + 1 )`.
+    // ---- the grid planes, in PHYSICAL coordinates.
+    // The convention is that of `measure`: `x = origin + F^T t`, so `t = ( F^T )^-1 ( x - origin )`
+    // and row `a` of `( F^T )^-1` is COLUMN `a` of `F^-1`, i.e. `solve_ge( F, e_a )`.
+    // So nothing is inverted: d solves, one per axis, and tile `k` is the intersection of the
+    // bands `knots( a, k_a ) <= n_a . ( x - origin ) <= knots( a, k_a + 1 )`.
     const auto F = Matrix<TF,d>::with_func( [&]( auto r, auto c ) { return TF( frame( r, c ) ); } );
     const auto og = Vector<TF,d>::with_func( [&]( PI c ) { return TF( origin( c ) ); } );
 
     Vector<Vector<TF,d>,d> nrm;
-    Vector<TF,d> shift;                     // `n_a . origin`, ce qui décale l'offset du plan
+    Vector<TF,d> shift;                     // `n_a . origin`, which shifts the plane offset
     for ( PI a = 0; a < d; ++a ) {
         nrm[ a ] = Matrix<TF,d>::solve_ge( F, Vector<TF,d>::with_value_at( a, TF( 1 ) ) );
         shift[ a ] = dot( nrm[ a ], og );
     }
 
-    // ---- QUELS pavés essayer : ceux que la boîte englobante de la cellule rencontre.
-    // Une cellule NON BORNÉE n'a pas de boîte -- ses sommets sont ceux d'un simplexe bouche-trou
-    // (`Cell::init_as_unbounded`) et ne bornent rien. On balaie alors toute l'image, ce qui reste
-    // JUSTE (l'image est à support compact, donc l'intégrale est finie même sur une cellule
-    // infinie) et se paie en temps seulement -- un domaine (`box = ...`) supprime le cas.
+    // ---- WHICH tiles to try: those that the bounding box of the cell meets.
+    // An UNBOUNDED cell has no box -- its vertices are those of a stop-gap simplex
+    // (`Cell::init_as_unbounded`) and bound nothing. We then sweep the whole image, which stays
+    // CORRECT (the image has compact support, so the integral is finite even on an
+    // infinite cell) and costs only time -- a domain (`box = ...`) removes the case.
     Vector<SI,d> k0, k1;
     const bool bounded = cell.bounded();
     for ( PI a = 0; a < d; ++a ) {
@@ -151,7 +151,7 @@ UTP HD void DTP::_for_each_piece( const auto &cell, auto &&ws, auto &&func ) con
             if ( v == 0 || t > t_max ) t_max = t;
         }
 
-        // hors de l'image de ce côté-là : rien à intégrer du tout.
+        // outside the image on that side: nothing at all to integrate.
         if ( t_max < TF( knots( a, 0 ) ) || t_min > TF( knots( a, nb ) ) )
             return;
 
@@ -159,13 +159,13 @@ UTP HD void DTP::_for_each_piece( const auto &cell, auto &&ws, auto &&func ) con
         k1[ a ] = knot_index( a, t_max, nb ) + 1;
     }
 
-    // ---- un morceau par pavé. Compteur kilométrique sur `[ k0, k1 )`, et 2d coupes par pavé.
+    // ---- one piece per tile. Odometer counter over `[ k0, k1 )`, and 2d cuts per tile.
     //
-    // Une descente RÉCURSIVE (couper d'abord la tranche de l'axe 0, puis subdiviser dedans) ferait
-    // ~2 coupes par pavé au lieu de 2d, et élaguerait les tranches vides d'un coup ; elle demande
-    // en revanche une cellule de rechange PAR NIVEAU, là où celle-ci en demande deux en tout. À
-    // faire le jour où le profil le réclame -- le contrat côté Python (`extra_cuts_per_piece`) ne
-    // change pas.
+    // A RECURSIVE descent (first cut the slab of axis 0, then subdivide inside it) would do
+    // ~2 cuts per tile instead of 2d, and would prune empty slabs in one go; it requires
+    // however a spare cell PER LEVEL, whereas this one requires two in all. To be
+    // done the day the profile calls for it -- the Python-side contract (`extra_cuts_per_piece`) does not
+    // change.
     Vector<SI,d> k = k0;
     for ( PI a = 0; a < d; ++a )
         if ( k0[ a ] >= k1[ a ] )
@@ -177,8 +177,8 @@ UTP HD void DTP::_for_each_piece( const auto &cell, auto &&ws, auto &&func ) con
             const TF lo = TF( knots( a, k[ a ] ) ) + shift[ a ];
             const TF hi = TF( knots( a, k[ a ] + 1 ) ) + shift[ a ];
 
-            // ces plans-là portent `PIECE` : ils ne font face à aucun germe, et c'est exactement ce
-            // que l'adjoint lit pour savoir que leur part ne va nulle part (voir
+            // those planes carry `PIECE`: they face no seed, and that is exactly what
+            // the adjoint reads to know that their share goes nowhere (see
             // `PowerDiagram::scatter_cell_grad`).
             fitted = ( a == 0 ) ? ws.start( cell, nrm[ a ], hi )
                                 : ws.cut  (       nrm[ a ], hi );
@@ -190,9 +190,9 @@ UTP HD void DTP::_for_each_piece( const auto &cell, auto &&ws, auto &&func ) con
             if ( ws.nb_vertices() == 0 ) { alive = false; break; }
         }
 
-        // une coupe qui n'a pas tenu : la capacité manquante est enregistrée, l'hôte relancera avec
-        // le double et ce résultat-ci sera jeté. On s'arrête là plutôt que de continuer sur une
-        // géométrie qui n'existe plus.
+        // a cut that did not fit: the missing capacity is recorded, the host will relaunch with
+        // double and this result will be thrown away. We stop here rather than carrying on with a
+        // geometry that no longer exists.
         if ( ! fitted )
             return;
 
@@ -201,10 +201,10 @@ UTP HD void DTP::_for_each_piece( const auto &cell, auto &&ws, auto &&func ) con
             const TF value = TF( values( idx ) );
             ws.with_current( [&]( const auto &piece ) {
                 func( piece, ConstantDensity{ value, [&]( auto &&grad_dist, TF g ) {
-                    // le puits de gradient du morceau : `d masse / d values( k )` est le volume du
-                    // morceau, et `k` est ce que cette fermeture-ci sait et que l'appelant ignore.
-                    // Atomique : plusieurs work-items intègrent des cellules qui touchent le même pavé.
-                    if constexpr ( grad_dist.values.is_valid )
+                    // the gradient sink of the piece: `d mass / d values( k )` is the volume of the
+                    // piece, and `k` is what this closure knows and the caller does not.
+                    // Atomic: several work-items integrate cells that touch the same tile.
+                    if constexpr ( DECAYED_TYPE_OF( grad_dist.values )::is_valid )
                         atomic_add( grad_dist.values( idx ).ref(), g );
                 } } );
             } );
@@ -221,7 +221,7 @@ UTP HD void DTP::measure_bwd( auto &&grad_values, auto &&grad_mass ) const {
     // `mass` is linear in `values` (see `measure`): mass = Sum_c values(c) * |det(frame)| * spacing(c),
     // so grad_values(c) = grad_mass * |det(frame)| * spacing(c). Guarded at compile time: an
     // unperturbed `values` arrives as a `NoneTensor` (no `operator=`), so the block must vanish.
-    if constexpr ( grad_values.is_valid ) {
+    if constexpr ( DECAYED_TYPE_OF( grad_values )::is_valid ) {
         with_defaults( [&]( auto &&img ) {
             using ImgT = DECAYED_TYPE_OF( img );
             using TF = typename ImgT::TF;
@@ -234,8 +234,8 @@ UTP HD void DTP::measure_bwd( auto &&grad_values, auto &&grad_mass ) const {
             auto shape = img.values.shape();
             CartesianIndices<DECAYED_TYPE_OF( shape )> cells{ shape };
             for ( PI flat = 0; flat < cells.size(); ++flat ) {
-                // meme raison qu'au forward : `cells[ flat ]` est un `Coords`, le
-                // depaquetage se demande a ses `values`.
+                // same reason as in the forward: `cells[ flat ]` is a `Coords`, and
+                // unpacking is requested from its `values`.
                 cells[ flat ].values.apply_values( [&]( auto ...i ) {
                     PI axis = 0;
                     TF spacing = 1;

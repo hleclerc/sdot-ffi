@@ -1,32 +1,32 @@
 #pragma once
 
 // =====================================================================================
-// LES DIAGRAMMES DU SOLVEUR : ce que Newton demande a un diagramme de puissance, et rien d'autre.
+// THE SOLVER'S DIAGRAMS : what Newton asks of a power diagram, and nothing else.
 //
-//     set_weights( w )              poser des poids ( ordre utilisateur ), refaire les majorants
-//     mesures( a, &fa )             UN balayage : la mesure de chaque cellule ET ses facettes
-//                                   `c_ij = int_{facette} rho / ( 2 |p_i - p_j| )` ( `Laplacien.h` )
+//     set_weights( w )              set the weights ( user order ), rebuild the majorants
+//     measures( a, &fa )             ONE sweep : the measure of each cell AND its facets
+//                                   `c_ij = int_{facet} rho / ( 2 |p_i - p_j| )` ( `Laplacian.h` )
 //
-// Tout tourne ici sur la file CPU ( `CpuQueue::run_threads` : des tranches contigues de cellules,
-// dans l'ordre du stockage, ou deux germes consecutifs sont voisins dans l'espace ). Le scratch
-// des cellules est GERE ICI, pas par loom : un solveur enchaine cent diagrammes dans un seul
-// appel, et un debordement ne doit relancer que le balayage en cours, pas l'appel entier. Une
-// ligne de mots par fil, doublee tant qu'une cellule n'y tient pas.
+// Everything runs here on the CPU queue ( `CpuQueue::run_threads` : contiguous slices of cells,
+// in storage order, where two consecutive seeds are neighbours in space ). The scratch
+// of the cells is MANAGED HERE, not by loom : a solver chains a hundred diagrams in a single
+// call, and an overflow must only restart the sweep in progress, not the whole call. One
+// row of words per thread, doubled as long as a cell does not fit.
 //
-// La cellule d'un germe est construite comme partout ( `diagram::make_cell` : le domaine, puis les
-// plans que le fournisseur du stockage propose ), sa masse integree comme partout
-// ( `diagram::integrate_into` ), et ses facettes lues comme `diagram::hessian_row` les lit -- ce
-// fichier n'ajoute pas de geometrie, il enchaine.
+// The cell of a seed is built as everywhere ( `diagram::make_cell` : the domain, then the
+// planes that the storage provider proposes ), its mass integrated as everywhere
+// ( `diagram::integrate_into` ), and its facets read as `diagram::hessian_row` reads them -- this
+// file adds no geometry, it chains.
 //
-// UNE DENSITE NON CONSTANTE sur une facette : la distribution doit savoir integrer sa densite sur
-// une facette ( `facet_mass( piece, cut )` -- les gaussiennes 2D le font en forme close ) ; a
-// defaut le laplacien n'est pas assemblable et la compilation le dit.
+// A NON-CONSTANT DENSITY on a facet : the distribution must know how to integrate its density on
+// a facet ( `facet_mass( piece, cut )` -- 2D gaussians do it in closed form ) ; failing
+// that the laplacian cannot be assembled and the compilation says so.
 // =====================================================================================
 
 #include <loom/support/kernels/CpuQueue.h>
 #include "../diagram/Ops.h"
 #include "../bsp_build_level.h"
-#include "Laplacien.h"
+#include "Laplacian.h"
 
 #include <algorithm>
 #include <atomic>
@@ -42,24 +42,24 @@ inline double now() {
     return duration<double>( steady_clock::now().time_since_epoch() ).count();
 }
 
-/// la masse d'une facette pour la densite d'un morceau : `rho * mesure` a densite constante, ce que
-/// la distribution sait en dire sinon
+/// the mass of a facet for the density of a piece : `rho * measure` for a constant density, what
+/// the distribution can say about it otherwise
 template<class Dens,class Pc>
-double masse_facette( const Dens &dens, const Pc &pc, int cut, double mes ) {
+double density_facet_mass( const Dens &dens, const Pc &pc, int cut, double mes ) {
     if constexpr ( Dens::is_constant )
         return double( dens.value ) * mes;
     else if constexpr ( requires { dens.facet_mass( pc, cut ); } )
         return double( dens.facet_mass( pc, cut ) );
     else
-        static_assert( Dens::is_constant, "sdotplan : cette distribution ne sait pas integrer sa densite sur une facette ( `facet_mass` )" );
+        static_assert( Dens::is_constant, "sdotplan : this distribution does not know how to integrate its density on a facet ( `facet_mass` )" );
     return 0;
 }
 
-/// UNE CELLULE du germe de rang `k` : sa masse dans `masse`, et `facette( j, c_kj )` pour chaque voisin
-/// `j` ( en rangs ). Rend `false` si le scratch n'a pas suffi.
+/// ONE CELL of the seed of rank `k` : its mass in `mass`, and `facet( j, c_kj )` for each neighbour
+/// `j` ( in ranks ). Returns `false` if the scratch was not enough.
 template<class PD,class Local>
-bool mesure_et_facettes( const PD &pd, SI k, Local &c, Local &piece, const auto &dom, const auto &dist,
-                         double &masse, auto &&facette, bool avec_facettes ) {
+bool measure_and_facets( const PD &pd, SI k, Local &c, Local &piece, const auto &dom, const auto &dist,
+                         double &mass, auto &&facet, bool with_facets ) {
     using TF = typename PD::TF;
     constexpr int D = PD::ct_dim;
     if ( ! diagram::make_cell( pd, c, k, dom ) )
@@ -67,12 +67,12 @@ bool mesure_et_facettes( const PD &pd, SI k, Local &c, Local &piece, const auto 
     TF m = 0;
     if ( ! diagram::integrate_into<TF>( m, c, piece, dist ) )
         return false;
-    masse = double( m );
-    if ( ! avec_facettes )
+    mass = double( m );
+    if ( ! with_facets )
         return true;
 
-    // les voisins de la cellule sont ses coupes vivantes : une case par coupe, accumulee morceau
-    // par morceau ( un morceau porte les memes identifiants, plus ceux de son pave )
+    // the neighbours of the cell are its live cuts : one slot per cut, accumulated piece
+    // by piece ( a piece carries the same identifiers, plus those of its box )
     c.tidy();
     const int nc = c.nb_cuts();
     double vals[ 512 ];
@@ -85,8 +85,8 @@ bool mesure_et_facettes( const PD &pd, SI k, Local &c, Local &piece, const auto 
         pc.template for_each_facet<TF>( [&]( int cut, TF mes ) {
             const int id = pc.cid[ cut ];
             if ( id < 0 )
-                return;                                  // le domaine, ou un bord de pave : immobile
-            const double val = masse_facette( dens, pc, cut, double( mes ) );
+                return;                                  // the domain, or a box edge : immobile
+            const double val = density_facet_mass( dens, pc, cut, double( mes ) );
             for ( int q = 0; q < nc; ++q )
                 if ( c.cid[ q ] == id ) {
                     vals[ q ] += val;
@@ -107,48 +107,48 @@ bool mesure_et_facettes( const PD &pd, SI k, Local &c, Local &piece, const auto 
         for ( int d = 0; d < D; ++d )
             d2 += double( pj[ d ] - p0[ d ] ) * double( pj[ d ] - p0[ d ] );
         if ( d2 > 0 )
-            facette( id, vals[ q ] / ( 2 * std::sqrt( d2 ) ) );
+            facet( id, vals[ q ] / ( 2 * std::sqrt( d2 ) ) );
     }
     return true;
 }
 
-/// LE DIAGRAMME VU PAR NEWTON. `pd` est le stockage ( `PowerDiagram_Bsp` / `_Plain` ) dont les
-/// poids -- et les majorants de l'arbre -- sont des vues INSCRIPTIBLES ( `with_weights` ) : c'est
-/// ici qu'on les ecrit.
+/// THE DIAGRAM AS SEEN BY NEWTON. `pd` is the storage ( `PowerDiagram_Bsp` / `_Plain` ) whose
+/// weights -- and tree majorants -- are WRITABLE views ( `with_weights` ) : this is
+/// where they are written.
 template<class PD,class Dom,class Dist,class TK>
-struct Balayage {
+struct Sweep {
     using TF = typename PD::TF;
     using Local = typename Dom::template Local<TK>;
     static constexpr int D = PD::ct_dim;
     static constexpr int nbc = diagram::nb_work_cells<Dist>();
 
     const CpuQueue &queue;
-    PD             &pd;                                  ///< les poids y sont ecrits ( vues de sortie )
+    PD             &pd;                                  ///< the weights are written there ( output views )
     const Dom      &dom;
-    const Dist     *dist;                                ///< la densite courante ( elle change d'une etape a l'autre )
-    int             nt;                                  ///< fils virtuels ( tranches contigues )
-    SI              cap;                                 ///< sommets par cellule locale
+    const Dist     *dist;                                ///< the current density ( it changes from one step to the next )
+    int             nt;                                  ///< virtual threads ( contiguous slices )
+    SI              cap;                                 ///< vertices per local cell
     SI              words = 0;
-    std::vector<std::vector<std::int32_t>> scratch;      ///< une ligne par fil
-    std::vector<std::vector<Facette>>      fa_th;        ///< les facettes, par fil
-    std::vector<SI> rang_de;                             ///< le rang du germe `i` ( ordre utilisateur )
+    std::vector<std::vector<std::int32_t>> scratch;      ///< one row per thread
+    std::vector<std::vector<Facet>>      fa_th;        ///< the facets, per thread
+    std::vector<SI> rank_of;                             ///< the rank of seed `i` ( user order )
 
-    SI     nb_deborde = 0;                               ///< doublements du scratch, en tout
+    SI     nb_overflowed = 0;                               ///< scratch doublings, in total
     int    nb_diag    = 0;
-    double t_maj = 0, t_diag = 0;
+    double t_majorant = 0, t_diag = 0;
 
-    /// `pd_in` : le stockage tel qu'il est entre ( ses souvenirs, `memo_*`, sont recopies dans ceux de `pd` )
-    Balayage( const CpuQueue &queue, PD &pd, const auto &pd_in, const Dom &dom, const Dist &dist, SI cap0 )
+    /// `pd_in` : the storage as it comes in ( its memories, `memo_*`, are copied into those of `pd` )
+    Sweep( const CpuQueue &queue, PD &pd, const auto &pd_in, const Dom &dom, const Dist &dist, SI cap0 )
         : queue( queue ), pd( pd ), dom( dom ), dist( &dist ), nt( std::max( queue.nb_workers(), 1 ) ), cap( std::max<SI>( cap0, 8 ) ) {
         const SI n = pd.nb_seeds();
         scratch.resize( nt );
         fa_th.resize( nt );
-        rang_de.resize( n );
+        rank_of.resize( n );
         for ( SI k = 0; k < n; ++k )
-            rang_de[ pd.user_id( k ) ] = k;
-        redimensionne();
+            rank_of[ pd.user_id( k ) ] = k;
+        resize_scratch();
         if constexpr ( requires { PD::has_memo; } ) {
-            if constexpr ( PD::has_memo ) {              // la memoire : les souvenirs d'avant, ou rien
+            if constexpr ( PD::has_memo ) {              // the memory : the previous memories, or nothing
                 const SI K = SI( pd.memo_nbrs.shape( 1 ) );
                 for ( SI k = 0; k < n; ++k ) {
                     const int c = int( pd_in.memo_counts( k ) );
@@ -162,33 +162,33 @@ struct Balayage {
 
     SI n() const { return pd.nb_seeds(); }
 
-    void redimensionne() {
+    void resize_scratch() {
         words = diagram::words_for<Local,TF>( cap, nbc, false );
         for ( auto &s : scratch )
             s.assign( size_t( words ) + 16, 0 );
     }
 
-    /// une tranche contigue de `[ 0, n )` par fil
-    static void tranche( SI n, int t, int nt, SI &b, SI &e ) {
+    /// one contiguous slice of `[ 0, n )` per thread
+    static void thread_range( SI n, int t, int nt, SI &b, SI &e ) {
         b = SI( ( long long ) t * n / nt );
         e = SI( ( long long ) ( t + 1 ) * n / nt );
     }
 
-    /// LES POIDS `W` ( ordre utilisateur ) poses sur le stockage, et les majorants de l'arbre refaits
+    /// THE WEIGHTS `W` ( user order ) set on the storage, and the tree majorants rebuilt
     void set_weights( const std::vector<double> &W ) {
         const double t0 = now();
         const SI n = this->n();
         if constexpr ( requires { pd.sorted_weights; } ) {
             queue.run_threads( nt, [&]( int t ) {
                 SI b, e;
-                tranche( n, t, nt, b, e );
+                thread_range( n, t, nt, b, e );
                 for ( SI k = b; k < e; ++k )
                     pd.sorted_weights( k ) = TF( W[ pd.user_id( k ) ] );
             } );
             const SI nb_nodes = SI( pd.tree.node_begin.shape( 0 ) );
             queue.run_threads( nt, [&]( int t ) {
                 SI b, e;
-                tranche( nb_nodes, t, nt, b, e );
+                thread_range( nb_nodes, t, nt, b, e );
                 for ( SI m = b; m < e; ++m )
                     bsp_refresh_majorant( pd.sorted_cloud(), pd.tree.node_begin( m ), pd.tree.node_end( m ),
                                           pd.tree.node_wa( m ), pd.tree.node_wb( m ) );
@@ -196,22 +196,22 @@ struct Balayage {
         } else {
             queue.run_threads( nt, [&]( int t ) {
                 SI b, e;
-                tranche( n, t, nt, b, e );
+                thread_range( n, t, nt, b, e );
                 for ( SI k = b; k < e; ++k )
                     pd.weights( k ) = TF( W[ k ] );
             } );
         }
-        t_maj += now() - t0;
+        t_majorant += now() - t0;
     }
 
-    /// LES MESURES `a` ( ordre utilisateur ) aux poids poses, et si `fa` n'est pas nul les facettes
-    /// `c_ij` ( identifiants utilisateur ). Un balayage, relance sur debordement du scratch.
-    void mesures( std::vector<double> &a, std::vector<Facette> *fa = nullptr ) {
+    /// THE MEASURES `a` ( user order ) at the current weights, and if `fa` is not null the facets
+    /// `c_ij` ( user identifiers ). One sweep, restarted on scratch overflow.
+    void measures( std::vector<double> &a, std::vector<Facet> *fa = nullptr ) {
         const double t0 = now();
         const SI n = this->n();
         a.resize( n );
         for ( ;; ) {
-            std::atomic<bool> deborde{ false };
+            std::atomic<bool> overflowed{ false };
             queue.run_threads( nt, [&]( int t ) {
                 Carver cv{ scratch[ t ].data(), words };
                 Local c, piece;
@@ -221,28 +221,28 @@ struct Balayage {
                 auto &fv = fa_th[ t ];
                 fv.clear();
                 SI b, e;
-                tranche( n, t, nt, b, e );
+                thread_range( n, t, nt, b, e );
                 for ( SI k = b; k < e; ++k ) {
                     const SI i = pd.user_id( k );
-                    if ( ! mesure_et_facettes( pd, k, c, piece, dom, *dist, a[ i ],
-                                               [&]( SI j, double cij ) { fv.push_back( Facette{ i, pd.user_id( j ), cij } ); },
+                    if ( ! measure_and_facets( pd, k, c, piece, dom, *dist, a[ i ],
+                                               [&]( SI j, double cij ) { fv.push_back( Facet{ i, pd.user_id( j ), cij } ); },
                                                fa != nullptr ) ) {
-                        deborde = true;
+                        overflowed = true;
                         return;
                     }
-                    // la memoire ( 3D ) : les voisins de cette cellule, proposes en premier au balayage suivant --
-                    // meme d'un essai refuse, un souvenir reste exact ( il ne fait qu'ordonner les coupes )
+                    // the memory ( 3D ) : the neighbours of this cell, proposed first to the next sweep --
+                    // even from a rejected trial, a memory stays exact ( it only orders the cuts )
                     if constexpr ( requires { PD::has_memo; } ) {
                         if constexpr ( PD::has_memo )
-                            diagram::memorise( c, k, pd.memo_nbrs, pd.memo_counts );
+                            diagram::memorize( c, k, pd.memo_nbrs, pd.memo_counts );
                     }
                 }
             } );
-            if ( ! deborde )
+            if ( ! overflowed )
                 break;
             cap *= 2;
-            redimensionne();
-            ++nb_deborde;
+            resize_scratch();
+            ++nb_overflowed;
         }
         if ( fa ) {
             fa->clear();
@@ -253,26 +253,26 @@ struct Balayage {
         ++nb_diag;
     }
 
-    /// LES MOMENTS aux poids poses : le BARYCENTRE de chaque cellule ( son germe si elle est vide )
-    /// et le cout de transport `sum_i int_{cell_i} |x - p_i|^2 rho`, deja reduit.
+    /// THE MOMENTS at the current weights : the BARYCENTER of each cell ( its seed if it is empty )
+    /// and the transport cost `sum_i int_{cell_i} |x - p_i|^2 rho`, already reduced.
     ///
-    /// Un balayage de plus, sur le MEME scratch et le meme decoupage par fil que `mesures` -- c'est
-    /// ce qui evite a l'appelant de refaire un diagramme depuis Python pour obtenir un cout
-    /// ( `integrate_moments_into` rend `int rho`, `int x rho` et `int |x|^2 rho`, en coordonnees
-    /// absolues, et le cout d'une cellule s'en deduit en une ligne ).
+    /// One more sweep, on the SAME scratch and the same per-thread split as `measures` -- this is
+    /// what spares the caller from rebuilding a diagram from Python to obtain a cost
+    /// ( `integrate_moments_into` returns `int rho`, `int x rho` and `int |x|^2 rho`, in absolute
+    /// coordinates, and the cost of a cell follows in one line ).
     ///
-    /// LA MASSE N'EN SORT PAS, et c'est delibere : pour une densite qui n'est pas constante par
-    /// morceaux, `integrate_moments_into` quadrature la ou `integrate_into` a une forme close ( la
-    /// reduction exacte de `SumOfGaussians` ) -- mesure 7e-4 d'ecart relatif sur une gaussienne. La
-    /// masse d'une cellule, c'est celle que Newton a mesuree ( `newton.a` ), pas celle-ci.
-    void moments( std::vector<double> &bary, double &cout ) {
+    /// THE MASS DOES NOT COME OUT OF IT, and this is deliberate : for a density that is not constant per
+    /// piece, `integrate_moments_into` uses quadrature where `integrate_into` has a closed form ( the
+    /// exact reduction of `SumOfGaussians` ) -- measured 7e-4 relative gap on a gaussian. The
+    /// mass of a cell is the one Newton measured ( `newton.a` ), not this one.
+    void moments( std::vector<double> &bary, double &cost ) {
         const double t0 = now();
         const SI n = this->n();
-        std::vector<double> masse( n, 0.0 );
+        std::vector<double> mass( n, 0.0 );
         bary.assign( size_t( n ) * D, 0.0 );
-        std::vector<double> cout_th( nt, 0.0 );
+        std::vector<double> cost_th( nt, 0.0 );
         for ( ;; ) {
-            std::atomic<bool> deborde{ false };
+            std::atomic<bool> overflowed{ false };
             queue.run_threads( nt, [&]( int t ) {
                 Carver cv{ scratch[ t ].data(), words };
                 Local c, piece;
@@ -281,18 +281,18 @@ struct Balayage {
                 else                     piece = c;
                 double acc = 0;
                 SI b, e;
-                tranche( n, t, nt, b, e );
+                thread_range( n, t, nt, b, e );
                 for ( SI k = b; k < e; ++k ) {
                     const SI i = pd.user_id( k );
                     if ( ! diagram::make_cell( pd, c, k, dom ) ) {
-                        deborde = true;
+                        overflowed = true;
                         return;
                     }
                     TF m = 0, m2 = 0;
                     TF mx[ D ];
                     auto first = [&]( int d ) -> TF & { return mx[ d ]; };
                     if ( ! diagram::integrate_moments_into<TF>( m, first, m2, c, piece, *dist ) ) {
-                        deborde = true;
+                        overflowed = true;
                         return;
                     }
                     const auto p = pd.point( k );
@@ -301,24 +301,24 @@ struct Balayage {
                         pp += double( p[ d ] ) * double( p[ d ] );
                         px += double( p[ d ] ) * double( mx[ d ] );
                     }
-                    masse[ i ] = double( m );
+                    mass[ i ] = double( m );
                     acc += double( m2 ) - 2 * px + double( m ) * pp;
-                    // une cellule vide garde son germe pour barycentre -- il n'y a rien d'autre a dire,
-                    // et diviser par zero en aval serait pire
+                    // an empty cell keeps its seed as barycenter -- there is nothing else to say,
+                    // and dividing by zero downstream would be worse
                     for ( int d = 0; d < D; ++d )
                         bary[ size_t( i ) * D + d ] = double( m ) > 0 ? double( mx[ d ] ) / double( m ) : double( p[ d ] );
                 }
-                cout_th[ t ] = acc;
+                cost_th[ t ] = acc;
             } );
-            if ( ! deborde )
+            if ( ! overflowed )
                 break;
             cap *= 2;
-            redimensionne();
-            ++nb_deborde;
+            resize_scratch();
+            ++nb_overflowed;
         }
-        cout = 0;
-        for ( double v : cout_th )
-            cout += v;
+        cost = 0;
+        for ( double v : cost_th )
+            cost += v;
         t_diag += now() - t0;
         ++nb_diag;
     }

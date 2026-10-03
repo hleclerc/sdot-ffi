@@ -1,20 +1,20 @@
-"""Écrit une page HTML autonome (SVG inline) montrant une ou plusieurs courbes de convergence
-(perte, résidu, ...) au fil des itérations d'un solveur -- LBFGS aujourd'hui, Newton demain,
-la même fonction pour les deux : elle ne sait rien de qui l'appelle, seulement des SUITES de
-valeurs.
+"""Writes a standalone HTML page (inline SVG) showing one or more convergence curves
+(loss, residual, ...) over the iterations of a solver -- LBFGS today, Newton tomorrow,
+the same function for both: it knows nothing about who calls it, only SEQUENCES of
+values.
 
-Une seule page en dit long sur un solveur : la PENTE en échelle log dit si la convergence est
-linéaire (LBFGS -- une droite) ou quadratique (Newton -- une droite qui se met à plonger).
-D'où l'échelle log par défaut sur l'axe des y. SVG plutôt que le canvas+WebGL de `Visualizer` :
-une poignée de points par courbe (le nombre d'itérations), pas des millions -- pas besoin de sa
-mécanique base64.
+A single page says a lot about a solver: the SLOPE on a log scale tells whether the convergence is
+linear (LBFGS -- a straight line) or quadratic (Newton -- a straight line that starts to dive).
+Hence the log scale by default on the y axis. SVG rather than the canvas+WebGL of `Visualizer`:
+a handful of points per curve (the number of iterations), not millions -- no need for its
+base64 machinery.
 """
 import numpy as np
 
 
-#: mêmes teintes que `Visualizer.scale_color` (pas de dépendance croisée : juste la même
-#: constante), pour qu'une courbe et le diagramme qu'elle résume, s'ils apparaissent dans la
-#: même expérience, ne se contredisent pas sur ce qu'une couleur veut dire.
+#: same tints as `Visualizer.scale_color` (no cross dependency: just the same
+#: constant), so that a curve and the diagram it summarizes, if they appear in the
+#: same experiment, do not contradict each other on what a color means.
 _GOLDEN_STRIDE = 0.6180339887498949
 
 
@@ -26,7 +26,7 @@ def _color( index ):
 
 
 def _nice_log_ticks( lo, hi ):
-    """Les puissances de 10 couvrant `[ lo, hi ]` (`lo > 0`), au moins deux."""
+    """The powers of 10 covering `[ lo, hi ]` (`lo > 0`), at least two."""
     import math
     a, b = math.floor( math.log10( lo ) ), math.ceil( math.log10( hi ) )
     if a == b:
@@ -41,16 +41,16 @@ def _nice_linear_ticks( lo, hi, count = 6 ):
     return [ lo + k * step for k in range( count ) ]
 
 
-def write_convergence_html( series, out_path, title = "convergence", xlabel = "itération",
-                            ylabel = "résidu", log_y = True ):
-    """`series` : `{ nom: [ y0, y1, ... ] }` (une abscisse implicite `0, 1, 2, ...`), ou
-    `{ nom: [ ( x0, y0 ), ( x1, y1 ), ... ] }` pour une abscisse explicite (des pas non
-    consécutifs, par exemple). Renvoie le chemin écrit.
+def write_convergence_html( series, out_path, title = "convergence", xlabel = "iteration",
+                            ylabel = "residual", log_y = True ):
+    """`series`: `{ name: [ y0, y1, ... ] }` (an implicit abscissa `0, 1, 2, ...`), or
+    `{ name: [ ( x0, y0 ), ( x1, y1 ), ... ] }` for an explicit abscissa (non-consecutive
+    steps, for instance). Returns the path written.
 
-    `log_y` : échelle log sur l'axe des y (le défaut -- une courbe de convergence ne dit rien en
-    échelle linéaire, elle s'écrase contre l'axe dès les deux premiers pas). Les valeurs `<= 0`
-    n'ont alors pas de point : `0` EST le but, mais ne se place pas sur un axe log -- seule son
-    approche se lit, dans la pente.
+    `log_y`: log scale on the y axis (the default -- a convergence curve says nothing on a
+    linear scale, it is squashed against the axis from the first two steps on). Values `<= 0`
+    then have no point: `0` IS the goal, but cannot be placed on a log axis -- only its
+    approach can be read, in the slope.
     """
     curves = {}
     for name, ys in series.items():
@@ -62,7 +62,7 @@ def write_convergence_html( series, out_path, title = "convergence", xlabel = "i
             curves[ name ] = pts
 
     W, H = 760, 420
-    ml, mr, mt, mb = 64, 16, 34, 44           # marges : place pour les graduations et le titre
+    ml, mr, mt, mb = 64, 16, 34, 44           # margins: room for the ticks and the title
 
     all_x = [ x for pts in curves.values() for x, _ in pts ]
     all_y = [ y for pts in curves.values() for _, y in pts ]
@@ -93,10 +93,10 @@ def write_convergence_html( series, out_path, title = "convergence", xlabel = "i
     svg.append( f'<rect x="0" y="0" width="{ W }" height="{ H }" fill="#ffffff"/>' )
     svg.append( f'<text x="{ W / 2 }" y="18" text-anchor="middle" font-size="14">{ title }</text>' )
 
-    # grille + graduations. Les valeurs formatées le sont SANS espace avant `}` -- tout ce qui
-    # suit `:` dans un f-string est pris LITTÉRALEMENT comme spécificateur de format, un espace y
-    # devient donc PARTIE du format (`ValueError: Invalid format specifier '.1f '`), contrairement
-    # à un simple nom (`{ ml }`) où l'espace est du Python normal.
+    # grid + ticks. The values are formatted WITHOUT a space before `}` -- everything that
+    # follows `:` in an f-string is taken LITERALLY as a format specifier, a space there
+    # thus becomes PART of the format (`ValueError: Invalid format specifier '.1f '`), unlike
+    # a plain name (`{ ml }`) where the space is normal Python.
     for yt in y_ticks:
         y = to_y( 10 ** yt if log_y else yt )
         y_s = f"{ y:.1f}"
@@ -115,7 +115,7 @@ def write_convergence_html( series, out_path, title = "convergence", xlabel = "i
     svg.append( f'<rect x="{ ml }" y="{ mt }" width="{ W - ml - mr }" height="{ H - mt - mb }" '
                f'fill="none" stroke="#999"/>' )
 
-    # courbes + légende
+    # curves + legend
     legend_y = mt + 4
     for i, ( name, pts ) in enumerate( curves.items() ):
         color = _color( i )

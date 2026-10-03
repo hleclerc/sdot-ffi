@@ -9,19 +9,19 @@
 
 namespace sdot {
 
-// Une somme de gaussiennes ISOTROPES, vue comme densité à intégrer sur une cellule.
+// A sum of ISOTROPIC gaussians, seen as a density to integrate over a cell.
 //
 //   rho( x ) = somme_i  w_i * exp( - r_i^2 / ( 2 s_i^2 ) ) / ( 2 pi s_i^2 ) ^ ( d / 2 ),
 //   r_i = | x - c_i |
 //
-// `w_i` est la MASSE de la gaussienne `i`, pas sa hauteur -- la masse totale est donc la somme des
-// poids, et normaliser est une division (voir `distributions/SumOfGaussians.py`).
+// `w_i` is the MASS of gaussian `i`, not its height -- the total mass is therefore the sum of the
+// weights, and normalizing is a division (see `distributions/SumOfGaussians.py`).
 //
-// C'est la première densité qui n'est pas constante par morceaux, et tout ce qu'elle a à dire tient
-// en trois réponses PONCTUELLES : la valeur, le gradient, et où ranger `d rho / d paramètres`.
-// Elle ne DÉCOUPE rien (son morceau est la cellule entière) et ne sait rien des cellules ; c'est
-// `PowerDiagram::integrate_into` qui, voyant `is_constant == false`, les découpe en simplices et y
-// fait sa quadrature. Le partage est là, et il n'a pas de troisième côté.
+// It is the first density that is not piecewise constant, and all it has to say fits in three
+// POINTWISE answers: the value, the gradient, and where to put `d rho / d parameters`.
+// It CUTS nothing (its piece is the whole cell) and knows nothing about cells; it is
+// `PowerDiagram::integrate_into` that, seeing `is_constant == false`, cuts them into simplices and
+// does its quadrature there. The split is there, and it has no third side.
 SDOT_TEMPLATE_DECL_FOR_SumOfGaussians
 struct SumOfGaussians {
     SDOT_ATTRIBUTES_OF_SumOfGaussians
@@ -29,26 +29,26 @@ struct SumOfGaussians {
     static constexpr int ct_dim = DECAYED_TYPE_OF( nb_dims )::value;
     using TF = DECAYED_TYPE_OF( positions )::TF;
 
-    /// LA CONVOLUTION par une gaussienne de largeur `conv_s` ( `with_convolution` ) : sur une somme de
-    /// gaussiennes elle ne change que les largeurs, `sigma_i' = sqrt( sigma_i^2 + conv_s^2 )`, rien
-    /// d'autre -- ce que la continuation en largeur de `SdotPlanNd` parcourt ( `sdotplan/Continuation.h` ).
-    /// Un membre A PART des attributs generes : `0` par defaut, donc absent de tout appel ordinaire.
+    /// THE CONVOLUTION by a gaussian of width `conv_s` ( `with_convolution` ): on a sum of
+    /// gaussians it only changes the widths, `sigma_i' = sqrt( sigma_i^2 + conv_s^2 )`, nothing
+    /// else -- what the width continuation of `SdotPlanNd` walks through ( `sdotplan/Continuation.h` ).
+    /// A member APART from the generated attributes: `0` by default, hence absent from any ordinary call.
     TF conv_s = 0;
 
     HD TF sigma_of( SI i ) const { const TF s = TF( sigmas( i ) ); return conv_s > 0 ? sdot::sqrt( s * s + conv_s * conv_s ) : s; }
     HD SumOfGaussians with_convolution( TF s ) const { SumOfGaussians r( *this ); r.conv_s = s; return r; }
-    /// la plus petite largeur ( avant convolution ) : l'echelle en dessous de laquelle la continuation s'arrete
+    /// the smallest width ( before convolution ): the scale below which the continuation stops
     HD TF smallest_sigma() const { TF r = TF( sigmas( 0 ) ); for ( SI i = 1; i < SI( sigmas.shape( 0 ) ); ++i ) r = sdot::fmin( r, TF( sigmas( i ) ) ); return r; }
 
-    /// Un seul morceau, la cellule elle-même, et pas une coupe : rien à découper quand la densité
-    /// est définie partout par la même formule. Le scratch de découpe n'est donc pas touché (et
-    /// `extra_cuts_per_piece` rend 0, donc il n'est même pas alloué).
+    /// A single piece, the cell itself, and not a cut: nothing to cut when the density
+    /// is defined everywhere by the same formula. The cutting scratch is therefore not touched (and
+    /// `extra_cuts_per_piece` returns 0, so it is not even allocated).
     ///
-    /// COMMENT on s'intègre dépend de la dimension, et c'est un choix qui se fait ici, par
-    /// composition -- l'intégrateur, lui, ne voit que le contrat :
-    ///   * en 2D on SAIT le faire (voir `wedge_measure`), donc on se passe soi-même ;
-    ///   * au-delà on ne sait pas, donc on se déclare BOÎTE NOIRE en s'emballant dans
-    ///     `PointwiseDensity`, qui n'a besoin que de `value_at` / `gradient_at`.
+    /// HOW we integrate depends on the dimension, and it is a choice made here, by
+    /// composition -- the integrator only sees the contract:
+    ///   * in 2D we KNOW how (see `wedge_measure`), so we pass ourselves;
+    ///   * beyond that we do not, so we declare ourselves a BLACK BOX by wrapping in
+    ///     `PointwiseDensity`, which only needs `value_at` / `gradient_at`.
     HD void for_each_piece( const auto &cell, auto &&/*ws*/, auto &&func ) const {
         if constexpr ( ct_dim == 2 )
             func( cell, *this );
@@ -56,85 +56,88 @@ struct SumOfGaussians {
             func( cell, PointwiseDensity{ *this } );
     }
 
-    // ---- l'intégration EXACTE en 2D ---------------------------------------------------------------
-    // Une gaussienne isotrope sur un triangle n'a pas de forme close élémentaire -- c'est la fonction
-    // T d'Owen -- mais elle se RÉDUIT à une intégrale 1D lisse et bornée, dont la précision ne dépend
-    // plus de la forme de la cellule. C'est toute la différence avec une règle de quadrature sur le
-    // triangle, dont l'erreur est en `( taille de cellule / sigma ) ^ 4`.
+    // ---- EXACT integration in 2D ------------------------------------------------------------------
+    // An isotropic gaussian over a triangle has no elementary closed form -- it is Owen's T
+    // function -- but it REDUCES to a smooth, bounded 1D integral, whose accuracy no longer depends
+    // on the shape of the cell. That is the whole difference with a quadrature rule on the
+    // triangle, whose error goes as `( cell size / sigma ) ^ 4`.
     //
-    // La réduction : après translation/mise à l'échelle, le triangle est décomposé en trois coins
-    // signés `( 0, P, Q )`, et un coin s'intègre en polaires --
+    // The reduction: after translation/scaling, the triangle is decomposed into three signed
+    // corners `( 0, P, Q )`, and a corner is integrated in polar coordinates --
     //
-    //     W( P, Q ) = signe( p ) / 2pi * Int_{t_P}^{t_Q} [ 1 - exp( -( p^2 + t^2 ) / 2 ) ] p dt / ( p^2 + t^2 )
+    //     W( P, Q ) = sign( p ) / 2pi * Int_{t_P}^{t_Q} [ 1 - exp( -( p^2 + t^2 ) / 2 ) ] p dt / ( p^2 + t^2 )
     //
-    // où `p` est la distance signée de l'origine à la droite `PQ` et `t` l'abscisse le long d'elle.
-    // Écrite AINSI -- la différence faite sous l'intégrale, pas entre deux arctangentes -- elle n'a
-    // aucune compensation catastrophique, y compris quand l'origine frôle la droite.
+    // where `p` is the signed distance from the origin to the line `PQ` and `t` the abscissa along it.
+    // Written THIS WAY -- the difference taken under the integral, not between two arctangents -- it has
+    // no catastrophic cancellation, even when the origin grazes the line.
     //
-    // Au-delà de `|t| = tail_cut`, l'exponentielle ne vaut plus rien et il ne reste que la
-    // lorentzienne, dont la primitive est `arctan( t / p )` : les queues sont donc EXACTES et
-    // gratuites, et la quadrature ne travaille que sur un intervalle borné où l'intégrande a une
-    // échelle `>= 1`. Mesuré : `8 x 4 = 32` évaluations par arête donnent 4e-14 d'erreur absolue
-    // sur des configurations choisies pour être méchantes (germe sur le centre, triangle immense,
-    // sliver rasant).
+    // Beyond `|t| = tail_cut`, the exponential is worth nothing and only the
+    // Lorentzian remains, whose antiderivative is `arctan( t / p )`: the tails are therefore EXACT and
+    // free, and the quadrature only works on a bounded interval where the integrand has a
+    // scale `>= 1`. Measured: `8 x 4 = 32` evaluations per edge give 4e-14 absolute error
+    // on configurations chosen to be nasty (seed on the center, huge triangle, grazing
+    // sliver).
     static constexpr bool is_constant = false;
 
-    /// les moments ( `diagram::integrate_moments_into` ) : la réduction exacte ne les donne pas, c'est
-    /// la quadrature adaptative de `PointwiseDensity` qui les accumule, en 2D comme ailleurs.
+    /// the moments ( `diagram::integrate_moments_into` ): the exact reduction does not give them, it is
+    /// the adaptive quadrature of `PointwiseDensity` that accumulates them, in 2D as elsewhere.
     HD void integrate_moments_over_simplex( const auto &pts, TF &m, auto &mx, TF &m2 ) const {
         PointwiseDensity{ *this }.integrate_moments_over_simplex( pts, m, mx, m2 );
     }
 
-    static constexpr TF  tail_cut   = 8;    ///< `exp( -t^2/2 ) < 1e-14` au-delà : la queue est exacte
-    static constexpr int nb_panels  = 4;    ///< panneaux de Gauss-Legendre sur le coeur
+    static constexpr TF  tail_cut   = 8;    ///< `exp( -t^2/2 ) < 1e-14` beyond: the tail is exact
+    static constexpr int nb_panels  = 4;    ///< Gauss-Legendre panels over the core
 
-    /// La mesure normale standard SIGNÉE du triangle `( 0, P, Q )` -- le coin.
+    /// The SIGNED standard normal measure of the triangle `( 0, P, Q )` -- the corner.
     HD TF wedge_measure( const auto &P, const auto &Q ) const;
 
-    /// La mesure normale standard du triangle `ys` (positive, orientation quelconque).
+    /// The standard normal measure of the triangle `ys` (positive, any orientation).
     HD TF std_triangle_measure( const auto &ys ) const;
 
-    /// `Int_T rho`, exact. `pts` : les 3 sommets.
+    /// `Int_T rho`, exact. `pts`: the 3 vertices.
     HD TF integrate_over_simplex( const auto &pts ) const;
 
-    /// L'adjoint, ÉLÉMENTAIRE -- c'est le point remarquable : la valeur demande une fonction
-    /// spéciale, ses dérivées non. Tout se ramène à des intégrales de BORD, qui pour une gaussienne
-    /// le long d'un segment sont des `erf` :
-    ///   * un sommet : le bouger balaie ses deux arêtes, d'où `Int rho * lambda` sur chacune ;
-    ///   * le centre : `d/dc = -Int grad rho = -Contour rho n ds` (divergence) -- égal, et c'est une
-    ///     bonne vérification, à MOINS la somme des dérivées par sommet ;
-    ///   * sigma : `d rho / d sigma = sigma * laplacien( rho )` (identité de la chaleur, `t = sigma^2/2`),
-    ///     donc encore un flux au bord, et `y . n` y est CONSTANT le long d'une arête ;
-    ///   * le poids : la mesure elle-même, déjà calculée.
+    /// The ELEMENTARY adjoint -- that is the remarkable point: the value requires a special
+    /// function, its derivatives do not. Everything reduces to BOUNDARY integrals, which for a gaussian
+    /// along a segment are `erf`s:
+    ///   * a vertex: moving it sweeps its two edges, hence `Int rho * lambda` on each;
+    ///   * the center: `d/dc = -Int grad rho = -Contour rho n ds` (divergence) -- equal, and it is a
+    ///     good check, to MINUS the sum of the per-vertex derivatives;
+    ///   * sigma: `d rho / d sigma = sigma * laplacian( rho )` (heat identity, `t = sigma^2/2`),
+    ///     hence again a boundary flux, and `y . n` is CONSTANT there along an edge;
+    ///   * the weight: the measure itself, already computed.
     HD void integrate_over_simplex_bwd( const auto &pts, TF g, auto &&grad_pts, auto &&grad_dist ) const;
 
-    /// Pour une arête `A -> B` du triangle `A, B, C`, en repère standard : la normale SORTANTE, la
-    /// distance signée `y . n` (constante le long de l'arête), `Int phi ds`, et `Int phi lambda_A ds`.
+    /// For an edge `A -> B` of the triangle `A, B, C`, in the standard frame: the OUTWARD normal, the
+    /// signed distance `y . n` (constant along the edge), `Int phi ds`, and `Int phi lambda_A ds`.
     struct EdgeInfo { Vector<TF,2> n; TF p; TF j0; TF j1a; };
     HD EdgeInfo edge_info( const auto &A, const auto &B, const auto &C ) const;
 
-    /// Le noyau NORMALISÉ de la gaussienne `i` en `x` (masse 1), et le carré de la distance --
-    /// les deux quantités dont tout le reste se déduit, calculées une fois.
+    /// The NORMALIZED kernel of gaussian `i` at `x` (mass 1), and the squared distance --
+    /// the two quantities from which everything else follows, computed once.
     HD auto kernel_at( SI i, const auto &x ) const;
 
-    /// `Int_{arete} rho ds` sur l'arete `cut` de la cellule 2D `pc` ( `[ v_cut, v_cut+1 ]` ) -- ce que le
-    /// laplacien d'un transport lit ( `sdotplan/Balayage.h` ) : une gaussienne le long d'un segment est
-    /// un `erf`, la distance au segment etant constante. 2D seulement.
+    /// `Int_{edge} rho ds` over the edge `cut` of the 2D cell `pc` ( `[ v_cut, v_cut+1 ]` ) -- what the
+    /// laplacian of a transport reads ( `sdotplan/Sweep.h` ): a gaussian along a segment is
+    /// an `erf`, the distance to the segment being constant. 2D only.
     HD TF   facet_mass    ( const auto &pc, int cut ) const;
 
     HD TF   value_at      ( const auto &x ) const;   ///< rho( x )
-    HD auto gradient_at   ( const auto &x ) const;   ///< grad rho( x ), un `Vector<TF,ct_dim>`
+    HD auto gradient_at   ( const auto &x ) const;   ///< grad rho( x ), a `Vector<TF,ct_dim>`
 
-    /// Accumule `g * d rho( x ) / d paramètre` dans la cotangente de chaque paramètre.
+    /// Accumulates `g * d rho( x ) / d parameter` into the cotangent of each parameter.
     ///
-    /// C'est la moitié « distribution » de l'adjoint, et elle ne connaît que `x` : l'intégrateur
-    /// lui passe le poids de quadrature du noeud (`g`), sans savoir ce qu'il y a derrière. Les
-    /// ajouts sont ATOMIQUES -- une gaussienne large est vue par les work-items de beaucoup de
-    /// cellules à la fois -- et chacun est gardé par la validité de sa cible, un paramètre non
-    /// dérivé arrivant en `NoneTensor`.
+    /// It is the "distribution" half of the adjoint, and it only knows `x`: the integrator
+    /// passes it the quadrature weight of the node (`g`), without knowing what is behind it. The
+    /// additions are ATOMIC -- a wide gaussian is seen by the work-items of many
+    /// cells at once -- and each is guarded by the validity of its target, a non-differentiated
+    /// parameter arriving as a `NoneTensor`.
     HD void add_value_grad_at( auto &&grad_dist, const auto &x, TF g ) const;
 };
 
 }
 
 #include "SumOfGaussians.cxx"
+
+// its convolved density, for the transport solver ( `sdotplan/Convolved.h` )
+#include "sdotplan/convolved/SumOfGaussians.h"

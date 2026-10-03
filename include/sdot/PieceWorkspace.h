@@ -5,25 +5,25 @@
 
 namespace sdot {
 
-// De quoi DECOUPER une cellule en morceaux : UNE cellule de rechange, dans la forme locale, posee
-// sur le scratch du work-item par l'appelant ( `PowerDiagram::measures` ). C'est le seul « scratch »
-// que le contrat d'une distribution prevoit ( voir `distributions/Distribution.py` ).
+// What it takes to SPLIT a cell into pieces: ONE spare cell, in the local form, laid on the
+// work-item's scratch by the caller ( `PowerDiagram::measures` ). It is the only "scratch"
+// that a distribution's contract provides for ( see `distributions/Distribution.py` ).
 //
-// La cellule SOURCE n'est jamais touchee : `start` la recopie dans `piece` et coupe, les coupes
-// suivantes coupent `piece` en place. C'est ce qui permet d'ouvrir un morceau apres l'autre a
-// partir de la meme cellule.
+// The SOURCE cell is never touched: `start` copies it into `piece` and cuts, and the following
+// cuts cut `piece` in place. That is what allows opening one piece after the other from the
+// same cell.
 //
-// Les plans de decoupe portent `cell_ids::PIECE` : « pas un germe », et c'est exactement ce que
-// l'adjoint lit pour savoir que leur part ne va nulle part ( `PowerDiagram::scatter_cell_grad` ).
+// The splitting planes carry `cell_ids::PIECE`: "not a seed", and that is exactly what the
+// adjoint reads to know that their share goes nowhere ( `PowerDiagram::scatter_cell_grad` ).
 template<class Local>
 struct PieceWorkspace {
     using TK = typename Local::TKernel;
     static constexpr int D = Local::ct_dim;
 
     Local &piece;
-    bool  overflow = false;   ///< une coupe n'a pas tenu : l'appelant le signale, le resultat sera jete
+    bool  overflow = false;   ///< a cut did not fit: the caller reports it, the result will be discarded
 
-    /// ouvre un morceau : `src` coupe par `direction . x <= offset`. Rend `false` s'il n'a pas tenu.
+    /// opens a piece: `src` cut by `direction . x <= offset`. Returns `false` if it did not fit.
     HD bool start( const Local &src, const auto &direction, auto offset ) {
         if ( ! piece.copy_from( src ) ) {
             overflow = true;
@@ -32,24 +32,24 @@ struct PieceWorkspace {
         return cut( direction, offset );
     }
 
-    /// une coupe de plus sur le morceau en cours
+    /// one more cut on the current piece
     HD bool cut( const auto &direction, auto offset ) {
         typename Local::PlaneT p;
         for ( int d = 0; d < D; ++d )
             p.dir[ d ] = TK( direction[ d ] );
         p.off = TK( offset );
         p.id  = cell_ids::PIECE;
-        if ( piece.cut( p ) == CutStatus::OVERFLOW ) {
+        if ( piece.cut( p ) == CutStatus::NO_ROOM ) {
             overflow = true;
             return false;
         }
         return true;
     }
 
-    /// le morceau courant
+    /// the current piece
     HD void with_current( auto &&func ) const { func( piece ); }
 
-    /// 0 = le morceau est vide ( le pave ne rencontre pas la cellule ) -- pas une anomalie
+    /// 0 = the piece is empty ( the box does not meet the cell ) -- not an anomaly
     HD SI nb_vertices() const { return piece.nb_vertices(); }
 };
 

@@ -2,8 +2,8 @@ import math
 
 import numpy as np
 
-# `loom.tensor` D'ABORD : `AaBsp` est le premier module que `sdot/__init__.py` importe, et
-# `loom.drivers.driver` importé avant lui coupe le cycle `driver <-> tensor` du mauvais côté.
+# `loom.tensor` FIRST: `AaBsp` is the first module that `sdot/__init__.py` imports, and
+# `loom.drivers.driver` imported before it cuts the `driver <-> tensor` cycle on the wrong side.
 import loom
 from loom.tensor import Axis, CtShapeVar, IntTensor, RealTensor, ShapeVar, new_batch_axis
 from loom.compilation.FfiCode import FfiCode
@@ -14,112 +14,112 @@ from .SpatialAccelerator import SpatialAccelerator
 
 
 class AaBsp( SpatialAccelerator ):
-    """Un BSP ALIGNÉ SUR LES AXES : un arbre binaire de boîtes, chaque feuille tenant une
-    poignée de germes.
+    """An AXIS-ALIGNED BSP: a binary tree of boxes, each leaf holding a
+    handful of seeds.
 
-    L'arbre est bâti par coupes médianes sur l'axe le plus long, jusqu'à ce qu'une feuille
-    n'ait plus que `max_seeds_per_leaf` germes : plus petit, l'arbre coûte plus en descentes qu'il
-    ne fait gagner en coupes évitées ; plus grand, on paie des bissectrices dont on savait déjà
-    qu'elles ne serviraient à rien.
+    The tree is built by median cuts on the longest axis, until a leaf
+    has no more than `max_seeds_per_leaf` seeds: smaller, the tree costs more in descents than it
+    saves in avoided cuts; larger, we pay for bisectors that we already knew
+    would be of no use.
 
-    L'équilibre est DIX, et il est mesuré (Xeon W-2145 + RTX 2080 Ti, 1e6 germes en 2D) : le
-    plateau va de 6 à 12, et 30 -- l'ancien défaut, mesuré sur un autre processeur -- y coûte 15 %.
-    C'est un réglage qui suit la MACHINE et pas le problème : il arbitre entre le coût d'une coupe
-    et celui d'une éviction de boîte, et les deux ne bougent pas ensemble d'un processeur à
-    l'autre. À rouvrir dès que l'un des deux change (voir le banc `pd accelerated`, qui le balaie :
+    The balance is TEN, and it is measured (Xeon W-2145 + RTX 2080 Ti, 1e6 seeds in 2D): the
+    plateau goes from 6 to 12, and 30 -- the old default, measured on another processor -- costs 15 % there.
+    It is a setting that follows the MACHINE and not the problem: it arbitrates between the cost of a cut
+    and that of a box eviction, and the two do not move together from one processor to the
+    other. To be reopened as soon as one of the two changes (see the `pd accelerated` bench, which sweeps it:
     `./run bench "test_PowerDiagram::pd accelerated" --leaf-size=6,10,16,30`).
 
-    = Ce que chaque nœud porte, et pourquoi
+    = What each node carries, and why
 
-    La BOÎTE (`node_box`, `lo` puis `hi`) contient tous les germes du sous-arbre, et un MAJORANT
-    AFFINE de leurs poids : `w( y ) <= node_wa . y + node_wb` pour tout germe `y` du sous-arbre.
-    Les deux ensemble suffisent à répondre « rien là-dedans ne peut couper cette cellule », et le
-    majorant affine est ce qui rend la réponse fine : la borne classique est un majorant CONSTANT
-    (le poids max du nœud), qui traite toute la boîte comme si le germe le plus lourd était
-    partout. Un poids qui varie régulièrement dans l'espace -- ce qui est exactement le régime du
-    transport optimal semi-discret, où les poids sont un potentiel -- est alors très mal borné.
+    The BOX (`node_box`, `lo` then `hi`) contains all the seeds of the subtree, and an AFFINE
+    MAJORANT of their weights: `w( y ) <= node_wa . y + node_wb` for every seed `y` of the subtree.
+    The two together suffice to answer "nothing in there can cut this cell", and the
+    affine majorant is what makes the answer sharp: the classic bound is a CONSTANT majorant
+    (the node's max weight), which treats the whole box as if the heaviest seed were
+    everywhere. A weight that varies smoothly in space -- which is exactly the regime of
+    semi-discrete optimal transport, where the weights are a potential -- is then very poorly bounded.
 
-    L'autre raison, moins évidente et décisive : le degré 1 ne coûte RIEN de plus à tester. Le
-    minimum de `|p - y|² - wa . y` sur une boîte est SÉPARABLE par axe, son minimum libre est en
-    `y = p + wa / 2`, et un `clamp` par axe donne la réponse exacte. La borne constante fait le
-    même travail avec `wa = 0`. Un majorant de degré 2 casserait cette séparabilité.
+    The other reason, less obvious and decisive: degree 1 costs NOTHING more to test. The
+    minimum of `|p - y|² - wa . y` over a box is SEPARABLE per axis, its free minimum is at
+    `y = p + wa / 2`, and a per-axis `clamp` gives the exact answer. The constant bound does the
+    same work with `wa = 0`. A degree-2 majorant would break this separability.
 
-    Le majorant est choisi À LA CONSTRUCTION, nœud par nœud, entre l'affine ajusté aux moindres
-    carrés et le constant : l'affine n'est retenu que s'il resserre franchement l'ÉTALEMENT des
-    résidus, qui est précisément ce qui fait le mou de la borne (voir `_weight_majorant`). Sans
-    poids du tout, `node_wa` / `node_wb` ne sont pas nommés : ils restent `Unbound`, arrivent en
-    `NoneTensor`, et le terme disparaît du kernel à la COMPILATION.
+    The majorant is chosen AT CONSTRUCTION, node by node, between the least-squares
+    fitted affine and the constant: the affine is only kept if it clearly tightens the SPREAD of the
+    residuals, which is precisely what makes the slack of the bound (see `_weight_majorant`). With no
+    weights at all, `node_wa` / `node_wb` are not named: they stay `Unbound`, arrive as
+    `NoneTensor`, and the term disappears from the kernel at COMPILATION.
 
-    = La marche
+    = The walk
 
-    Une descente en profondeur, l'enfant le plus proche d'abord (voir `AaBsp.cxx`). Le premier
-    nœud atteint est donc la feuille du germe lui-même : la cellule se réduit tout de suite sur
-    ses voisins immédiats, et tout ce qui suit est élagué contre une cellule déjà petite. C'est
-    ce qui rend la pile SUFFISANTE là où il faudrait sinon une file de priorité : à chaque niveau
-    on dépile un nœud et on en empile deux, donc la pile ne dépasse jamais la PROFONDEUR de
-    l'arbre -- une capacité connue à la construction (`max_depth`), et pas une capacité à
-    deviner puis à doubler.
+    A depth-first descent, the nearest child first (see `AaBsp.cxx`). The first node
+    reached is therefore the leaf of the seed itself: the cell shrinks right away on
+    its immediate neighbors, and everything that follows is pruned against an already small cell. That is
+    what makes the stack SUFFICIENT where a priority queue would otherwise be needed: at each level
+    we pop one node and push two, so the stack never exceeds the DEPTH of
+    the tree -- a capacity known at construction (`max_depth`), and not a capacity to
+    guess and then double.
 
-    = Où il est construit
+    = Where it is built
 
-    En KERNEL, un appel par NIVEAU de l'arbre (`_build_in_kernel` + `bsp_build_level.h`), et un
-    work-item par nœud du niveau. Ce qui le permet est que la FORME de l'arbre ne dépend pas des
-    données : la coupe est MÉDIANE, donc la profondeur vaut `ceil( log2( n / leaf_size ) ) + 1` et
-    les nœuds sont ceux d'un arbre binaire PARFAIT de cette profondeur, l'un et l'autre fonction de
-    `n` seul (voir `max_depth_for` / `max_nb_nodes_for`, et le test
-    `the_tree_shape_does_not_depend_on_the_data`, qui le vérifie jusqu'à des nuages entièrement
-    dégénérés). Il n'y a donc AUCUNE capacité à deviner -- ni pour la pile de la descente, ni pour
-    les tableaux de nœuds -- et le NOMBRE D'APPELS lui-même est connu avant de regarder un point.
+    In a KERNEL, one call per LEVEL of the tree (`_build_in_kernel` + `bsp_build_level.h`), and one
+    work-item per node of the level. What makes it possible is that the SHAPE of the tree does not depend on the
+    data: the cut is MEDIAN, so the depth is `ceil( log2( n / leaf_size ) ) + 1` and
+    the nodes are those of a PERFECT binary tree of that depth, both functions of
+    `n` alone (see `max_depth_for` / `max_nb_nodes_for`, and the test
+    `the_tree_shape_does_not_depend_on_the_data`, which checks it down to entirely
+    degenerate clouds). So there is NO capacity to guess -- neither for the descent's stack, nor for
+    the node arrays -- and the NUMBER OF CALLS itself is known before looking at a point.
 
-    La boucle sur les niveaux reste côté hôte, ainsi que l'arithmétique d'indices entre deux
-    niveaux : des tableaux de la taille d'un niveau, jamais du nuage. C'est ce qui empêche encore
-    cette construction de passer sous un `jit` -- mais un `AaBsp` est une CONSTANTE du trace (voir
-    plus bas), donc ce n'est pas ce qu'on lui demande.
+    The loop over the levels stays on the host side, as does the index arithmetic between two
+    levels: arrays the size of a level, never of the cloud. That is what still prevents
+    this construction from going under a `jit` -- but an `AaBsp` is a CONSTANT of the trace (see
+    below), so that is not what is asked of it.
 
-    Le NUAGE, lui, ne redescend jamais : `positions` / `weights` sont passés au kernel tels qu'ils
-    arrivent, sans `np.asarray`. Des germes qui vivent sur le GPU y restent -- ce qui compte pour
-    celui qui reconstruit l'arbre à chaque pas de Newton, où un aller-retour hôte coûterait deux
-    fois le nuage par pas et ne servirait à rien. Ce qui redescend est de la taille d'un NIVEAU
-    (les boîtes, les `mid`), plus la permutation finale : mesuré, 0.11 s sur les 4.5 s d'un arbre
-    à 1e6 germes, le reste étant les kernels eux-mêmes -- et pour l'essentiel les tout premiers
-    niveaux, où deux ou quatre work-items balaient tout le nuage.
+    The CLOUD, for its part, never comes back down: `positions` / `weights` are passed to the kernel as they
+    arrive, without `np.asarray`. Seeds that live on the GPU stay there -- which matters for
+    whoever rebuilds the tree at each Newton step, where a host round trip would cost twice
+    the cloud per step and serve no purpose. What comes back down is the size of a LEVEL
+    (the boxes, the `mid`), plus the final permutation: measured, 0.11 s out of the 4.5 s of a tree
+    at 1e6 seeds, the rest being the kernels themselves -- and mostly the very first
+    levels, where two or four work-items sweep the whole cloud.
 
-    = La DÉRIVATION, et pourquoi il n'y en a pas
+    = DIFFERENTIATION, and why there is none
 
-    L'arbre est un objet COMBINATOIRE, et le gradient juste à travers lui est exactement ZÉRO --
-    l'élagage ne change pas l'ensemble des coupes survivantes, seulement lesquelles on essaie. Ses
-    sorties flottantes (boîtes, majorants) ne sont donc pas dérivables, et la construction hôte
-    l'obtient gratuitement en les rendant constantes du trace.
+    The tree is a COMBINATORIAL object, and the true gradient through it is exactly ZERO --
+    pruning does not change the set of surviving cuts, only which ones we try. Its floating-point
+    outputs (boxes, majorants) are therefore not differentiable, and the host construction
+    gets this for free by making them constants of the trace.
     """
 
-    # les germes, RÉORDONNÉS : les indices des germes groupés par feuille, chaque feuille
-    # occupant la tranche `[ node_begin, node_end )`. C'est ce regroupement qui fait que lire
-    # une feuille est une lecture contiguë et pas une collecte d'indices épars.
+    # the seeds, REORDERED: the seed indices grouped by leaf, each leaf
+    # occupying the slice `[ node_begin, node_end )`. It is this grouping that makes reading
+    # a leaf a contiguous read and not a gather of scattered indices.
     seed_indices : IntTensor[ "num_bsp_seed" ]
 
 
-    # l'arbre, numeroté EN TAS : le nœud `k` a ses enfants en `2k+1` / `2k+2`, la racine est 0, et
-    # le niveau `L` occupe `[ 2^L - 1, 2^(L+1) - 1 )`. `node_left < 0` DIT feuille, et n'arrive
-    # qu'au DERNIER niveau -- un nœud qui n'a plus rien à couper passe sa tranche entière à son fils
-    # gauche et rien au droit (voir `_build_in_kernel`), de sorte qu'un fils VIDE (`begin == end`)
-    # est la
-    # seule autre chose à distinguer, ce que `FournisseurBsp::suivant` fait en deux lectures d'entier.
+    # the tree, numbered AS A HEAP: node `k` has its children at `2k+1` / `2k+2`, the root is 0, and
+    # level `L` occupies `[ 2^L - 1, 2^(L+1) - 1 )`. `node_left < 0` MEANS leaf, and only occurs
+    # at the LAST level -- a node that has nothing left to cut passes its whole slice to its left
+    # child and nothing to the right (see `_build_in_kernel`), so that an EMPTY child (`begin == end`)
+    # is the
+    # only other thing to distinguish, which `ProviderBsp::next` does in two integer reads.
     node_left    : IntTensor[ "num_bsp_node" ]
     node_right   : IntTensor[ "num_bsp_node" ]
     node_begin   : IntTensor[ "num_bsp_node" ]
     node_end     : IntTensor[ "num_bsp_node" ]
 
-    # la boîte englobante du sous-arbre -- `lo` PUIS `hi`, DANS LE MÊME TABLEAU, et c'est le point :
-    # la marche est du pointer-chasing, donc ce qui coûte n'est pas le nombre d'octets lus mais le
-    # nombre de LIGNES DE CACHE touchées. Deux tableaux séparés, ce sont deux lignes à deux endroits
-    # de la mémoire pour une seule boîte ; entrelacés, la boîte d'un nœud tient dans une lecture
-    # contiguë (32 octets en 2D FP64).
+    # the bounding box of the subtree -- `lo` THEN `hi`, IN THE SAME ARRAY, and that is the point:
+    # the walk is pointer-chasing, so what costs is not the number of bytes read but the
+    # number of CACHE LINES touched. Two separate arrays are two lines at two places
+    # in memory for a single box; interleaved, a node's box fits in one contiguous
+    # read (32 bytes in 2D FP64).
     #
-    # Ça compte parce que l'arbre ne tient dans aucun cache : ~16 Mo à 1e6 germes, contre 1 Mo de L2
-    # par cœur et 11 Mo de L3 pour tous. Mesuré : les défauts L2 PAR CELLULE passent de 15 à un
-    # thread à 163 à huit, à localité par cœur pourtant identique -- le L3 de Skylake-SP est un
-    # cache de VICTIMES non inclusif, donc à huit cœurs chacun n'a plus qu'un huitième du
-    # rattrapage. Diviser le nombre de lignes touchées est la seule prise là-dessus.
+    # It matters because the tree fits in no cache: ~16 MB at 1e6 seeds, against 1 MB of L2
+    # per core and 11 MB of L3 for all. Measured: L2 misses PER CELL go from 15 on one
+    # thread to 163 on eight, with identical per-core locality -- the Skylake-SP L3 is a
+    # non-inclusive VICTIM cache, so with eight cores each has only an eighth of the
+    # catch-up. Dividing the number of lines touched is the only handle on this.
     node_box     : RealTensor[ "num_bsp_node", "num_lohi", "dim" ]
     node_wa      : RealTensor[ "num_bsp_node", "dim" ]
     node_wb      : RealTensor[ "num_bsp_node" ]
@@ -136,19 +136,19 @@ class AaBsp( SpatialAccelerator ):
 
 
     def __init__( self, positions, weights = None, max_seeds_per_leaf = 10 ):
-        """`positions` : `[ n, d ]`. `weights` : `[ n ]`, ou rien (le cas euclidien).
+        """`positions`: `[ n, d ]`. `weights`: `[ n ]`, or nothing (the Euclidean case).
 
-        `max_seeds_per_leaf` est le grain de l'arbre -- voir la docstring de la classe.
+        `max_seeds_per_leaf` is the grain of the tree -- see the class docstring.
 
-        Le nuage n'est PAS converti en numpy : il part au kernel tel qu'il arrive (`Tensor.set`
-        lit sa forme sans toucher ses données), donc des germes qui vivent sur le GPU y restent.
-        Seule une FORME est lue ici, et une forme n'est pas une donnée.
+        The cloud is NOT converted to numpy: it goes to the kernel as it arrives (`Tensor.set`
+        reads its shape without touching its data), so seeds that live on the GPU stay there.
+        Only a SHAPE is read here, and a shape is not data.
         """
         pos = positions if hasattr( positions, "shape" ) else np.asarray( positions, dtype = float )
-        # sous un `jit`, `positions` est un tracer : sa forme se lit, mais la boucle par niveau
-        # relit les `mid` côté hôte et n'a rien à lire sur un tracer. Le dire ICI plutôt que de
-        # laisser remonter l'erreur du backend quinze lignes plus loin : ce n'est pas un accident,
-        # c'est la limite assumée de la construction côté hôte (voir la docstring de la classe).
+        # under a `jit`, `positions` is a tracer: its shape can be read, but the per-level loop
+        # reads the `mid` back on the host side and has nothing to read on a tracer. Say so HERE rather than
+        # letting the backend's error surface fifteen lines later: it is not an accident,
+        # it is the accepted limit of the host-side construction (see the class docstring).
         if driver.is_traced( pos ):
             raise TypeError( "`AaBsp` is built on the HOST, from concrete positions: it cannot be "
                              "built from a traced array (inside a `jit`). Build it outside, and "
@@ -162,17 +162,17 @@ class AaBsp( SpatialAccelerator ):
         if int( pos.shape[ 0 ] ) == 0:
             raise ValueError( "an accelerator over no seed at all has nothing to accelerate" )
 
-        # des poids TRACÉS, en revanche, passent : ils n'entrent que dans le majorant, et la FORME de
-        # l'arbre ne dépend que des positions. L'arbre est donc bâti sans eux ( ses `mid` restent
-        # lisibles côté hôte, même sous un `jit` ), et le majorant est refait ensuite, en un kernel
-        # qui accepte les traceurs ( `refresh_weight_majorants` )
+        # TRACED weights, on the other hand, are fine: they only enter the majorant, and the SHAPE of
+        # the tree depends only on the positions. The tree is therefore built without them ( its `mid` remain
+        # readable on the host side, even under a `jit` ), and the majorant is redone afterwards, in a kernel
+        # that accepts tracers ( `refresh_weight_majorants` )
         traced_w = w is not None and driver.is_traced( w )
         tree = _build_in_kernel( pos, None if traced_w else w, int( max_seeds_per_leaf ) )
 
-        # la profondeur, qui est EXACTEMENT `max_depth_for( n, leaf )` : l'arbre a désormais la
-        # forme fixe que ce majorant décrivait (voir `_build_in_kernel`). C'est elle qui dimensionne
-        # la pile
-        # de la descente, et une pile trop courte serait une marche qui saute des germes.
+        # the depth, which is EXACTLY `max_depth_for( n, leaf )`: the tree now has the
+        # fixed shape that this majorant described (see `_build_in_kernel`). It is what sizes
+        # the stack
+        # of the descent, and a stack that is too short would be a walk that skips seeds.
         self.max_depth = tree[ "max_depth" ]
         self.max_seeds_per_leaf = int( max_seeds_per_leaf )
         self.nb_leaves = tree[ "nb_leaves" ]
@@ -185,10 +185,10 @@ class AaBsp( SpatialAccelerator ):
             node_end     = tree[ "node_end"     ],
             node_box     = tree[ "node_box"     ],
         )
-        # pas de poids -> on ne NOMME pas les deux tenseurs du majorant : les laisser `Unbound`
-        # (jamais alloués, `NoneTensor` côté C++) supprime le terme du kernel, là où des zéros
-        # seraient un tableau à lire. Même règle que `PowerDiagram.weights`, et pour la même
-        # raison : « pas de poids » est un ÉTAT, pas une valeur.
+        # no weights -> we do not NAME the two majorant tensors: leaving them `Unbound`
+        # (never allocated, `NoneTensor` on the C++ side) removes the term from the kernel, where zeros
+        # would be an array to read. Same rule as `PowerDiagram.weights`, and for the same
+        # reason: "no weights" is a STATE, not a value.
         if w is not None:
             kwargs[ "node_wa" ] = tree[ "node_wa" ]
             kwargs[ "node_wb" ] = tree[ "node_wb" ]
@@ -202,123 +202,123 @@ class AaBsp( SpatialAccelerator ):
 
     @staticmethod
     def max_depth_for( nb_seeds, max_seeds_per_leaf = 10 ):
-        """Un MAJORANT de la profondeur, SANS voir les points -- et il est ATTEINT dès que les
-        germes sont distincts : la coupe est médiane, donc l'arbre est équilibré et sa forme ne
-        dépend que de `n`. Un nuage dégénéré (des germes confondus) ferme des feuilles plus tôt,
-        donc il ne fait que rétrécir l'arbre, jamais l'inverse. C'est ce qui dit qu'une
-        construction en kernel n'a aucune capacité à deviner.
+        """A MAJORANT of the depth, WITHOUT seeing the points -- and it is REACHED as soon as the
+        seeds are distinct: the cut is median, so the tree is balanced and its shape
+        depends only on `n`. A degenerate cloud (coincident seeds) closes leaves earlier,
+        so it only shrinks the tree, never the opposite. That is what says that a
+        kernel construction has no capacity to guess.
         """
         n, leaf = int( nb_seeds ), max( int( max_seeds_per_leaf ), 1 )
         return 1 if n <= leaf else math.ceil( math.log2( n / leaf ) ) + 1
 
     @staticmethod
     def max_nb_nodes_for( nb_seeds, max_seeds_per_leaf = 10 ):
-        """Un majorant du nombre de nœuds, `n` seul -- voir `max_depth_for`. Un arbre binaire dont
-        toutes les feuilles sont au même niveau en a `2 * feuilles - 1`, et les feuilles sont au
-        plus `2 ** ( profondeur - 1 )`."""
+        """A majorant of the number of nodes, `n` alone -- see `max_depth_for`. A binary tree whose
+        leaves are all at the same level has `2 * leaves - 1` of them, and the leaves number at
+        most `2 ** ( depth - 1 )`."""
         return 2 * 2 ** ( AaBsp.max_depth_for( nb_seeds, max_seeds_per_leaf ) - 1 ) - 1
 
     @classmethod
     def of( cls, power_diagram, max_seeds_per_leaf = 10 ):
-        """L'accélérateur des germes de `power_diagram` -- ses positions ET ses poids.
+        """The accelerator of the seeds of `power_diagram` -- its positions AND its weights.
 
-        Le raccourci qu'on veut presque toujours : un BSP construit sur d'autres poids que ceux
-        du diagramme resterait CORRECT (le majorant ne servirait qu'à élaguer moins bien) mais
-        n'aurait aucune raison d'être bon.
+        The shortcut one almost always wants: a BSP built on other weights than those
+        of the diagram would remain CORRECT (the majorant would only prune less well) but
+        would have no reason to be good.
         """
-        # les TAMPONS du diagramme, pas leur copie hôte : `Tensor.raw` est le tableau du backend, et
-        # `__init__` le passe au kernel sans y toucher. Un diagramme dont les germes sont sur le GPU
-        # y bâtit donc son arbre sans que le nuage ne redescende -- et il redescendait deux fois,
-        # une par `np.asarray` et une par le ré-upload.
+        # the diagram's BUFFERS, not their host copy: `Tensor.raw` is the backend's array, and
+        # `__init__` passes it to the kernel without touching it. A diagram whose seeds are on the GPU
+        # therefore builds its tree there without the cloud coming back down -- and it used to come down twice,
+        # once through `np.asarray` and once through the re-upload.
         pos = power_diagram.positions.raw
         w = power_diagram.weights
         w = w.raw if w.is_defined else None
         return cls( pos, w, max_seeds_per_leaf = max_seeds_per_leaf )
 
 
-    # -- ce que l'appelant a besoin de savoir ---------------------------------------------------
+    # -- what the caller needs to know ----------------------------------------------------------
 
     def nb_seeds( self ):
         return int( self.nb_bsp_seeds.value )
 
     def rank_of_seeds( self ):
-        """l'inverse de `seed_indices` : le RANG ( dans l'ordre de l'arbre ) du germe `i`"""
+        """the inverse of `seed_indices`: the RANK ( in the tree's order ) of seed `i`"""
         order = np.asarray( self.seed_indices ).reshape( -1 ).astype( np.int64 )
         rank = np.empty_like( order )
         rank[ order ] = np.arange( len( order ) )
         return rank
 
-    # -- ce qui se refait sans rebâtir --------------------------------------------------------------
+    # -- what is redone without rebuilding ------------------------------------------------------
 
     def refresh_weight_majorants( self, sorted_positions, sorted_weights ):
-        """Le majorant affine des poids de CHAQUE nœud, refait sur des poids neufs -- les germes
-        étant donnés DANS L'ORDRE DE L'ARBRE ( ce que `PowerDiagram_Bsp` stocke ), une tranche par
-        nœud. Un kernel, un work-item par nœud ( `AaBsp.h::refresh_majorant` ).
+        """The affine majorant of the weights of EACH node, redone on new weights -- the seeds
+        being given IN THE TREE'S ORDER ( what `PowerDiagram_Bsp` stores ), one slice per
+        node. One kernel, one work-item per node ( `AaBsp.h::refresh_majorant` ).
 
-        C'est ce qui rend un arbre RÉUTILISABLE quand seuls les poids changent ( un pas de `SdotPlanNd`,
-        où les positions sont les constantes du problème ) : la forme de l'arbre ne dépend que des
-        positions, et la seule chose qui parle des poids est ce majorant. Il accepte des poids
-        TRACÉS ( les nœuds sortent alors tracés eux aussi ) et coupe le gradient : le majorant est
-        un objet de l'ÉLAGAGE, qui ne change pas le résultat -- sa dérivée juste est zéro.
+        It is what makes a tree REUSABLE when only the weights change ( a step of `SdotPlanNd`,
+        where the positions are the constants of the problem ): the shape of the tree depends only on the
+        positions, and the only thing that speaks of weights is this majorant. It accepts
+        TRACED weights ( the nodes then come out traced too ) and cuts the gradient: the majorant is
+        an object of PRUNING, which does not change the result -- its true derivative is zero.
         """
         nb_nodes = int( self.nb_bsp_nodes.value )
         num_node = new_batch_axis( nb_nodes, prefix = "bspnode" )
-        maj = _NodeMajorant( nb_dims = int( self.nb_dims.value ), batch_axes = [ num_node ] )
+        majorant = _NodeMajorant( nb_dims = int( self.nb_dims.value ), batch_axes = [ num_node ] )
 
-        # le gradient est coupé À L'ENTRÉE : un kernel sans adjoint sous `driver.grad` est une
-        # erreur, et celui-ci n'a rien à propager ( voir ci-dessus )
+        # the gradient is cut AT THE INPUT: a kernel without an adjoint under `driver.grad` is an
+        # error, and this one has nothing to propagate ( see above )
         cloud = _BspCloud( nb_dims = int( self.nb_dims.value ),
                            positions = driver.stop_gradient( getattr( sorted_positions, "raw", sorted_positions ) ),
                            weights = driver.stop_gradient( getattr( sorted_weights, "raw", sorted_weights ) ) )
 
-        # l'arbre n'est PAS un argument : ses majorants courants sont ce qu'on remplace, et sous
-        # une trace ils peuvent être des traceurs d'une trace close ( voir `SdotPlanNd` ). Seules les
-        # tranches entrent.
+        # the tree is NOT an argument: its current majorants are what we replace, and under
+        # a trace they may be tracers of a closed trace ( see `SdotPlanNd` ). Only the
+        # slices go in.
         loom.ffi_call(
             "bsp_refresh_majorants",
             FfiCode.per_item( includes = [ "sdot/bsp_build_level.h" ],
                 code = "bsp_refresh_majorant( inputs.cloud, inputs.node_begin( batch_index ), inputs.node_end( batch_index ), "
-                           "outputs.maj.wa( batch_index ), outputs.maj.wb( batch_index ) );" ),
+                           "outputs.majorant.wa( batch_index ), outputs.majorant.wb( batch_index ) );" ),
             cloud = cloud,
-            maj = loom.out( maj ),
+            majorant = loom.out( majorant ),
             node_begin = IntTensor[ num_node ]( np.asarray( self.node_begin ).reshape( -1 ) ),
             node_end   = IntTensor[ num_node ]( np.asarray( self.node_end ).reshape( -1 ) ),
             has_dynamic_capacity = False,
         )
-        self.node_wa = maj.wa.raw
-        self.node_wb = maj.wb.raw
+        self.node_wa = majorant.wa.raw
+        self.node_wb = majorant.wb.raw
 
 
 def _weight_majorant( pos, w ):
-    """`( a, b )` tels que `w_i <= a . pos_i + b` pour tout germe du nœud, le plus serré qu'on
-    sache faire vite.
+    """`( a, b )` such that `w_i <= a . pos_i + b` for every seed of the node, the tightest we
+    know how to do quickly.
 
-    Deux candidats : le CONSTANT (`a = 0`, `b = max w`), et l'AFFINE ajusté aux moindres carrés
-    puis relevé jusqu'à majorer. On garde l'affine seulement s'il resserre franchement
-    l'ÉTALEMENT des résidus -- c'est-à-dire `max( w - a.y ) - min( w - a.y )`, qui est exactement
-    le mou de la borne : un majorant vaut ce que vaut l'écart entre lui et le poids réel du germe
-    qui l'atteint. Les deux ne sont pas comparables dans l'absolu (l'affine crédite moins le côté
-    « poids faible » de la boîte, mais plus le côté opposé), et l'étalement est la façon honnête
-    de trancher sans dépendre d'où on regarde la boîte.
+    Two candidates: the CONSTANT (`a = 0`, `b = max w`), and the AFFINE fitted by least squares
+    then raised until it majorizes. We keep the affine only if it clearly tightens
+    the SPREAD of the residuals -- that is, `max( w - a.y ) - min( w - a.y )`, which is exactly
+    the slack of the bound: a majorant is worth the gap between it and the real weight of the seed
+    that attains it. The two are not comparable in the absolute (the affine credits the "low weight"
+    side of the box less, but the opposite side more), and the spread is the honest way
+    to decide without depending on where the box is looked at from.
 
-    Comparé à QUOI, en revanche, demande une précaution : un ajustement à `d + 1` paramètres sur
-    `m` points resserre l'étalement même quand il n'y a rien à ajuster, d'autant plus fort que
-    `m` est petit -- et une feuille est petite par construction. Le seuil est donc le
-    resserrement que le HASARD donne déjà, `sqrt( 1 - d / ( m - 1 ) )` (mesuré : 0.93 pour
-    `d = 2, m = 13`, 0.76 pour `d = 3, m = 8`), et l'affine doit faire nettement mieux que lui.
-    Sans cette correction, un nœud de poids purement aléatoires retenait l'affine une fois sur
-    trois -- toujours VALIDE (le relevé s'en charge), mais un vecteur de plus à lire par nœud
-    pour une borne qui ne vaut pas mieux.
+    Compared to WHAT, however, requires a precaution: a fit with `d + 1` parameters on
+    `m` points tightens the spread even when there is nothing to fit, all the more strongly as
+    `m` is small -- and a leaf is small by construction. The threshold is therefore the
+    tightening that CHANCE already gives, `sqrt( 1 - d / ( m - 1 ) )` (measured: 0.93 for
+    `d = 2, m = 13`, 0.76 for `d = 3, m = 8`), and the affine must do clearly better than it.
+    Without this correction, a node of purely random weights kept the affine one time in
+    three -- always VALID (the raising takes care of it), but one more vector to read per node
+    for a bound that is no better.
 
-    Un second garde-fou, appris sur un vrai nuage (`solvers_des_familles`, § 7.5) : des germes
-    clampés au bord, `x` égaux à 1e-8 près, et la matrice normale est presque singulière -- le
-    rapport de valeurs singulières, 3e-8, passe le `rcond` de `lstsq` -- donc la pente sort à
-    1e13 et `b` se calcule à 1e9 par une annulation qui mange tout. Relevé, le majorant reste
-    vrai, mais il ne majore plus RIEN d'utile. Une pente n'est donc admise que si, sur l'étendue
-    du nœud, elle reste de l'ordre de l'étalement des poids : au-delà elle n'explique rien, elle
-    amplifie l'arrondi. Et comme la marge d'arrondi de `b` est relative à `|a . y|` (le noyau
-    calcule en `float`), `|a . y|` ne doit pas dépasser cent fois l'étalement, sans quoi cette
-    marge cesse d'être négligeable devant ce qu'on majore.
+    A second safeguard, learned on a real cloud (`solvers_des_familles`, § 7.5): seeds
+    clamped at the edge, `x` equal to within 1e-8, and the normal matrix is nearly singular -- the
+    ratio of singular values, 3e-8, passes the `rcond` of `lstsq` -- so the slope comes out at
+    1e13 and `b` is computed at 1e9 by a cancellation that eats everything. Once raised, the majorant stays
+    true, but it no longer majorizes ANYTHING useful. A slope is therefore only admitted if, over the extent
+    of the node, it remains of the order of the spread of the weights: beyond that it explains nothing, it
+    amplifies rounding. And since the rounding margin of `b` is relative to `|a . y|` (the kernel
+    computes in `float`), `|a . y|` must not exceed a hundred times the spread, otherwise this
+    margin ceases to be negligible compared to what is being majorized.
     """
     d = pos.shape[ 1 ]
     if w is None:
@@ -328,45 +328,45 @@ def _weight_majorant( pos, w ):
     spread = float( w.max() - w.min() )
     a = np.zeros( d )
     if m >= 2 * ( d + 1 ) and spread > 0:
-        # centré : les moindres carrés sur `pos` brut seraient mal conditionnés dès que le nœud
-        # est loin de l'origine. La constante ne change pas l'étalement, elle est reprise par `b`.
+        # centered: least squares on raw `pos` would be badly conditioned as soon as the node
+        # is far from the origin. The constant does not change the spread, it is taken up by `b`.
         q = pos - pos.mean( axis = 0 )
         fit = np.linalg.lstsq( q, w - w.mean(), rcond = None )[ 0 ]
         r = w - pos @ fit
         by_chance = np.sqrt( max( 1.0 - d / ( m - 1 ), 0.0 ) )
         extent = pos.max( axis = 0 ) - pos.min( axis = 0 )
         reach = np.abs( pos ).max( axis = 0 )
-        sage = bool( ( np.abs( fit ) * extent <= 8 * spread ).all() and ( np.abs( fit ) * reach <= 100 * spread ).all() )
-        if sage and float( r.max() - r.min() ) < 0.85 * by_chance * spread:
+        well_behaved = bool( ( np.abs( fit ) * extent <= 8 * spread ).all() and ( np.abs( fit ) * reach <= 100 * spread ).all() )
+        if well_behaved and float( r.max() - r.min() ) < 0.85 * by_chance * spread:
             a = fit
 
     b = float( ( w - pos @ a ).max() )
 
-    # une MARGE d'arrondi sur la constante, et sur elle seule. La boîte, elle, n'en a pas besoin :
-    # `float32( min( y ) ) == min( float32( y ) )` (un arrondi est monotone), donc `node_box`
-    # reste exact une fois converti. `b`, au contraire, est le seul terme que l'hôte
-    # et le kernel calculent DIFFÉREMMENT -- ici `w - a . y` en double, là-bas en `TF` -- et un `b`
-    # arrondi vers le bas cesserait de majorer. Grossir `b` ne peut qu'élaguer moins, jamais mentir.
+    # a rounding MARGIN on the constant, and on it alone. The box does not need one:
+    # `float32( min( y ) ) == min( float32( y ) )` (a rounding is monotone), so `node_box`
+    # remains exact once converted. `b`, on the contrary, is the only term that the host
+    # and the kernel compute DIFFERENTLY -- here `w - a . y` in double, there in `TF` -- and a `b`
+    # rounded downward would cease to majorize. Enlarging `b` can only prune less, never lie.
     scale = abs( b ) + float( w.max() - w.min() ) + float( np.abs( pos @ a ).max() )
     return a, b + 1e-6 * scale
 
 
-# -- la construction, NIVEAU PAR NIVEAU ---------------------------------------------------------
+# -- the construction, LEVEL BY LEVEL -----------------------------------------------------------
 
 
 class _BspCloud( Aggregate ):
-    """Le nuage EN COURS DE TRI : les germes rangés dans l'ordre où l'arbre les regroupe, plus
-    l'indice d'origine de chacun.
+    """The cloud WHILE BEING SORTED: the seeds arranged in the order in which the tree groups them, plus
+    the original index of each.
 
-    Les positions (et les poids) sont tenues PERMUTÉES à côté des indices, et pas relues à travers
-    eux : un nœud lit alors ses points d'un seul tenant, là où une indirection par `order` en ferait
-    une collecte éparse. Ça compte partout, et surtout aux premiers niveaux, où très peu de
-    work-items balaient tout le nuage.
+    The positions (and the weights) are kept PERMUTED next to the indices, and not re-read through
+    them: a node then reads its points in one piece, where an indirection through `order` would make
+    it a scattered gather. It matters everywhere, and above all at the first levels, where very few
+    work-items sweep the whole cloud.
 
-    Il en faut DEUX par niveau, l'un lu et l'autre écrit : les entrées et les sorties d'un appel sont
-    disjointes (voir `driver.call`), et le tri d'un niveau est une permutation, donc chaque case de
-    la sortie est écrite par le work-item du nœud qui la contient -- une et une seule fois, sans
-    atomique ni barrière, parce que les tranches d'un niveau PARTITIONNENT `[ 0, n )`.
+    TWO are needed per level, one read and the other written: the inputs and outputs of a call are
+    disjoint (see `driver.call`), and the sort of a level is a permutation, so each cell of
+    the output is written by the work-item of the node that contains it -- once and only once, with no
+    atomic or barrier, because the slices of a level PARTITION `[ 0, n )`.
     """
 
     positions : RealTensor[ "num_point", "dim" ]
@@ -381,8 +381,8 @@ class _BspCloud( Aggregate ):
 
 
 class _NodeMajorant( Aggregate ):
-    """le majorant affine des poids d'UN nœud, `w( y ) <= wa . y + wb` -- batché sur les nœuds
-    quand on les refait tous ( `AaBsp.refresh_weight_majorants` )"""
+    """the affine majorant of the weights of ONE node, `w( y ) <= wa . y + wb` -- batched over the nodes
+    when all of them are redone ( `AaBsp.refresh_weight_majorants` )"""
 
     wa    : RealTensor[ "dim" ]
     wb    : RealTensor
@@ -392,13 +392,13 @@ class _NodeMajorant( Aggregate ):
 
 
 class _BspLevel( Aggregate ):
-    """Ce qu'UN niveau de l'arbre porte, PAR NŒUD -- batché sur les nœuds du niveau, donc un
-    work-item par nœud.
+    """What ONE level of the tree carries, PER NODE -- batched over the nodes of the level, hence one
+    work-item per node.
 
-    `begin` / `end` sont l'ENTRÉE (la tranche du nœud, décidée par le niveau d'au-dessus) ; tout le
-    reste est la sortie. `mid` dit où couper : le fils gauche reçoit `[ begin, mid )`, le droit
-    `[ mid, end )`, et `mid == end` est un nœud qui n'avait plus rien à couper et propage tout à
-    gauche (voir `bsp_build_level.h`).
+    `begin` / `end` are the INPUT (the node's slice, decided by the level above); everything
+    else is output. `mid` says where to cut: the left child receives `[ begin, mid )`, the right
+    `[ mid, end )`, and `mid == end` is a node that had nothing left to cut and propagates everything
+    to the left (see `bsp_build_level.h`).
     """
 
     begin : IntTensor
@@ -416,33 +416,33 @@ class _BspLevel( Aggregate ):
 
 
 def _preorder_of_heap( depth ):
-    """`p[ i ]` = ou le noeud de rang-tas `i` atterrit en PREORDRE (DFS).
+    """`p[ i ]` = where the node of heap rank `i` lands in PREORDER (DFS).
 
-    = Pourquoi changer la numerotation
+    = Why change the numbering
 
-    En TAS, les fils du noeud `i` sont en `2i+1` / `2i+2` : un chemin racine -> feuille saute vers
-    des adresses qui DIVERGENT exponentiellement, et le pire est en bas de l'arbre, la ou les
-    niveaux sont les plus gros -- a 1e6 germes, le niveau 17 fait 65 536 noeuds, donc les fils d'un
-    noeud profond sont a deux megaoctets de lui. Or c'est un chemin racine -> feuille que la marche
-    parcourt POUR CHAQUE CELLULE.
+    In a HEAP, the children of node `i` are at `2i+1` / `2i+2`: a root -> leaf path jumps to
+    addresses that DIVERGE exponentially, and the worst is at the bottom of the tree, where the
+    levels are biggest -- at 1e6 seeds, level 17 has 65 536 nodes, so the children of a deep
+    node are two megabytes away from it. Yet it is a root -> leaf path that the walk
+    traverses FOR EACH CELL.
 
-    En PREORDRE, le fils gauche est en `i+1` et le droit en `i + 2^(h-1)`, ou `h` est la hauteur du
-    sous-arbre : les sauts RETRECISSENT en descendant, et les derniers niveaux -- les plus nombreux
-    et les plus visites -- tiennent a quelques noeuds les uns des autres. La propriete genante est
-    exactement inversee.
+    In PREORDER, the left child is at `i+1` and the right at `i + 2^(h-1)`, where `h` is the height of the
+    subtree: the jumps SHRINK as we descend, and the last levels -- the most numerous
+    and the most visited -- sit within a few nodes of each other. The troublesome property is
+    exactly reversed.
 
-    = Ce que ca ne change pas
+    = What it does not change
 
-    Ni la forme de l'arbre, ni les tranches, ni la marche : c'est une PERMUTATION des memes noeuds.
-    Ce qui change est l'adresse a laquelle chacun est ecrit -- et c'est mesure comme etant ce qui
-    compte : a instructions egales (17 500 par cellule contre 26 950 pour pysdot, donc MOINS), on
-    generait 199 defauts de cache par cellule a huit coeurs la ou pysdot -- un quadtree en ordre Z,
-    donc a sous-arbres contigus -- en genere 5.9.
+    Neither the shape of the tree, nor the slices, nor the walk: it is a PERMUTATION of the same nodes.
+    What changes is the address at which each is written -- and that is measured to be what
+    matters: at equal instruction counts (17 500 per cell against 26 950 for pysdot, so FEWER), we
+    generated 199 cache misses per cell on eight cores where pysdot -- a quadtree in Z order,
+    hence with contiguous subtrees -- generates 5.9.
     """
     nb_nodes = 2 ** depth - 1
     pre = np.zeros( nb_nodes, dtype = np.int64 )
     for level in range( depth - 1 ):
-        h = depth - level                       # hauteur du sous-arbre d'un noeud de ce niveau
+        h = depth - level                       # height of the subtree of a node of this level
         idx = np.arange( 2 ** level - 1, 2 ** ( level + 1 ) - 1 )
         pre[ 2 * idx + 1 ] = pre[ idx ] + 1
         pre[ 2 * idx + 2 ] = pre[ idx ] + 2 ** ( h - 1 )
@@ -450,31 +450,31 @@ def _preorder_of_heap( depth ):
 
 
 def _build_in_kernel( pos, w, leaf_size ):
-    """Le même arbre que `_build`, construit par `bsp_build_level.h` au lieu de numpy.
+    """The same tree as `_build`, built by `bsp_build_level.h` instead of numpy.
 
-    = Pourquoi un appel PAR NIVEAU
+    = Why one call PER LEVEL
 
-    Un niveau lit les tranches que le précédent a produites, et il n'y a pas de barrière GLOBALE
-    dans un kernel SYCL -- seulement au sein d'un work-group. La barrière est donc la fin du
-    lancement, et l'hôte enchaîne `depth` appels. Ce n'est pas un pis-aller : `depth` vaut
-    `max_depth_for( n, leaf_size )`, une fonction de `n` SEUL (coupe médiane), donc le nombre
-    d'appels est connu d'avance et ne dépend d'aucune donnée -- une quinzaine à 1e6 germes, contre
-    les ~130 000 tours de boucle Python que la version hôte fait par nœud.
+    A level reads the slices that the previous one produced, and there is no GLOBAL barrier
+    in a kernel -- only within a work-group. The barrier is therefore the end of the
+    launch, and the host chains `depth` calls. It is not a stopgap: `depth` is
+    `max_depth_for( n, leaf_size )`, a function of `n` ALONE (median cut), so the number
+    of calls is known in advance and depends on no data -- about fifteen at 1e6 seeds, against
+    the ~130 000 Python loop iterations that the host version does per node.
 
-    = Ce qui reste côté hôte, et ce que ça coûte
+    = What stays on the host side, and what it costs
 
-    L'arithmétique d'indices entre deux niveaux (`[ begin, mid )` / `[ mid, end )`) et le
-    recollement des niveaux en un seul tableau de nœuds. Des tableaux de la taille d'un NIVEAU,
-    jamais du nuage. C'est aussi ce qui empêche encore cette construction de passer sous un `jit`
-    -- mais un `AaBsp` est de toute façon une CONSTANTE du trace (voir la docstring de la classe),
-    donc ce n'est pas ce qu'on lui demande.
+    The index arithmetic between two levels (`[ begin, mid )` / `[ mid, end )`) and the
+    gluing of the levels into a single node array. Arrays the size of a LEVEL,
+    never of the cloud. It is also what still prevents this construction from going under a `jit`
+    -- but an `AaBsp` is a CONSTANT of the trace anyway (see the class docstring),
+    so that is not what is asked of it.
 
-    = Le nom de l'axe de batch
+    = The name of the batch axis
 
-    Un axe frais par niveau donnerait `depth` sources C++ différentes, donc `depth` compilations
-    (voir `loom.tensor.batch`). Les tenseurs d'un niveau sont donc RECOPIÉS en numpy et le niveau
-    relâché avant le suivant : le nom revient à la réserve, les `depth` appels partagent une seule
-    source, et seul le premier compile.
+    A fresh axis per level would give `depth` different C++ sources, hence `depth` compilations
+    (see `loom.tensor.batch`). The tensors of a level are therefore COPIED into numpy and the level
+    released before the next: the name goes back to the pool, the `depth` calls share a single
+    source, and only the first one compiles.
     """
     n, d = pos.shape
 
@@ -490,8 +490,8 @@ def _build_in_kernel( pos, w, leaf_size ):
     begs, ends, boxes, was, wbs = [], [], [], [], []
 
     for level in range( depth ):
-        # le nuage de sortie PARTAGE l'axe des points (donc son compte) avec l'entrée : c'est la
-        # même permutation, réarrangée.
+        # the output cloud SHARES the points axis (hence its count) with the input: it is the
+        # same permutation, rearranged.
         dst = _BspCloud( nb_dims = d, num_point = src.num_point )
 
         num_node = new_batch_axis( 2 ** level, prefix = "bspnode" )
@@ -501,13 +501,13 @@ def _build_in_kernel( pos, w, leaf_size ):
         leaf = IntTensor[ num_param ]()
         leaf.set( np.array( [ leaf_size ], dtype = np.int64 ) )
 
-        # CE QUE LE NIVEAU ÉCRIT, nommé POSITIVEMENT. `begin` / `end` sont son ENTRÉE ( la tranche
-        # décidée par le niveau d'au-dessus ) : ne pas les nommer suffit à les laisser lues et non
-        # allouées. Sans poids, ni le nuage ni le majorant n'ont de tenseur : pas nommés non plus,
-        # ils restent `Unbound`, arrivent en `NoneTensor`, et les deux blocs correspondants du
-        # kernel disparaissent à la compilation ( même règle que `PowerDiagram.weights` ).
-        ecrit_dst = [ "positions", "order" ] + ( [ "weights" ] if w is not None else [] )
-        ecrit_lvl = [ "mid", "box" ] + ( [ "wa", "wb" ] if w is not None else [] )
+        # WHAT THE LEVEL WRITES, named POSITIVELY. `begin` / `end` are its INPUT ( the slice
+        # decided by the level above ): not naming them is enough to leave them read and not
+        # allocated. Without weights, neither the cloud nor the majorant has a tensor: not named either,
+        # they stay `Unbound`, arrive as `NoneTensor`, and the two corresponding blocks of the
+        # kernel disappear at compilation ( same rule as `PowerDiagram.weights` ).
+        written_dst = [ "positions", "order" ] + ( [ "weights" ] if w is not None else [] )
+        written_lvl = [ "mid", "box" ] + ( [ "wa", "wb" ] if w is not None else [] )
 
         loom.ffi_call(
             "bsp_build_level",
@@ -518,13 +518,13 @@ def _build_in_kernel( pos, w, leaf_size ):
                            "outputs.lvl.wa( batch_index ), outputs.lvl.wb( batch_index ), outputs.lvl.mid( batch_index ), "
                            "SI( inputs.leaf_size( 0 ) ) );" ),
             src = src,
-            dst = loom.out( dst, writes = ecrit_dst ),
-            lvl = loom.out( lvl, writes = ecrit_lvl ),
+            dst = loom.out( dst, writes = written_dst ),
+            lvl = loom.out( lvl, writes = written_lvl ),
             perm = loom.scratch( perm ),
             leaf_size = leaf,
-            # toutes les tailles sont prescrites en amont (elles ne dépendent que de `n` et du
-            # niveau) : aucun compte n'est décidé par le kernel, donc rien ne peut déborder et le
-            # test d'exécution -- une synchro device -> hôte par appel -- n'a rien à surveiller.
+            # all sizes are prescribed upstream (they depend only on `n` and on the
+            # level): no count is decided by the kernel, so nothing can overflow and the
+            # runtime check -- a device -> host sync per call -- has nothing to watch.
             has_dynamic_capacity = False,
         )
 
@@ -546,15 +546,15 @@ def _build_in_kernel( pos, w, leaf_size ):
         order = np.asarray( dst.order ).reshape( -1 ).copy()
         src = dst
 
-        # RENDRE le nom de l'axe avant d'en emprunter un autre : le niveau suivant le prend au
-        # DÉBUT de son tour, donc tant que celui-ci est vivant il en faut un neuf -- et un nom neuf,
-        # c'est une source C++ de plus, donc une compilation de plus (voir `loom.tensor.batch`).
+        # GIVE BACK the axis name before borrowing another: the next level takes it at the
+        # START of its turn, so as long as this one is alive a new one is needed -- and a new name
+        # is one more C++ source, hence one more compilation (see `loom.tensor.batch`).
         del lvl, num_node, perm, dst, leaf
 
     nb_nodes = 2 ** depth - 1
 
-    # les niveaux se concatènent dans l'ordre, ce qui donne la numérotation EN TAS : le nœud `k` du
-    # niveau `L` est le global `2^L - 1 + k`. C'est la forme dans laquelle ils SORTENT du kernel.
+    # the levels concatenate in order, which gives the HEAP numbering: node `k` of
+    # level `L` is global `2^L - 1 + k`. It is the form in which they COME OUT of the kernel.
     node_begin = np.concatenate( begs )
     node_end   = np.concatenate( ends )
     node_box   = np.concatenate( boxes )
@@ -562,10 +562,10 @@ def _build_in_kernel( pos, w, leaf_size ):
     node_wb    = np.concatenate( wbs ) if w is not None else np.zeros( nb_nodes )
 
     is_leaf = np.zeros( nb_nodes, dtype = bool )
-    is_leaf[ 2 ** ( depth - 1 ) - 1: ] = True              # le dernier niveau : QUE des feuilles
+    is_leaf[ 2 ** ( depth - 1 ) - 1: ] = True              # the last level: ONLY leaves
 
-    # ... puis on les RANGE en préordre, ce qui est une pure permutation : même arbre, mêmes
-    # tranches, même marche, seules les ADRESSES changent (voir `_preorder_of_heap`).
+    # ... then we ARRANGE them in preorder, which is a pure permutation: same tree, same
+    # slices, same walk, only the ADDRESSES change (see `_preorder_of_heap`).
     pre = _preorder_of_heap( depth )
     def in_preorder( a ):
         r = np.empty_like( a )

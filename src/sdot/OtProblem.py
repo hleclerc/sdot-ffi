@@ -1,78 +1,78 @@
-"""`OtProblem` : CE QU'ON RÉSOUT -- et la seule porte d'entrée des plans de transport semi-discrets.
+"""`OtProblem` : WHAT WE SOLVE -- and the only entry point to semi-discrete transport plans.
 
-= Deux objets, et pas un de plus
+= Two objects, and not one more
 
-`OtProblem` porte les ENTRÉES, et rien d'autre : deux distributions. Aucun réglage de solveur,
-aucun tenseur alloué, aucun arbre, aucune capacité de scratch. Le construire ne déclenche aucun
-appel. On peut rebrancher une entrée et redemander la solution :
+`OtProblem` carries the INPUTS, and nothing else : two distributions. No solver setting,
+no allocated tensor, no tree, no scratch capacity. Building it triggers no
+call. An input can be rewired and the solution asked for again :
 
     pb = OtProblem( SumOfDiracs( pos ), image )
     sol = pb.solve()
-    pb.source = SumOfDiracs( pos_suivantes )      # une entrée change
-    sol = pb.solve()                              # et la SOLUTION d'avant sert de départ
+    pb.source = SumOfDiracs( next_pos )           # an input changes
+    sol = pb.solve()                              # and the previous SOLUTION is the starting point
 
-`solve()` rend une SOLUTION, un objet à part -- `SdotPlan1d` ou `SdotPlanNd`. Un problème peut
-avoir plusieurs solutions ( deux tolérances, deux départs ) et ne doit donc pas en porter une.
+`solve()` returns a SOLUTION, a separate object -- `SdotPlan1d` or `SdotPlanNd`. A problem can
+have several solutions ( two tolerances, two starting points ) and must therefore not carry one.
 
-Pour un transport qu'on ne résout QU'UNE FOIS, `ot_solve( source, target, ... )` fait les deux en
-une expression. Ce n'est un raccourci que dans ce cas-là : dès qu'on résout plusieurs fois, c'est
-l'`OtProblem` gardé qui porte la SOLUTION de la fois d'avant, et c'est lui qui fait qu'un transport
-voisin coûte quelques pas de Newton au lieu de quelques dizaines. Un plan et non des poids, parce
-que des poids seuls ne décrivent pas une solution dès qu'il y a des germes confondus ( § 23.11 ).
+For a transport that is solved ONLY ONCE, `ot_solve( source, target, ... )` does both in
+one expression. It is only a shortcut in that case : as soon as one solves several times, it is the
+kept `OtProblem` that carries the SOLUTION of the previous time, and it is what makes a
+neighbouring transport cost a few Newton steps instead of a few dozen. A plan and not weights, because
+weights alone do not describe a solution as soon as there are coincident seeds ( § 23.11 ).
 
-= Direct ou itératif : le problème a déjà choisi
+= Direct or iterative : the problem has already chosen
 
-    d = 1, diracs contre densité  ->  TRI plus inversion de fonction de répartition.  `SdotPlan1d`
-    d >= 2                        ->  POINT FIXE d'un Newton amorti.                  `SdotPlanNd`
+    d = 1, diracs against a density  ->  SORT plus inversion of the cumulative distribution function.  `SdotPlan1d`
+    d >= 2                           ->  FIXED POINT of a damped Newton.                                `SdotPlanNd`
 
-Le premier est exact, sans boucle, sans tolérance et sans point de départ ; il est dérivable de
-bout en bout et batché sur des milliers d'angles. Le second est une boucle, avec une tolérance, un
-départ, un historique, et un gradient par le théorème de l'enveloppe.
+The first is exact, loop-free, tolerance-free and needs no starting point ; it is differentiable
+end to end and batched over thousands of angles. The second is a loop, with a tolerance, a
+starting point, a history, and a gradient by the envelope theorem.
 
-**Les paramètres ne diffèrent donc pas parce que l'appelant choisit une méthode : ils diffèrent
-parce que le RÉGIME diffère, et le régime se lit sur les entrées.** D'où la règle : il y a un objet
-de réglages PAR RÉGIME, `Direct` et `Iterative`, et **son type EST le régime**. En donner un qui ne
-correspond pas est une erreur, pas un argument ignoré en silence :
+**The parameters therefore do not differ because the caller chooses a method : they differ
+because the REGIME differs, and the regime is read off the inputs.** Hence the rule : there is one
+settings object PER REGIME, `Direct` and `Iterative`, and **its type IS the regime**. Giving one that does not
+match is an error, not an argument silently ignored :
 
-    sol = pb.solve()                              # les défauts du régime, qui sont les bons
+    sol = pb.solve()                              # the regime's defaults, which are the right ones
     sol = pb.solve( Iterative( tol = 1e-10 ) )    # d >= 2
     sol = pb.solve( Direct( with_barycenters = True ) )   # d = 1
 
-= Les réglages du banc ne sont pas des réglages d'utilisateur
+= The bench settings are not user settings
 
-Tout ce que `solvers_des_familles` fait varier pour COMPARER des algorithmes -- le choix du pas, le
-solveur linéaire, l'échelle de continuation, l'accélérateur spatial, la mémoire des voisins -- a un
-défaut MESURÉ, et un utilisateur qui le change choisit mal. Ces réglages existent, derrière une
-porte de service : `Iterative( tuning = Tuning( ... ) )`. `Tuning` est explicitement INSTABLE --
-c'est la surface par laquelle le banc continue d'exister, et rien d'autre ne doit en dépendre.
+Everything that `solvers_des_familles` varies to COMPARE algorithms -- the choice of step, the linear
+solver, the continuation scale, the spatial accelerator, the neighbour memory -- has a MEASURED
+default, and a user who changes it chooses badly. These settings exist, behind a service door :
+`Iterative( tuning = Tuning( ... ) )`. `Tuning` is explicitly UNSTABLE --
+it is the surface through which the bench keeps existing, and nothing else must depend on it.
 
-Et la leçon à ne pas réapprendre ( README § 24.5 ) : **un défaut appartient au régime où il a été
-mesuré.** `residu = log` gagne sur les solves directs et casse la continuation en densité.
+And the lesson not to relearn ( README § 24.5 ) : **a default belongs to the regime where it was
+measured.** `residu = log` wins on direct solves and breaks continuation in density.
 """
 
-import numpy as np                  # les seuls tableaux hôtes d'ici : les quelques plans du domaine
+import numpy as np                  # the only host arrays in here : the few planes of the domain
 
 
 _PRECISIONS = { "auto": "FP64", "fp64": "FP64", "fp32": "FP32" }
 
 
 class Tuning:
-    """LES RÉGLAGES DU BANC. Instable, non supporté, et rien dans `sdot` ne doit en dépendre.
+    """THE BENCH SETTINGS. Unstable, unsupported, and nothing in `sdot` must depend on it.
 
-    Exactement les paramètres retirés de la surface publique ( voir le module ) : ils gardent leur
-    défaut mesuré, et la section du banc qui l'a mesuré est écrite à côté.
+    Exactly the parameters removed from the public surface ( see the module ) : they keep their
+    measured default, and the bench section that measured it is written next to it.
     """
 
     def __init__( self,
-                  # le pas, et le solveur linéaire -- `auto` = ce que le § 24.4 conclut
+                  # the step, and the linear solver -- `auto` = what § 24.4 concludes
                   step = "auto", linear_solver = "auto",
-                  # l'échelle de la continuation en largeur ( § 9.2 : le ratio sqrt( 2 ) est mesuré )
+                  # the scale of the width continuation ( § 9.2 : the ratio sqrt( 2 ) is measured )
                   conv_start = None, conv_ratio = 2 ** 0.5, conv_min = None, conv_threshold = 1e-2,
-                  # les garde-fous de l'amortissement ( § 3 : `restart_factor = 4` est mesuré )
+                  # the damping safeguards ( § 3 : `restart_factor = 4` is measured )
                   t_min = 1e-10, max_backtracks = 60, restart_factor = 4.0, mass_rtol = 0.0,
-                  # l'agrégation ( § 23.5 : le mal commence vers 0.2 % de l'espacement médian )
+                  # the aggregation ( § 23.5 : trouble starts around 0.2 % of the median spacing )
                   delta_aggregation = None,
-                  # la machine : l'accélérateur spatial, la mémoire des voisins ( § 11 ), le scratch ( § 18.2 )
+                  # the machine : the spatial accelerator, the neighbour memory ( § 11 ), the scratch ( § 18.2 )
                   accelerator = None, memory = None, scratch_capacity = None ):
         self.step              = step
         self.linear_solver     = linear_solver
@@ -91,44 +91,44 @@ class Tuning:
 
 
 class Iterative:
-    """Les réglages du RÉGIME ITÉRATIF ( `d >= 2`, `SdotPlanNd` ) -- et son type dit le régime.
+    """The settings of the ITERATIVE REGIME ( `d >= 2`, `SdotPlanNd` ) -- and its type says the regime.
 
-    `tol` : on s'arrête dès que `max_i | m_i - nu_i | <= tol`, ABSOLU, dans l'unité des masses
-    normalisées ( la masse cible d'un dirac est `1 / n` ). `max_iter` : pas de Newton, au plus.
+    `tol` : we stop as soon as `max_i | m_i - nu_i | <= tol`, ABSOLUTE, in the unit of the normalized
+    masses ( the target mass of a dirac is `1 / n` ). `max_iter` : Newton steps, at most.
 
-    `ot_plan` : LE DÉPART, sous la forme d'une SOLUTION précédente -- ce dont vit une reconstruction,
-    où un transport voisin coûte quelques pas de Newton au lieu de quelques dizaines. C'est un plan et
-    non un vecteur de poids, et c'est structurel : dès qu'il y a des germes confondus, les poids seuls
-    NE DÉCRIVENT PAS la solution ( § 23.11 -- c'est le couple ( problème réduit, plans de coupe ) qui
-    porte la précision ), donc un départ qui n'est que `w` perd l'agrégat. Un plan le porte, et il
-    porte aussi les POSITIONS pour lesquelles il a été résolu : quand elles n'ont pas changé, les
-    grappes n'ont pas à être redétectées ( ce que l'étape 7 exploitera ).
+    `ot_plan` : THE STARTING POINT, in the form of a previous SOLUTION -- what a reconstruction lives
+    on, where a neighbouring transport costs a few Newton steps instead of a few dozen. It is a plan and
+    not a weight vector, and that is structural : as soon as there are coincident seeds, the weights alone
+    DO NOT DESCRIBE the solution ( § 23.11 -- it is the pair ( reduced problem, cutting planes ) that
+    carries the precision ), so a starting point that is only `w` loses the aggregate. A plan carries it, and
+    it also carries the POSITIONS for which it was solved : when they have not changed, the
+    clusters need not be detected again ( which step 7 will exploit ).
 
-    `weights0` : les poids NUS, quand c'est tout ce qu'on a ( un fichier, un essai délibéré ).
-    `ot_plan` est la bonne façon ; donner les deux lève. Sans l'un ni l'autre, `OtProblem` propose la
-    dernière solution qu'il a rendue ( voir `OtProblem.solve` ). Un départ qui vide une cellule n'est
-    pas une erreur : le C++ compare lui-même les départs qu'il connaît et garde le meilleur
-    ( `stats[ "depart" ]`, et `stats[ "repris" ]` dit ce que le départ à chaud a fourni ).
+    `weights0` : the BARE weights, when that is all we have ( a file, a deliberate trial ).
+    `ot_plan` is the right way ; giving both raises. With neither, `OtProblem` proposes the
+    last solution it returned ( see `OtProblem.solve` ). A starting point that empties a cell is
+    not an error : the C++ itself compares the starting points it knows and keeps the best
+    ( `stats[ "start" ]`, and `stats[ "warm_start" ]` says what the warm start supplied ).
 
-    `continuation` : la CONTINUATION EN LARGEUR -- résoudre d'abord pour la densité convolée par une
-    gaussienne large, puis de plus en plus étroite, chaque étape partant des poids de la précédente.
-    C'est ce qu'il faut à une densité qui se concentre ( des bosses étroites, des déserts où des
-    cellules n'ont pas de masse, et où Newton direct STAGNE -- § 9.1 ). `"auto"` la déclenche quand
-    le départ laisse une cellule sans masse ; `"always"` / `"never"`.
+    `continuation` : the WIDTH CONTINUATION -- first solve for the density convolved with a wide
+    gaussian, then a narrower and narrower one, each step starting from the weights of the previous one.
+    This is what a concentrating density needs ( narrow bumps, deserts where cells have no mass, and where
+    direct Newton STAGNATES -- § 9.1 ). `"auto"` triggers it when the starting point leaves a cell
+    without mass ; `"always"` / `"never"`.
 
-    `precision` : le flottant dans lequel la géométrie se coupe. `"auto"` est `FP64` : le banc l'a
-    mesuré ( § 4 ), l'amortissement demande une décroissance stricte du résidu que le bruit d'une
-    aire en `float` refuse bien avant la tolérance. La bascule `fp32 -> fp64` est STRUCTURELLE
-    ( § 19.10 ) et appartient donc au C++, pas à l'appelant.
+    `precision` : the float in which the geometry is cut. `"auto"` is `FP64` : the bench measured it
+    ( § 4 ), damping requires a strict decrease of the residual that the noise of an area in `float`
+    refuses well before the tolerance. The `fp32 -> fp64` switch is STRUCTURAL
+    ( § 19.10 ) and therefore belongs to the C++, not to the caller.
 
-    `aggregate` : FUSIONNER les diracs trop proches avant de résoudre ( § 23.6 ). Allumé, parce que
-    l'alternative est un plancher SILENCIEUX vers `1e-6` sur un nuage dégénéré : sans lui,
-    `lignes sigma = 0.005` stagne à `2.35e-6` en 113 diagrammes ; avec, il converge à `2.00e-7` en
-    78. La détection coûte 4 % d'un diagramme en 2D, 1 % en 3D ( § 23.8 ). La solution porte alors
-    l'agrégat, et c'est pourquoi `SdotPlanNd` a des grappes même quand il n'y en a pas ( § 23.11 ).
+    `aggregate` : MERGE diracs that are too close before solving ( § 23.6 ). On, because
+    the alternative is a SILENT floor at `1e-6` on a degenerate cloud : without it,
+    `lines sigma = 0.005` stagnates at `2.35e-6` in 113 diagrams ; with it, it converges to `2.00e-7` in
+    78. Detection costs 4 % of a diagram in 2D, 1 % in 3D ( § 23.8 ). The solution then carries
+    the aggregate, which is why `SdotPlanNd` has clusters even when there are none ( § 23.11 ).
 
-    `keep_weights` : garder les poids de CHAQUE pas dans `history`, pour rejouer la descente ( un
-    tableau `[ pas, n ]`, qu'on ne veut pas toujours ).
+    `keep_weights` : keep the weights of EVERY step in `history`, to replay the descent ( an
+    array `[ step, n ]`, which one does not always want ).
     """
 
     regime = "iterative"
@@ -137,12 +137,12 @@ class Iterative:
                   continuation = "auto", precision = "auto", aggregate = True, keep_weights = False,
                   tuning = None ):
         if precision not in _PRECISIONS:
-            raise ValueError( f"precision inconnue : { precision !r } ( { ', '.join( _PRECISIONS ) } )" )
+            raise ValueError( f"unknown precision : { precision !r } ( { ', '.join( _PRECISIONS ) } )" )
         if continuation not in ( "auto", "always", "never" ):
-            raise ValueError( f"continuation inconnue : { continuation !r } ( 'auto', 'always' ou 'never' )" )
+            raise ValueError( f"unknown continuation : { continuation !r } ( 'auto', 'always' or 'never' )" )
         if ot_plan is not None and weights0 is not None:
-            raise ValueError( "Iterative : `ot_plan` ET `weights0` -- il n'y a qu'un depart. `ot_plan` "
-                              "est celui a garder ( il porte l'agregat et les positions, voir la docstring )" )
+            raise ValueError( "Iterative : `ot_plan` AND `weights0` -- there is only one starting point. `ot_plan` "
+                              "is the one to keep ( it carries the aggregate and the positions, see the docstring )" )
         self.ot_plan      = ot_plan
         self.tol          = float( tol )
         self.max_iter     = int( max_iter )
@@ -159,13 +159,13 @@ class Iterative:
 
 
 class Direct:
-    """Les réglages du RÉGIME DIRECT ( `d = 1`, `SdotPlan1d` ) -- et son type dit le régime.
+    """The settings of the DIRECT REGIME ( `d = 1`, `SdotPlan1d` ) -- and its type says the regime.
 
-    Il n'y a ni tolérance ni nombre d'itérations : la solution est un tri plus une inversion de
-    fonction de répartition, donc exacte. Reste à dire ce qu'on veut en SORTIR.
+    There is neither a tolerance nor a number of iterations : the solution is a sort plus an inversion of the
+    cumulative distribution function, hence exact. What remains is to say what we want as OUTPUT.
 
-    `with_barycenters` : produire ET stocker les barycentres ( `[ n, d ]` par élément de batch,
-    `80 Go` à l'échelle d'une reconstruction ). Éteint par défaut : l'adjoint sait les recalculer.
+    `with_barycenters` : produce AND store the barycenters ( `[ n, d ]` per batch element,
+    `80 GB` at the scale of a reconstruction ). Off by default : the adjoint knows how to recompute them.
     """
 
     regime = "direct"
@@ -175,56 +175,56 @@ class Direct:
 
 
 class OtProblem:
-    """voir la docstring du module"""
+    """see the module docstring"""
 
     def __init__( self, source, target ):
-        """`source` : la distribution DISCRÈTE -- une `SumOfDiracs` ( ou une `ProjectedSumOfDiracs` ) ;
-        ses `weights`, normalisés, sont les masses cibles des cellules.
+        """`source` : the DISCRETE distribution -- a `SumOfDiracs` ( or a `ProjectedSumOfDiracs` ) ;
+        its `weights`, normalized, are the target masses of the cells.
 
-        `target` : la distribution CONTINUE contre laquelle intégrer ( `Image`, `SumOfGaussians`, ... ).
+        `target` : the CONTINUOUS distribution to integrate against ( `Image`, `SumOfGaussians`, ... ).
 
-        LE DOMAINE VIENT DE `target`, ET D'ELLE SEULE : le support qu'elle déclare
-        ( `bounding_half_spaces` -- le pavé d'une image, `centres +- 6 sigma` pour des gaussiennes ),
-        qui doit être BORNÉ. Les diracs n'y sont pour rien : leurs cellules peuvent être loin d'eux.
-        Leur enveloppe ne sert qu'au DÉPART ( le recadrage ). C'est pourquoi `domain` est en LECTURE
-        SEULE -- il n'y a pas de second endroit où le dire."""
+        THE DOMAIN COMES FROM `target`, AND FROM IT ALONE : the support it declares
+        ( `bounding_half_spaces` -- the box of an image, `centers +- 6 sigma` for gaussians ),
+        which must be BOUNDED. The diracs have nothing to do with it : their cells can be far from them.
+        Their envelope is only used for the STARTING POINT ( the reframing ). This is why `domain` is
+        READ-ONLY -- there is no second place to state it."""
         if target is None:
-            raise ValueError( "OtProblem : il faut une cible -- c'est elle qui donne le domaine" )
-        self._last = None                                # la dernière solution rendue ( pas ses poids )
+            raise ValueError( "OtProblem : a target is needed -- it is what gives the domain" )
+        self._last = None                                # the last solution returned ( not its weights )
         self._source = None
         self._target = None
         self.source = source
         self.target = target
 
-    # -- les entrées, paramétrables -----------------------------------------------------------
+    # -- the inputs, adjustable ---------------------------------------------------------------
 
     @property
     def source( self ):
-        """la distribution discrète, normalisée"""
+        """the discrete distribution, normalized"""
         return self._source
 
     @source.setter
     def source( self, source ):
         if source is None:
-            raise ValueError( "OtProblem : il faut une source" )
+            raise ValueError( "OtProblem : a source is needed" )
         source = source.normalized_version()
-        # un nuage qui a changé de TAILLE périme la solution gardée ( un étage de multi-échelle )
+        # a cloud whose SIZE changed invalidates the kept solution ( a multi-scale stage )
         if self._source is not None and self._nb_diracs_of( source ) != self._nb_diracs_of( self._source ):
             self._last = None
         self._source = source
 
     @property
     def target( self ):
-        """la densité cible, normalisée -- et ce qui donne le domaine"""
+        """the target density, normalized -- and what gives the domain"""
         return self._target
 
     @target.setter
     def target( self, target ):
         if target is None:
-            raise ValueError( "OtProblem : il faut une cible -- c'est elle qui donne le domaine" )
+            raise ValueError( "OtProblem : a target is needed -- it is what gives the domain" )
         self._target = target.normalized_version()
 
-    # -- ce qui se LIT sur les entrées --------------------------------------------------------
+    # -- what can be READ off the inputs ------------------------------------------------------
 
     @property
     def nb_dims( self ):
@@ -236,14 +236,14 @@ class OtProblem:
 
     @property
     def regime( self ):
-        """`"direct"` ( un tri, `d = 1` ) ou `"iterative"` ( un Newton amorti, `d >= 2` ) -- DÉDUIT,
-        jamais choisi. Voir la docstring du module."""
+        """`"direct"` ( a sort, `d = 1` ) or `"iterative"` ( a damped Newton, `d >= 2` ) -- DEDUCED,
+        never chosen. See the module docstring."""
         return "direct" if self.nb_dims == 1 else "iterative"
 
     @property
     def domain( self ):
-        """Le domaine, en demi-espaces `( directions, offsets )` : `direction . x <= offset`. Il vient
-        du support que la CIBLE déclare, et d'elle seule. Lève si ce support ne borne pas."""
+        """The domain, as half-spaces `( directions, offsets )` : `direction . x <= offset`. It comes
+        from the support that the TARGET declares, and from it alone. Raises if this support does not bound it."""
         d = self.nb_dims
         support = self._target.bounding_half_spaces()
         if support is not None:
@@ -251,56 +251,56 @@ class OtProblem:
             offs = np.asarray( support[ 1 ], dtype = float ).reshape( -1 )
             if self._bounds( dirs, offs, d ):
                 return dirs, offs
-        raise ValueError( "OtProblem : le support de la cible ne borne pas le domaine "
-                          "( `bounding_half_spaces` ) -- c'est a la cible de le declarer "
+        raise ValueError( "OtProblem : the support of the target does not bound the domain "
+                          "( `bounding_half_spaces` ) -- it is up to the target to declare it "
                           "( `SumOfGaussians( support_sigmas = ... )` )" )
 
-    # -- resoudre ------------------------------------------------------------------------------
+    # -- solving -------------------------------------------------------------------------------
 
     def solve( self, settings = None, verbose = False ):
-        """La SOLUTION : un `SdotPlan1d` si le régime est direct, un `SdotPlanNd` s'il est itératif.
+        """The SOLUTION : a `SdotPlan1d` if the regime is direct, a `SdotPlanNd` if it is iterative.
 
-        `settings` : `None` pour les défauts du régime, ou un `Direct` / `Iterative` -- et son TYPE
-        doit être celui du régime, sans quoi on lève ( voir la docstring du module ).
+        `settings` : `None` for the regime's defaults, or a `Direct` / `Iterative` -- and its TYPE
+        must be that of the regime, otherwise this raises ( see the module docstring ).
 
-        Un `Iterative` qui n'impose pas de départ ( ni `ot_plan` ni `weights0` ) repart de la
-        dernière SOLUTION de CE problème, quand il y en a une et que le nombre de diracs n'a pas
-        changé : c'est ce dont vit une reconstruction, et ça n'a plus à être recopié à la main par
-        l'appelant."""
+        An `Iterative` that does not impose a starting point ( neither `ot_plan` nor `weights0` ) restarts from the
+        last SOLUTION of THIS problem, when there is one and the number of diracs has not
+        changed : this is what a reconstruction lives on, and it no longer has to be copied by hand
+        by the caller."""
         regime = self.regime
         if settings is None:
             settings = { "direct": Direct, "iterative": Iterative }[ regime ]()
         elif getattr( settings, "regime", None ) != regime:
             want = { "direct": "Direct", "iterative": "Iterative" }[ regime ]
-            raise TypeError( f"OtProblem.solve : ce probleme se resout en regime { regime !r } "
-                             f"( nb_dims = { self.nb_dims } ), donc ses reglages sont un `{ want }` "
-                             f"et non un `{ type( settings ).__name__ }` -- voir la docstring de `OtProblem`" )
+            raise TypeError( f"OtProblem.solve : this problem is solved in regime { regime !r } "
+                             f"( nb_dims = { self.nb_dims } ), so its settings are a `{ want }` "
+                             f"and not a `{ type( settings ).__name__ }` -- see the docstring of `OtProblem`" )
 
         if regime == "direct":
             from .SdotPlan1d import SdotPlan1d
             return SdotPlan1d._solve( self, settings, verbose )
 
         from .SdotPlanNd import SdotPlanNd
-        # le RE-ECHAUFFEMENT : la derniere SOLUTION, quand l'appelant n'impose pas de depart.
-        # Un plan et non des poids -- il porte l'agregat, que `w` seul ne sait pas decrire
-        # ( README § 23.11 ). Passe a part, et non ecrit dans `settings` : un objet de reglages que
-        # l'appelant garde ne doit pas se mettre a porter l'etat du probleme.
+        # the WARM RE-START : the last SOLUTION, when the caller does not impose a starting point.
+        # A plan and not weights -- it carries the aggregate, which `w` alone cannot describe
+        # ( README § 23.11 ). Passed separately, and not written into `settings` : a settings object that
+        # the caller keeps must not start carrying the state of the problem.
         sol = SdotPlanNd._solve( self, settings, verbose, warm = self._last )
         self._last = sol
         return sol
 
-    # -- les détails -----------------------------------------------------------------------------
+    # -- the details -----------------------------------------------------------------------------
 
     @staticmethod
     def _nb_diracs_of( dist ):
         if not getattr( dist, "_is_dirac_source", False ):
-            raise TypeError( f"OtProblem : { type( dist ).__name__ } n'est pas une source discrete "
-                             "-- c'est la source qui porte les masses cibles des cellules" )
+            raise TypeError( f"OtProblem : { type( dist ).__name__ } is not a discrete source "
+                             "-- it is the source that carries the target masses of the cells" )
         return int( dist.nb_diracs.value )
 
     def _bounds( self, dirs, offs, d ):
-        """Est-ce que ces demi-espaces bornent ? Un pavé se reconnaît sans rien construire ; sinon on
-        monte le polytope pour le savoir ( quelques plans, côté hôte )."""
+        """Do these half-spaces bound ? A box is recognized without building anything ; otherwise we
+        build the polytope to find out ( a few planes, host side )."""
         from .PowerDiagram import axis_aligned_box
         if axis_aligned_box( dirs, offs ) is not None:
             return True
@@ -311,45 +311,45 @@ class OtProblem:
         return bool( dom.is_bounded )
 
 
-# -- LE RACCOURCI ------------------------------------------------------------------------------
+# -- THE SHORTCUT ------------------------------------------------------------------------------
 
 def ot_solve( source, target, *, verbose = False, **settings ):
-    """Poser le problème et le résoudre, en une expression -- pour un transport qu'on ne résout
-    QU'UNE FOIS.
+    """Pose the problem and solve it, in one expression -- for a transport that is solved
+    ONLY ONCE.
 
         sol = ot_solve( SumOfDiracs( pos ), image )
-        sol = ot_solve( SumOfDiracs( pos ), image, tol = 1e-10 )     # d >= 2 : un `Iterative`
-        sol = ot_solve( SumOfDiracs( pos2 ), image, ot_plan = sol )   # en repartant du plan d'avant
-        sol = ot_solve( diracs_1d, image_1d, with_barycenters = True )   # d = 1 : un `Direct`
+        sol = ot_solve( SumOfDiracs( pos ), image, tol = 1e-10 )     # d >= 2 : an `Iterative`
+        sol = ot_solve( SumOfDiracs( pos2 ), image, ot_plan = sol )   # restarting from the previous plan
+        sol = ot_solve( diracs_1d, image_1d, with_barycenters = True )   # d = 1 : a `Direct`
 
-    Les réglages se donnent ici en MOTS-CLEFS, et non comme un objet : le régime est déduit des
-    entrées (voir la docstring du module), donc la classe de réglages qui les reçoit l'est aussi.
-    Un nom qui n'appartient pas au régime lève, en disant lequel c'est et ce qu'il accepte --
-    jamais ignoré en silence.
+    The settings are given here as KEYWORDS, and not as an object : the regime is deduced from the
+    inputs (see the module docstring), so the settings class that receives them is too.
+    A name that does not belong to the regime raises, saying which one it is and what it accepts --
+    never silently ignored.
 
-    Pour repartir d'une résolution précédente, `ot_plan = la_solution_d_avant` -- un PLAN et non des
-    poids, parce que les poids seuls ne décrivent pas une solution dès qu'il y a des germes confondus
-    ( voir `Iterative` ).
+    To restart from a previous solve, `ot_plan = the_previous_solution` -- a PLAN and not
+    weights, because weights alone do not describe a solution as soon as there are coincident seeds
+    ( see `Iterative` ).
 
-    **Mais dans une boucle, garder le problème est mieux.** Il propose la dernière solution tout seul,
-    il la périme tout seul quand le nuage change de taille, et c'est un `ot_plan` de moins à faire
-    circuler. Une reconstruction, une descente, un balayage de paramètre gardent donc le problème et
-    rebranchent ses entrées :
+    **But in a loop, keeping the problem is better.** It proposes the last solution by itself,
+    it invalidates it by itself when the cloud changes size, and it is one fewer `ot_plan` to
+    pass around. A reconstruction, a descent, a parameter sweep therefore keep the problem and
+    rewire its inputs :
 
         pb = OtProblem( SumOfDiracs( pos ), image )
-        for _ in range( nb_pas ):
-            sol = pb.solve()                      # repart des poids d'avant
-            pb.source = SumOfDiracs( deplace( pos, sol ) )
+        for _ in range( nb_steps ):
+            sol = pb.solve()                      # restarts from the previous weights
+            pb.source = SumOfDiracs( move( pos, sol ) )
 
-    `ot_solve` refait un `OtProblem` neuf à chaque appel : sans `ot_plan`, il repart de zéro."""
+    `ot_solve` builds a fresh `OtProblem` at each call : without `ot_plan`, it restarts from zero."""
     pb = OtProblem( source, target )
     cls = { "direct": Direct, "iterative": Iterative }[ pb.regime ]
     try:
-        reglages = cls( **settings )
+        solver_settings = cls( **settings )
     except TypeError as e:
         import inspect
-        noms = [ n for n in inspect.signature( cls ).parameters if n != "self" ]
-        raise TypeError( f"ot_solve : ce probleme se resout en regime { pb.regime !r } "
-                         f"( nb_dims = { pb.nb_dims } ), donc ses reglages sont ceux de `{ cls.__name__ }` "
-                         f"( { ', '.join( noms ) } ) -- { e }" ) from None
-    return pb.solve( reglages, verbose )
+        names = [ n for n in inspect.signature( cls ).parameters if n != "self" ]
+        raise TypeError( f"ot_solve : this problem is solved in regime { pb.regime !r } "
+                         f"( nb_dims = { pb.nb_dims } ), so its settings are those of `{ cls.__name__ }` "
+                         f"( { ', '.join( names ) } ) -- { e }" ) from None
+    return pb.solve( solver_settings, verbose )

@@ -25,8 +25,8 @@ def cost_1d_ot( proj, weights, values, s_min, dw ):
     scale). `values`: [m] target bin densities (any positive scale, piecewise-constant over
     bins of width `dw` starting at `s_min`). Both sides are normalized to mass 1 internally,
     matching `SdotPlan1d.cost`'s semantics. Returns a scalar."""
-    # des tableaux du backend, quoi qu'on ait reçu : sous `lax.map` les indices sont des traceurs,
-    # et un `numpy.ndarray` indexé par un traceur essaie de le convertir ( `__array__` )
+    # backend arrays, whatever we received: under `lax.map` the indices are tracers,
+    # and a `numpy.ndarray` indexed by a tracer tries to convert it ( `__array__` )
     proj, weights, values = jnp.asarray( proj ), jnp.asarray( weights ), jnp.asarray( values )
     m = values.shape[ 0 ]
     w_norm = weights / jnp.sum( weights )

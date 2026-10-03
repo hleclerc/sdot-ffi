@@ -8,106 +8,106 @@ class Distribution( Aggregate ):
     Subclasses should override `measure` (property) to return the total mass.
     Supports automatic normalization via `normalized_version()` when `target_mass` is set.
 
-    = Intégrer une CELLULE contre une distribution -- le contrat côté kernel
+    = Integrating a CELL against a distribution -- the kernel-side contract
 
-    Une distribution peut servir de MESURE à `PowerDiagram.measures` : au lieu du volume de la
-    cellule, on veut alors l'intégrale de la densité dessus. Le partage est le même que pour les
-    accélérateurs spatiaux (voir `SpatialAccelerator.py`) : la distribution sait DÉCOUPER, le
-    diagramme sait ce qu'on calcule SUR un morceau -- et c'est ce qui fait qu'une image, une somme
-    de gaussiennes, ou rien du tout, se branchent au même endroit sans un second intégrateur.
+    A distribution can serve as a MEASURE for `PowerDiagram.measures` : instead of the volume of the
+    cell, we then want the integral of the density over it. The split is the same as for the spatial
+    accelerators (see `SpatialAccelerator.py`) : the distribution knows how to CUT, the
+    diagram knows what is computed ON a piece -- and this is what lets an image, a sum
+    of gaussians, or nothing at all, plug in at the same place without a second integrator.
 
-    La classe C++ homonyme doit donc offrir :
+    The C++ class of the same name must therefore offer :
 
         void for_each_piece( const auto &cell, auto &&ws, auto &&func ) const;
 
-    qui découpe `cell` en morceaux sur lesquels la densité est SIMPLE et appelle, pour chacun :
+    which cuts `cell` into pieces on which the density is SIMPLE and calls, for each one :
 
         func( piece, density )
 
-      * `piece`   -- un polytope convexe (une `Cell`), le morceau. Ses coupes gardent le `cut_id`
-                     qu'elles avaient dans la cellule (donc l'indice du germe qu'elles font face) ;
-                     celles que le découpage ajoute portent `BOUNDARY`, c.-à-d. « pas un germe ».
-                     C'est cette seule propriété qui permet à l'adjoint de traiter un morceau
-                     exactement comme une cellule (`PowerDiagram::integrate_bwd_into`).
-      * `density` -- COMMENT ce morceau s'intègre. Deux formes, distinguées à la COMPILATION par
-                     `density.is_constant` :
+      * `piece`   -- a convex polytope (a `Cell`), the piece. Its cuts keep the `cut_id`
+                     they had in the cell (hence the index of the seed they face) ;
+                     those added by the cutting carry `BOUNDARY`, i.e. "not a seed".
+                     This property alone is what lets the adjoint treat a piece
+                     exactly like a cell (`PowerDiagram::integrate_bwd_into`).
+      * `density` -- HOW this piece is integrated. Two forms, distinguished at COMPILE TIME
+                     by `density.is_constant` :
 
-    1. `is_constant == true` : `density.value` est la densité, constante sur le morceau, et
-       `density.add_value_grad( grad_dist, g )` dit où ranger `g = d(sortie)/d(cette valeur)` -- la
-       masse étant linéaire en elle, l'intégrateur passe le VOLUME du morceau, et la distribution
-       seule sait dans quelle case de ses paramètres ça tombe. C'est `ConstantDensity`, ce que
-       rendent une image (une case de `values` par pavé) et la densité unité (aucune case).
-       L'intégration est alors exacte et ne coûte rien : `valeur * mesure`.
+    1. `is_constant == true` : `density.value` is the density, constant over the piece, and
+       `density.add_value_grad( grad_dist, g )` says where to put `g = d(output)/d(this value)` -- the
+       mass being linear in it, the integrator passes the VOLUME of the piece, and only the distribution
+       knows which slot of its parameters it falls into. This is `ConstantDensity`, what
+       an image returns (one slot of `values` per box) and the unit density (no slot).
+       The integration is then exact and costs nothing : `value * measure`.
 
-    2. `is_constant == false` : la densité S'INTÈGRE ELLE-MÊME, sur un simplexe --
+    2. `is_constant == false` : the density INTEGRATES ITSELF, over a simplex --
 
            TF   integrate_over_simplex    ( const auto &pts ) const;
            void integrate_over_simplex_bwd( const auto &pts, TF g, auto &&grad_pts,
                                             auto &&grad_dist ) const;
 
-       `pts` sont les `d + 1` sommets, `grad_pts` la cotangente à y accumuler (l'intégrateur la
-       recolle sur les sommets du morceau, puis `scatter_cell_grad` remonte aux germes comme
-       toujours), `grad_dist` celle des paramètres de la densité.
+       `pts` are the `d + 1` vertices, `grad_pts` the cotangent to accumulate into (the integrator
+       glues it back onto the vertices of the piece, then `scatter_cell_grad` goes up to the seeds
+       as usual), `grad_dist` that of the density parameters.
 
-    L'INTÉGRATEUR N'ÉCRIT AUCUNE RÈGLE D'INTÉGRATION. Il apporte le découpage géométrique en
-    simplices (`Cell::for_each_simplex`, en toute dimension) et rien d'autre. Une densité qui a une
-    formule fermée sur un simplexe -- ou une réduction à une fonction spéciale -- la donne, et elle
-    est exacte. Une qui n'est qu'une BOÎTE NOIRE (une fonction écrite ailleurs, une gaussienne dont
-    on n'a pas dérivé la formule) s'emballe dans `PointwiseDensity`, qui implémente le même contrat
-    par quadrature à partir de `value_at` / `gradient_at` / `add_value_grad_at` :
+    THE INTEGRATOR WRITES NO INTEGRATION RULE. It brings the geometric cutting into
+    simplices (`Cell::for_each_simplex`, in any dimension) and nothing else. A density that has a
+    closed formula on a simplex -- or a reduction to a special function -- supplies it, and it is
+    exact. One that is only a BLACK BOX (a function written elsewhere, a gaussian whose
+    formula has not been derived) is wrapped in `PointwiseDensity`, which implements the same contract
+    by quadrature from `value_at` / `gradient_at` / `add_value_grad_at` :
 
         void for_each_piece( const auto &cell, auto &&, auto &&func ) const {
             func( cell, PointwiseDensity{ *this } );
         }
 
-    La quadrature n'est donc pas un régime de l'intégrateur : c'est UNE implémentation du contrat,
-    à côté des formules exactes, et le choix appartient à la densité.
+    Quadrature is therefore not a regime of the integrator : it is ONE implementation of the contract,
+    next to the exact formulas, and the choice belongs to the density.
 
-    « Pas de distribution » est un cas ordinaire du même code, pas une absence de code : c'est
-    `UnitDensity` (densité 1, un seul morceau, la cellule), fabriqué côté C++ par
-    `PowerDiagram::unit_density()` -- comme `EverySeed` l'est pour les accélérateurs.
+    "No distribution" is an ordinary case of the same code, not an absence of code : it is
+    `UnitDensity` (density 1, a single piece, the cell), built C++ side by
+    `PowerDiagram::unit_density()` -- as `EverySeed` is for the accelerators.
 
-    = Le SCRATCH, et pourquoi il ne passe pas par ici
+    = The SCRATCH, and why it does not go through here
 
-    Découper demande de la place : `Cell::cut` écrit dans une cellule SÉPARÉE, donc une suite de
-    coupes fait la navette entre deux tampons. Ces deux tampons-là (plus la table de compaction du
-    régime d > 2) sont fournis par l'APPELANT, dans `ws` -- un `PieceWorkspace` (voir
-    `PieceWorkspace.h`), que `PowerDiagram.measures` alloue par work-item comme tout le reste.
+    Cutting needs room : `Cell::cut` writes into a SEPARATE cell, so a sequence of
+    cuts shuttles between two buffers. These two buffers (plus the compaction table of the
+    d > 2 regime) are supplied by the CALLER, in `ws` -- a `PieceWorkspace` (see
+    `PieceWorkspace.h`), which `PowerDiagram.measures` allocates per work-item like everything else.
 
-    Une distribution ne demande donc pas de la mémoire : elle dit seulement, DEPUIS PYTHON,
-    combien de coupes de plus qu'une cellule un de ses morceaux peut porter
-    (`extra_cuts_per_piece`), et ces cellules-là sont dimensionnées en conséquence. Une taille de
-    tampon n'est pas une décision de kernel : c'est ce que la plateforme doit savoir AVANT
-    d'allouer, donc ça se dit d'ici.
+    A distribution therefore does not ask for memory : it only says, FROM PYTHON,
+    how many more cuts than a cell one of its pieces can carry
+    (`extra_cuts_per_piece`), and those cells are sized accordingly. A buffer size
+    is not a kernel decision : it is what the platform must know BEFORE
+    allocating, so it is said from here.
     """
 
     def bounding_half_spaces( self ):
-        """Le SUPPORT de la distribution, en demi-espaces `direction . x <= offset`, ou `None`.
+        """The SUPPORT of the distribution, as half-spaces `direction . x <= offset`, or `None`.
 
-        Une densité à support compact (une image) borne les cellules pour rien : tout ce qui
-        dépasse son support n'apporte aucune masse, donc le couper ne change PAS le résultat --
-        c'est une identité, pas une approximation. `PowerDiagram` ajoute donc ces demi-espaces aux
-        siens (voir son `__init__`), et il y gagne trois choses : les cellules du bord cessent
-        d'être infinies, le test d'élagage d'un accélérateur redevient utilisable
-        (`cell_may_be_cut` n'a rien à mordre sur une cellule infinie), et le découpage n'a plus à
-        balayer toute la grille faute de boîte englobante (`Image::_for_each_piece`).
+        A compact-support density (an image) bounds cells for nothing : everything that
+        goes beyond its support brings no mass, so cutting it does NOT change the result --
+        it is an identity, not an approximation. `PowerDiagram` therefore adds these half-spaces to
+        its own (see its `__init__`), and gains three things : the border cells stop
+        being infinite, the pruning test of an accelerator becomes usable again
+        (`cell_may_be_cut` has nothing to bite on an infinite cell), and the cutting no longer has to
+        sweep the whole grid for lack of a bounding box (`Image::_for_each_piece`).
 
-        `None` (le défaut) dit « support non borné », ce qui est le cas d'une somme de gaussiennes :
-        la tronquer perdrait de la masse, donc on ne le fait pas dans son dos -- c'est alors à
-        l'appelant de donner un `box` s'il en veut un.
+        `None` (the default) says "unbounded support", which is the case of a sum of gaussians :
+        truncating it would lose mass, so we do not do it behind its back -- it is then up to the
+        caller to give a `box` if they want one.
 
-        Renvoie `None` aussi quand la géométrie n'est pas lisible côté hôte (sous `jit`) : borner
-        est une OPTIMISATION, et une optimisation qui ne peut pas se faire ne doit pas casser
-        l'appel."""
+        Also returns `None` when the geometry is not readable host side (under `jit`) : bounding
+        is an OPTIMIZATION, and an optimization that cannot be done must not break
+        the call."""
         return None
 
     def extra_cuts_per_piece( self, nb_dims ):
-        """Combien de coupes de plus qu'une cellule un MORCEAU peut porter.
+        """How many more cuts than a cell a PIECE can carry.
 
-        `0` (le défaut) dit « le morceau EST la cellule » : aucun découpage, donc pas de cellules
-        de rechange à allouer. Une image découpe par les 2d plans d'un pavé de sa grille, donc
-        `2 * nb_dims`. C'est la SEULE information de dimensionnement que le contrat demande ; voir
-        la docstring de la classe pour pourquoi elle passe par Python et pas par le kernel."""
+        `0` (the default) says "the piece IS the cell" : no cutting, hence no spare cells
+        to allocate. An image cuts by the 2d planes of a box of its grid, hence
+        `2 * nb_dims`. This is the ONLY sizing information that the contract asks for ; see
+        the class docstring for why it goes through Python and not through the kernel."""
         return 0
 
     # current_mass   : Tensor...

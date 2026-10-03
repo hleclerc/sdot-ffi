@@ -6,16 +6,16 @@ from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOf
                    box_half_spaces, ot_solve, write_convergence_html )
 
 
-# le domaine VIENT DE LA DENSITÉ, et d'elle seule : le pavé d'une image, `centres +- 6 sigma` pour des
-# gaussiennes ( `SumOfGaussians.bounding_half_spaces` ). La masse hors du domaine est PERDUE ( 2e-9
-# à 6 sigma ), et le solveur remet les masses cibles à l'échelle de ce que le domaine contient
-# ( `sdotplan/Solve.h` ). `atol` des tests : la masse cible d'un dirac est `1 / n`, et Newton converge
-# au bruit du noyau.
+# the domain COMES FROM THE DENSITY, and from it alone: the tile of an image, `centers +- 6 sigma` for
+# Gaussians ( `SumOfGaussians.bounding_half_spaces` ). The mass outside the domain is LOST ( 2e-9
+# at 6 sigma ), and the solver rescales the target masses to what the domain contains
+# ( `sdotplan/Solve.h` ). `atol` in the tests: the target mass of a dirac is `1 / n`, and Newton converges
+# down to the kernel noise.
 
 
 def _overlapping_target( d, nb_gaussians, seed, spread = 0.12 ):
-    """Quelques gaussiennes PROCHES les unes des autres plutôt que des bosses séparées : leur
-    densité combinée ne s'annule nulle part sur la zone utile -- le cas DOUX."""
+    """A few Gaussians CLOSE to one another rather than separate bumps: their
+    combined density vanishes nowhere on the useful area -- the SOFT case."""
     rng = numpy.random.default_rng( seed )
     center = numpy.full( d, 0.5 )
     pos = center + rng.uniform( -spread, spread, size = ( nb_gaussians, d ) )
@@ -25,9 +25,9 @@ def _overlapping_target( d, nb_gaussians, seed, spread = 0.12 ):
 
 
 def _scattered_target( d, nb_gaussians, seed, sigma = 0.13 ):
-    """Des bosses ÉTROITES et SÉPARÉES sur tout `[ 0.3, 0.7 ]^d` -- le cas DUR : un dirac tiré
-    uniformément a de bonnes chances de tomber dans un DÉSERT de densité, entre deux bosses. C'est
-    là que l'amortissement de KMT ( le plancher de masse ) travaille."""
+    """NARROW, SEPARATE bumps over all of `[ 0.3, 0.7 ]^d` -- the HARD case: a dirac drawn
+    uniformly has a good chance of landing in a density DESERT, between two bumps. This is
+    where KMT's damping ( the mass floor ) does its work."""
     rng = numpy.random.default_rng( seed )
     pos = rng.uniform( 0.3, 0.7, size = ( nb_gaussians, d ) )
     sigmas = numpy.full( nb_gaussians, sigma )
@@ -40,9 +40,9 @@ def _target_masses( plan ):
 
 
 if test( "newton_matches_the_target_masses" ):
-    # le test de base : les masses des CELLULES, une fois l'ajustement fini, doivent retomber sur
-    # les masses des DIRACS -- c'est la seule chose que `SdotPlanNd` promet. UNE gaussienne, large et
-    # bien centrée sur le nuage de diracs : le cas le plus simple, sans aucun désert de densité.
+    # the basic test: the masses of the CELLS, once the fit is done, must fall back on
+    # the masses of the DIRACS -- this is the only thing `SdotPlanNd` promises. ONE Gaussian, wide and
+    # well centered on the cloud of diracs: the simplest case, with no density desert at all.
     rng = numpy.random.default_rng( 3 )
     pos = rng.uniform( 0.15, 0.85, size = ( 20, 2 ) )
     src = SumOfDiracs( pos )
@@ -54,81 +54,81 @@ if test( "newton_matches_the_target_masses" ):
     assert plan.converged, plan.stats
     got = numpy.asarray( plan.cell_masses ).reshape( -1 )
     assert numpy.allclose( got, _target_masses( plan ), atol = 1e-10 ), numpy.abs( got - _target_masses( plan ) ).max()
-    # la masse cible est celle des diracs, à la queue au-delà de 6 sigma près
-    assert abs( plan.stats[ "masse_domaine" ] - 1 ) < 1e-7, plan.stats[ "masse_domaine" ]
+    # the target mass is that of the diracs, up to the tail beyond 6 sigma
+    assert abs( plan.stats[ "domain_mass" ] - 1 ) < 1e-7, plan.stats[ "domain_mass" ]
 
 
 if test( "ot_solve_and_the_warm_start_is_a_PLAN_not_weights" ):
-    # `ot_solve` n'est QUE le raccourci : même plan, aux derniers chiffres près. Et le départ à chaud
-    # est un PLAN -- soit donné par `ot_plan`, soit proposé par l'`OtProblem` qui garde sa dernière
-    # solution. Un plan et non des poids : dès qu'il y a des germes confondus, `w` seul ne décrit pas
-    # la solution ( README § 23.11 ), et le plan porte aussi de quoi ne pas redétecter les grappes.
+    # `ot_solve` is ONLY the shortcut: same plan, up to the last digits. And the warm start
+    # is a PLAN -- either given through `ot_plan`, or proposed by the `OtProblem` which keeps its last
+    # solution. A plan and not weights: as soon as there are coincident seeds, `w` alone does not describe
+    # the solution ( README § 23.11 ), and the plan also carries what is needed not to re-detect the clusters.
     rng = numpy.random.default_rng( 7 )
     pos = rng.uniform( 0.15, 0.85, size = ( 30, 2 ) )
     dst = SumOfGaussians( numpy.array( [ [ 0.5, 0.5 ] ] ), numpy.array( [ 0.2 ] ), weights = numpy.array( [ 1.0 ] ) )
 
     direct = OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 50, tol = 1e-12 ) )
-    court  = ot_solve( SumOfDiracs( pos ), dst, max_iter = 50, tol = 1e-12 )
-    assert court.converged, court.stats
-    assert numpy.allclose( numpy.asarray( court.weights ), numpy.asarray( direct.weights ), atol = 1e-12 )
-    assert court.stats[ "nb_diag" ] == direct.stats[ "nb_diag" ], ( court.stats[ "nb_diag" ], direct.stats[ "nb_diag" ] )
+    shortcut  = ot_solve( SumOfDiracs( pos ), dst, max_iter = 50, tol = 1e-12 )
+    assert shortcut.converged, shortcut.stats
+    assert numpy.allclose( numpy.asarray( shortcut.weights ), numpy.asarray( direct.weights ), atol = 1e-12 )
+    assert shortcut.stats[ "nb_diag" ] == direct.stats[ "nb_diag" ], ( shortcut.stats[ "nb_diag" ], direct.stats[ "nb_diag" ] )
 
-    # le RÉ-ÉCHAUFFEMENT est au problème, pas au raccourci : un nuage à peine déplacé repart des
-    # poids d'avant si on garde le problème, et de zéro si on ne le garde pas.
-    bouge = pos + 1e-4 * rng.normal( size = pos.shape )
+    # the RE-WARMING belongs to the problem, not to the shortcut: a barely moved cloud restarts from the
+    # previous weights if we keep the problem, and from zero if we do not.
+    moved = pos + 1e-4 * rng.normal( size = pos.shape )
     pb = OtProblem( SumOfDiracs( pos ), dst )
     pb.solve( Iterative( max_iter = 50, tol = 1e-12 ) )
-    pb.source = SumOfDiracs( bouge )
-    chaud = pb.solve( Iterative( max_iter = 50, tol = 1e-12 ) )
-    froid = ot_solve( SumOfDiracs( bouge ), dst, max_iter = 50, tol = 1e-12 )
-    assert chaud.stats[ "depart" ] == "weights0", chaud.stats[ "depart" ]
-    assert froid.stats[ "depart" ] == "voronoi", froid.stats[ "depart" ]
-    assert chaud.stats[ "nb_diag" ] < froid.stats[ "nb_diag" ], ( chaud.stats[ "nb_diag" ], froid.stats[ "nb_diag" ] )
-    assert numpy.allclose( numpy.asarray( chaud.weights ), numpy.asarray( froid.weights ), atol = 1e-8 )
+    pb.source = SumOfDiracs( moved )
+    rewarmed = pb.solve( Iterative( max_iter = 50, tol = 1e-12 ) )
+    cold = ot_solve( SumOfDiracs( moved ), dst, max_iter = 50, tol = 1e-12 )
+    assert rewarmed.stats[ "start" ] == "weights0", rewarmed.stats[ "start" ]
+    assert cold.stats[ "start" ] == "voronoi", cold.stats[ "start" ]
+    assert rewarmed.stats[ "nb_diag" ] < cold.stats[ "nb_diag" ], ( rewarmed.stats[ "nb_diag" ], cold.stats[ "nb_diag" ] )
+    assert numpy.allclose( numpy.asarray( rewarmed.weights ), numpy.asarray( cold.weights ), atol = 1e-8 )
 
-    # `ot_plan` : le départ EST un plan, et il donne le même résultat que le problème gardé
-    repris = ot_solve( SumOfDiracs( bouge ), dst, ot_plan = direct, max_iter = 50, tol = 1e-12 )
-    assert repris.stats[ "repris" ] == "ot_plan", repris.stats[ "repris" ]
-    assert repris.stats[ "depart" ] == "weights0", repris.stats[ "depart" ]
-    assert repris.stats[ "nb_diag" ] == chaud.stats[ "nb_diag" ], ( repris.stats[ "nb_diag" ], chaud.stats[ "nb_diag" ] )
-    assert froid.stats[ "repris" ] == "rien", froid.stats[ "repris" ]
+    # `ot_plan`: the start IS a plan, and it gives the same result as the kept problem
+    resumed = ot_solve( SumOfDiracs( moved ), dst, ot_plan = direct, max_iter = 50, tol = 1e-12 )
+    assert resumed.stats[ "warm_start" ] == "ot_plan", resumed.stats[ "warm_start" ]
+    assert resumed.stats[ "start" ] == "weights0", resumed.stats[ "start" ]
+    assert resumed.stats[ "nb_diag" ] == rewarmed.stats[ "nb_diag" ], ( resumed.stats[ "nb_diag" ], rewarmed.stats[ "nb_diag" ] )
+    assert cold.stats[ "warm_start" ] == "none", cold.stats[ "warm_start" ]
 
-    # un plan qui ne porte pas le bon nombre de poids ne peut pas servir : IMPOSÉ, ça lève ( l'appelant
-    # croit repartir à chaud ) ; proposé par le problème, c'est abandonné et DIT
+    # a plan that does not carry the right number of weights cannot be used: IMPOSED, it raises ( the caller
+    # believes it is restarting warm ); proposed by the problem, it is dropped and REPORTED
     try:
         ot_solve( SumOfDiracs( pos[ :20 ] ), dst, ot_plan = direct )
     except ValueError as e:
         assert "ot_plan" in str( e ), str( e )
     else:
-        raise AssertionError( "un ot_plan de la mauvaise taille aurait du lever" )
+        raise AssertionError( "an ot_plan of the wrong size should have raised" )
     pb2 = OtProblem( SumOfDiracs( pos ), dst )
     pb2.solve( Iterative( max_iter = 50, tol = 1e-12 ) )
-    pb2.source = SumOfDiracs( pos[ :20 ] )                        # un étage de multi-échelle
-    moins = pb2.solve( Iterative( max_iter = 50, tol = 1e-12 ) )
-    assert moins.stats[ "repris" ] == "rien", moins.stats[ "repris" ]
-    assert moins.stats[ "depart" ] == "voronoi", moins.stats[ "depart" ]
+    pb2.source = SumOfDiracs( pos[ :20 ] )                        # a multiscale stage
+    smaller = pb2.solve( Iterative( max_iter = 50, tol = 1e-12 ) )
+    assert smaller.stats[ "warm_start" ] == "none", smaller.stats[ "warm_start" ]
+    assert smaller.stats[ "start" ] == "voronoi", smaller.stats[ "start" ]
 
-    # les deux départs à la fois n'ont pas de sens
+    # both starts at once make no sense
     try:
         Iterative( ot_plan = direct, weights0 = numpy.zeros( len( pos ) ) )
     except ValueError as e:
         assert "ot_plan" in str( e ), str( e )
     else:
-        raise AssertionError( "ot_plan ET weights0 aurait du lever" )
+        raise AssertionError( "ot_plan AND weights0 should have raised" )
 
-    # un réglage qui n'est pas de ce régime-là se DIT, il n'est pas ignoré
+    # a setting that does not belong to this regime is REPORTED, not ignored
     try:
         ot_solve( SumOfDiracs( pos ), dst, with_barycenters = True )
     except TypeError as e:
         assert "Iterative" in str( e ), str( e )
     else:
-        raise AssertionError( "`with_barycenters` appartient au regime direct : ot_solve aurait du lever" )
+        raise AssertionError( "`with_barycenters` belongs to the direct regime: ot_solve should have raised" )
 
 
 if test( "starting_from_nonzero_weights_still_converges" ):
-    # le point de départ ne devrait être qu'une question de vitesse, pas de résultat -- ici on
-    # part déjà PRÈS de la solution ( `weights0` tiré au hasard mais petit ) plutôt que de zéro, et
-    # le solveur garde ces poids-là ( `depart = "weights0"` ) : ils ne vident aucune cellule.
+    # the starting point should only be a matter of speed, not of result -- here we
+    # start already NEAR the solution ( `weights0` drawn at random but small ) rather than from zero, and
+    # the solver keeps those weights ( `start = "weights0"` ): they empty no cell.
     rng = numpy.random.default_rng( 2 )
     pos = rng.uniform( 0.1, 0.9, size = ( 18, 2 ) )
     src = SumOfDiracs( pos )
@@ -137,16 +137,16 @@ if test( "starting_from_nonzero_weights_still_converges" ):
 
     plan = OtProblem( src, dst ).solve( Iterative( weights0 = w0, max_iter = 50, tol = 1e-12 ) )
 
-    assert plan.converged and plan.stats[ "depart" ] == "weights0", plan.stats
+    assert plan.converged and plan.stats[ "start" ] == "weights0", plan.stats
     got = numpy.asarray( plan.cell_masses ).reshape( -1 )
     assert numpy.allclose( got, _target_masses( plan ), atol = 1e-10 ), numpy.abs( got - _target_masses( plan ) ).max()
 
 
 if test( "no_cell_dies_even_with_scattered_targets" ):
-    # le cas DUR ( `_scattered_target` ) : sans plancher, ce scénario vide plusieurs cellules et s'y
-    # bloque. Ici on vérifie les DEUX choses que l'amortissement promet : aucune cellule ne meurt
-    # EN COURS DE ROUTE ( `min_measure` reste `> 0` à CHAQUE pas de `plan.history` ), et
-    # l'ajustement retombe quand même sur les masses cibles.
+    # the HARD case ( `_scattered_target` ): without a floor, this scenario empties several cells and gets
+    # stuck there. Here we check the TWO things the damping promises: no cell dies
+    # ALONG THE WAY ( `min_measure` stays `> 0` at EVERY step of `plan.history` ), and
+    # the fit still falls back on the target masses.
     rng = numpy.random.default_rng( 5 )
     pos = rng.uniform( 0.1, 0.9, size = ( 40, 2 ) )
     src = SumOfDiracs( pos )
@@ -161,8 +161,8 @@ if test( "no_cell_dies_even_with_scattered_targets" ):
 
 
 if test( "the_hessian_rows_are_the_jacobian_of_the_measures" ):
-    # `PowerDiagram.hessian_rows` contre la différence finie des mesures par rapport aux poids,
-    # sur une image ( des facettes plates à densité constante ) : symétrique, lignes de somme nulle
+    # `PowerDiagram.hessian_rows` against the finite difference of the measures with respect to the weights,
+    # on an image ( flat facets with constant density ): symmetric, rows summing to zero
     rng = numpy.random.default_rng( 31 )
     n = 25
     pos = rng.uniform( 0.1, 0.9, size = ( n, 2 ) )
@@ -188,8 +188,8 @@ if test( "the_hessian_rows_are_the_jacobian_of_the_measures" ):
 
 
 if test( "the_hessian_rows_hold_in_3d_too" ):
-    # en 3D la facette est une FACE, dont l'aire vient de l'accumulation de `LocalN::measure_3d`
-    # ( `for_each_facet` ) : même vérification par différence finie, sans distribution ( Lebesgue )
+    # in 3D the facet is a FACE, whose area comes from the accumulation of `LocalN::measure_3d`
+    # ( `for_each_facet` ): same finite-difference check, without a distribution ( Lebesgue )
     rng = numpy.random.default_rng( 32 )
     n = 14
     pos = rng.uniform( 0.1, 0.9, size = ( n, 3 ) )
@@ -212,9 +212,9 @@ if test( "the_hessian_rows_hold_in_3d_too" ):
 
 
 if test( "newton_converges_quadratically_on_an_image" ):
-    # sur une image, quelques pas suffisent, le résidu chute quadratiquement à la fin, et un départ
-    # chaud ( les poids d'un nuage voisin ) n'en demande que deux ou trois -- ce dont vit une
-    # reconstruction ( `otrec.models.ProjectedDiracModel` )
+    # on an image, a few steps suffice, the residual drops quadratically at the end, and a warm
+    # start ( the weights of a neighboring cloud ) needs only two or three -- which is what a
+    # reconstruction lives on ( `otrec.models.ProjectedDiracModel` )
     rng = numpy.random.default_rng( 41 )
     n = 300
     pos = rng.uniform( 0.05, 0.95, size = ( n, 2 ) )
@@ -223,38 +223,38 @@ if test( "newton_converges_quadratically_on_an_image" ):
     plan = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 60, tol = 1e-10 / n ) )
     res = [ h[ "max_abs_residual" ] * n for h in plan.history ]
     assert plan.converged and res[ -1 ] < 1e-9 and len( res ) < 30, ( plan.stats, res[ -1 ], len( res ) )
-    # les deux derniers pas : au moins un ordre de grandeur chacun ( la phase quadratique )
+    # the last two steps: at least one order of magnitude each ( the quadratic phase )
     assert res[ -1 ] < 0.1 * res[ -2 ] < 0.01 * res[ -3 ]
     got  = numpy.asarray( plan.cell_masses ).reshape( -1 )
     assert numpy.allclose( got, _target_masses( plan ), atol = 1e-11 )
-    # un diagramme par pas : aucun recul sur ce cas doux
-    assert plan.stats[ "nb_recul" ] == 0 and plan.stats[ "nb_diag" ] == len( res ), plan.stats
+    # one diagram per step: no backtracking on this soft case
+    assert plan.stats[ "nb_backtracks" ] == 0 and plan.stats[ "nb_diag" ] == len( res ), plan.stats
 
     warm = OtProblem( SumOfDiracs( pos + 1e-4 * rng.normal( size = pos.shape ) ), img ).solve( Iterative( max_iter = 60, tol = 1e-10 / n, weights0 = plan.weights ) )
-    assert warm.stats[ "depart" ] == "weights0" and len( warm.history ) <= 6, ( warm.stats, len( warm.history ) )
+    assert warm.stats[ "start" ] == "weights0" and len( warm.history ) <= 6, ( warm.stats, len( warm.history ) )
 
-    # un départ chaud qui VIDE une cellule ( des poids qui n'ont plus rien à voir avec le nuage )
-    # est abandonné pour le Voronoï, et on converge quand même
+    # a warm start that EMPTIES a cell ( weights that have nothing to do with the cloud any more )
+    # is dropped in favor of the Voronoi, and we still converge
     bad = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 60, tol = 1e-10 / n, weights0 = rng.uniform( -1, 1, n ) ) )
-    assert bad.converged and bad.stats[ "depart" ] == "voronoi", bad.stats
+    assert bad.converged and bad.stats[ "start" ] == "voronoi", bad.stats
 
 
 if test( "newton_starts_from_a_similarity_when_the_voronoi_has_empty_cells" ):
-    # des diracs HORS du domaine ( leur cellule de Voronoï restreinte au domaine est vide ) : le
-    # départ est le Voronoï du nuage ramené dans le domaine par une similitude, écrit comme
-    # diagramme de puissance du nuage d'origine -- toutes les cellules nourries, et Newton converge
+    # diracs OUTSIDE the domain ( their Voronoi cell restricted to the domain is empty ): the
+    # start is the Voronoi of the cloud brought back into the domain by a similarity, written as a
+    # power diagram of the original cloud -- all cells fed, and Newton converges
     rng = numpy.random.default_rng( 51 )
     n = 40
     pos = rng.uniform( -2, 3, size = ( n, 2 ) )
     img = Image( values = 1 + 0.3 * rng.random( ( 16, 16 ) ), origin = [ 0.0, 0.0 ],
                  frame = [ [ 1 / 16, 0 ], [ 0, 1 / 16 ] ] )
     voronoi = PowerDiagram( pos, numpy.zeros( n ), distribution = img, kernel_dtype = "FP64" )
-    assert ( numpy.asarray( voronoi.measures ) == 0 ).any()      # le problème existe bien
+    assert ( numpy.asarray( voronoi.measures ) == 0 ).any()      # the problem does exist
     plan = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 80, tol = 1e-10 / n, keep_weights = True ) )
-    assert plan.stats[ "depart" ] == "similitude", plan.stats
-    assert plan.history[ 0 ][ "min_measure" ] > 0                # ... et le départ l'a résolu
+    assert plan.stats[ "start" ] == "similarity", plan.stats
+    assert plan.history[ 0 ][ "min_measure" ] > 0                # ... and the start solved it
     assert plan.converged, plan.stats
-    # la similitude elle-même : ses poids sont ceux du Voronoï du nuage contracté ( à la jauge près )
+    # the similarity itself: its weights are those of the Voronoi of the contracted cloud ( up to the gauge )
     w = numpy.asarray( plan.history[ 0 ][ "weights" ] ).reshape( -1 )
     q = 0.5 + 0.8 * ( pos - ( pos.min( axis = 0 ) + pos.max( axis = 0 ) ) / 2 ) / numpy.ptp( pos, axis = 0 ).max()
     a = 0.8 / numpy.ptp( pos, axis = 0 ).max()
@@ -263,11 +263,11 @@ if test( "newton_starts_from_a_similarity_when_the_voronoi_has_empty_cells" ):
 
 
 if test( "newton_works_in_3d" ):
-    # la même promesse en 3D, sans distribution ( Lebesgue sur le cube ) : la facette est une face
+    # the same promise in 3D, without a distribution ( Lebesgue on the cube ): the facet is a face
     rng = numpy.random.default_rng( 61 )
     n = 200
     pos = rng.uniform( 0.05, 0.95, size = ( n, 3 ) )
-    # ( `SdotPlanNd` demande une distribution : une image constante à un pavé est la mesure de Lebesgue )
+    # ( `SdotPlanNd` requires a distribution: a constant one-tile image is the Lebesgue measure )
     img = Image( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) )
     plan = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 60, tol = 1e-10 / n ) )
     assert plan.converged and len( plan.history ) < 30, ( plan.stats, len( plan.history ) )
@@ -276,25 +276,25 @@ if test( "newton_works_in_3d" ):
 
 
 if test( "the_limits_step_reaches_the_same_plan_with_fewer_diagrams" ):
-    # `step = "limits"` ( le défaut en 2D ) : les mêmes poids que les essais de KMT ( `"trials"` ), et
-    # moins de diagrammes -- sur le cas DUR, où les essais reculent ( `solvers_des_familles` README § 7 )
+    # `step = "limits"` ( the default in 2D ): the same weights as KMT's trials ( `"trials"` ), and
+    # fewer diagrams -- on the HARD case, where the trials back off ( `solvers_des_familles` README § 7 )
     rng = numpy.random.default_rng( 81 )
     pos = rng.uniform( 0.1, 0.9, size = ( 60, 2 ) )
     src = SumOfDiracs( pos )
     dst = _scattered_target( 2, 4, seed = 6 )
-    # ( sans la continuation : c'est le Newton direct, et ses reculs, qu'on compare ici )
+    # ( without continuation: it is the direct Newton, and its backtracking, that we compare here )
     a = OtProblem( src, dst ).solve( Iterative( max_iter = 200, tol = 1e-12, continuation = "never", tuning = Tuning( step = "trials" ) ) )
     b = OtProblem( src, dst ).solve( Iterative( max_iter = 200, tol = 1e-12, continuation = "never", tuning = Tuning( step = "limits" ) ) )
     assert a.converged and b.converged, ( a.stats, b.stats )
     assert numpy.allclose( numpy.asarray( a.weights ), numpy.asarray( b.weights ), atol = 1e-9 )
     assert b.stats[ "nb_diag" ] <= a.stats[ "nb_diag" ], ( a.stats[ "nb_diag" ], b.stats[ "nb_diag" ] )
-    assert b.stats[ "nb_cell_lim" ] > 0 and b.stats[ "nb_recul" ] == 0, b.stats
+    assert b.stats[ "nb_cell_lim" ] > 0 and b.stats[ "nb_backtracks" ] == 0, b.stats
 
 
 if test( "the_continuation_solves_what_direct_newton_cannot" ):
-    # des bosses ÉTROITES ( le cas dur du banc, `solvers_des_familles` README § 9 ) : des cellules sans
-    # masse au départ, Newton direct STAGNE ; la continuation en largeur ( `sdotplan/Continuation.h` )
-    # converge, et `"auto"` la déclenche toute seule sur la plus petite masse du départ
+    # NARROW bumps ( the bench's hard case, `solvers_des_familles` README § 9 ): cells with no
+    # mass at the start, direct Newton STAGNATES; the width continuation ( `sdotplan/Continuation.h` )
+    # converges, and `"auto"` triggers it by itself based on the smallest mass at the start
     rng = numpy.random.default_rng( 91 )
     pos = rng.uniform( 0, 1, size = ( 400, 2 ) )
     centres = numpy.array( [ [ 0.3, 0.3 ], [ 0.7, 0.35 ], [ 0.4, 0.75 ], [ 0.75, 0.7 ] ] )
@@ -302,28 +302,28 @@ if test( "the_continuation_solves_what_direct_newton_cannot" ):
     direct = OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 100, continuation = "never", tuning = Tuning( mass_rtol = 1e-6 ) ) )
     assert not direct.converged, direct.stats
     plan = OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 100, tuning = Tuning( mass_rtol = 1e-6 ) ) )
-    assert plan.converged and plan.stats[ "nb_etapes" ] > 1, plan.stats
+    assert plan.converged and plan.stats[ "nb_continuation_steps" ] > 1, plan.stats
     got = numpy.asarray( plan.cell_masses ).reshape( -1 )
     assert numpy.allclose( got, _target_masses( plan ), rtol = 1e-5 ), numpy.abs( got / _target_masses( plan ) - 1 ).max()
-    # l'historique porte la largeur de chaque pas, décroissante jusqu'à 0
+    # the history carries the width of each step, decreasing down to 0
     ss = [ h[ "s" ] for h in plan.history ]
     assert ss[ 0 ] > 0 and ss[ -1 ] == 0 and all( b <= a for a, b in zip( ss, ss[ 1: ] ) )
 
-    # une IMAGE aussi ( floutée sur sa grille ) : une image presque vide, sauf deux taches
+    # an IMAGE too ( blurred on its grid ): an almost empty image, except for two spots
     values = numpy.full( ( 32, 32 ), 1e-6 )
     values[ 6:10, 6:10 ] = 1.0
     values[ 20:26, 18:24 ] = 0.7
     img = Image( values = values, origin = [ 0.0, 0.0 ], frame = [ [ 1 / 32, 0 ], [ 0, 1 / 32 ] ] )
     plan = OtProblem( SumOfDiracs( pos ), img ).solve( Iterative( max_iter = 100, tuning = Tuning( mass_rtol = 1e-6 ) ) )
-    assert plan.converged and plan.stats[ "nb_etapes" ] > 1, plan.stats
+    assert plan.converged and plan.stats[ "nb_continuation_steps" ] > 1, plan.stats
     got = numpy.asarray( plan.cell_masses ).reshape( -1 )
     assert numpy.allclose( got, _target_masses( plan ), rtol = 1e-5 ), numpy.abs( got / _target_masses( plan ) - 1 ).max()
 
 
 if test( "the_domain_comes_from_the_density_alone" ):
-    # des gaussiennes : le domaine est le support qu'elles DÉCLARENT ( `centres +- 6 sigma` ), pas
-    # l'enveloppe des diracs -- des diracs tirés dans un coin du domaine ont des cellules qui vont
-    # loin d'eux, et le transport les y envoie ( les barycentres sortent de la boîte des diracs )
+    # Gaussians: the domain is the support they DECLARE ( `centers +- 6 sigma` ), not
+    # the envelope of the diracs -- diracs drawn in a corner of the domain have cells that go
+    # far from them, and the transport sends them there ( the barycenters leave the box of the diracs )
     rng = numpy.random.default_rng( 3 )
     pos = rng.uniform( 0.4, 0.6, size = ( 60, 2 ) )
     dst = SumOfGaussians( numpy.array( [ [ 0.5, 0.5 ] ] ), numpy.array( [ 0.15 ] ), weights = numpy.array( [ 1.0 ] ) )
@@ -332,21 +332,21 @@ if test( "the_domain_comes_from_the_density_alone" ):
     pd = plan._pd
     assert pd.box_min.is_defined and not pd.bnd_offsets.is_defined
     assert numpy.allclose( numpy.asarray( pd.box_min ), [ 0.5 - 0.9 ] * 2 ) and numpy.allclose( numpy.asarray( pd.box_max ), [ 0.5 + 0.9 ] * 2 )
-    assert abs( plan.stats[ "masse_domaine" ] - 1 ) < 1e-7
+    assert abs( plan.stats[ "domain_mass" ] - 1 ) < 1e-7
     _, bary, _ = plan.transport()
     bary = numpy.asarray( bary )
     assert bary.min() < 0.3 and bary.max() > 0.7, ( bary.min(), bary.max() )
-    # sans support déclaré, pas de domaine : on le dit
+    # without a declared support, no domain: we say so
     try:
         OtProblem( SumOfDiracs( pos ), SumOfGaussians( numpy.array( [ [ 0.5, 0.5 ] ] ), numpy.array( [ 0.15 ] ), support_sigmas = None ) ).solve()
-        assert False, "un domaine non borne devrait etre refuse"
+        assert False, "an unbounded domain should have been refused"
     except ValueError:
         pass
 
 
 if test( "the_plain_storage_gives_the_same_plan" ):
-    # `accelerator = "plain"` : les mêmes poids que l'arbre BSP, aux arrondis près ( l'accélération
-    # ne change que ce que le diagramme coûte )
+    # `accelerator = "plain"`: the same weights as the BSP tree, up to rounding ( the acceleration
+    # only changes what the diagram costs )
     rng = numpy.random.default_rng( 71 )
     n = 60
     pos = rng.uniform( 0.05, 0.95, size = ( n, 2 ) )
@@ -357,12 +357,12 @@ if test( "the_plain_storage_gives_the_same_plan" ):
     assert numpy.allclose( numpy.asarray( a.weights ), numpy.asarray( b.weights ), atol = 1e-10 )
 
 
-# -- les moments, et ce qu'un coût de transport en tire ---------------------------------------
+# -- the moments, and what a transport cost draws from them ---------------------------------
 
 if test( "moments_are_the_closed_forms" ):
-    # UN dirac dans le carré unité : sa cellule est le carré, dont les moments sont connus --
-    # masse 1, barycentre ( 1/2, 1/2 ), `int |x|^2 = 2/3`. Et sur une image à UN pixel allumé, le
-    # barycentre est le centre de ce pixel : c'est aussi ce qui vérifie l'orientation de la grille
+    # ONE dirac in the unit square: its cell is the square, whose moments are known --
+    # mass 1, barycenter ( 1/2, 1/2 ), `int |x|^2 = 2/3`. And on an image with ONE pixel lit, the
+    # barycenter is the center of that pixel: this also checks the orientation of the grid
     # ( `values[ i, j ]` <-> `origin + i frame[ 0 ] + j frame[ 1 ]` ).
     pd = PowerDiagram( numpy.array( [ [ 0.3, 0.6 ] ] ), boundaries = box_half_spaces( [ 0, 0 ], [ 1, 1 ] ),
                        kernel_dtype = "FP64" )
@@ -378,11 +378,11 @@ if test( "moments_are_the_closed_forms" ):
     mass, first, second = pd.moments
     m = float( numpy.asarray( mass ).reshape( -1 )[ 0 ] )
     bary = numpy.asarray( first ).reshape( -1 ) / m
-    assert abs( m - 1 ) < 1e-12, m                                    # normalisée
+    assert abs( m - 1 ) < 1e-12, m                                    # normalized
     assert numpy.allclose( bary, [ 3.5 * 0.5, 1.5 * 0.25 ], atol = 1e-12 ), bary
 
-    # plusieurs diracs : les moments d'ordre 0 sont les mesures, et les barycentres restent dans
-    # le carré, leur moyenne pondérée étant le centre de masse du domaine
+    # several diracs: the order-0 moments are the measures, and the barycenters stay inside
+    # the square, their weighted mean being the center of mass of the domain
     rng = numpy.random.default_rng( 11 )
     pos = rng.uniform( 0.1, 0.9, size = ( 15, 2 ) )
     pd = PowerDiagram( pos, boundaries = box_half_spaces( [ 0, 0 ], [ 1, 1 ] ), kernel_dtype = "FP64" )
@@ -395,10 +395,10 @@ if test( "moments_are_the_closed_forms" ):
 
 
 if test( "the_transport_cost_derives_by_the_envelope_theorem" ):
-    # `cost_and_position_grad` : la dérivée du coût par rapport aux positions des diracs, aux
-    # poids ajustés, contre la différence finie du coût lui-même ( chaque évaluation réajustant
-    # ses poids, en repartant des précédents ). Sur une IMAGE : ses moments sont exacts ( ceux d'une
-    # gaussienne passent par la quadrature adaptative, à `rtol` près ).
+    # `cost_and_position_grad`: the derivative of the cost with respect to the dirac positions, at the
+    # fitted weights, against the finite difference of the cost itself ( each evaluation refitting
+    # its weights, restarting from the previous ones ). On an IMAGE: its moments are exact ( those of a
+    # Gaussian go through the adaptive quadrature, up to `rtol` ).
     rng = numpy.random.default_rng( 21 )
     pos = rng.uniform( 0.2, 0.8, size = ( 8, 2 ) )
     img = Image( values = 1 + 0.5 * rng.random( ( 12, 12 ) ), origin = [ 0.0, 0.0 ], frame = [ [ 1 / 12, 0 ], [ 0, 1 / 12 ] ] )
@@ -411,8 +411,8 @@ if test( "the_transport_cost_derives_by_the_envelope_theorem" ):
     cost, grad = float( cost ), numpy.asarray( grad )
     assert cost > 0 and numpy.isfinite( grad ).all()
 
-    # le coût est bien `W_2^2` : la même chose que `sum_i m_i |p_i - b_i|^2 + sum_i var_i` -- on
-    # vérifie au moins la borne `cost >= sum_i m_i |p_i - b_i|^2`
+    # the cost is indeed `W_2^2`: the same thing as `sum_i m_i |p_i - b_i|^2 + sum_i var_i` -- we
+    # at least check the bound `cost >= sum_i m_i |p_i - b_i|^2`
     _, bary, m = plan.transport()
     bary, m = numpy.asarray( bary ), numpy.asarray( m ).reshape( -1 )
     assert cost >= float( ( m * ( ( pos - bary ) ** 2 ).sum( axis = 1 ) ).sum() ) - 1e-12
@@ -424,29 +424,29 @@ if test( "the_transport_cost_derives_by_the_envelope_theorem" ):
         assert abs( fd - grad[ i, c ] ) < 1e-4 * max( 1.0, abs( fd ) ), ( i, c, fd, grad[ i, c ] )
 
 
-# -- ce qu'on REGARDE ------------------------------------------------------------------------
+# -- what we LOOK AT -------------------------------------------------------------------------
 #
 #   ./run experiment test_SdotPlanNd
 
 def _report( p, plan, pos, stem ):
-    """Commun aux deux expériences ci-dessous : la même paire ( courbe, animation ), la même
-    lecture d'historique."""
+    """Shared by the two experiments below: the same pair ( curve, animation ), the same
+    reading of the history."""
     last = plan.history[ -1 ]
-    print( f"  { last[ 'step' ] } pas, { plan.stats[ 'nb_diag' ] } diagrammes, { plan.stats[ 'fin' ] }"
-           f", résidu max { last[ 'max_abs_residual' ]:.3e}"
-           f", mesure min finale { last[ 'min_measure' ]:.3e}" )
+    print( f"  { last[ 'step' ] } steps, { plan.stats[ 'nb_diag' ] } diagrams, { plan.stats[ 'status' ] }"
+           f", max residual { last[ 'max_abs_residual' ]:.3e}"
+           f", final min measure { last[ 'min_measure' ]:.3e}" )
 
     write_convergence_html(
-        { "résidu l2":                        [ h[ "residual_l2" ] for h in plan.history ],
-          "résidu max":                       [ h[ "max_abs_residual" ] for h in plan.history ],
-          "mesure minimale (jamais 0)":       [ h[ "min_measure" ] for h in plan.history ] },
+        { "l2 residual":                      [ h[ "residual_l2" ] for h in plan.history ],
+          "max residual":                     [ h[ "max_abs_residual" ] for h in plan.history ],
+          "minimum measure (never 0)":        [ h[ "min_measure" ] for h in plan.history ] },
         p.out_dir / f"{ stem }_convergence.html",
         title = f"SdotPlanNd 2D -- { len( pos ) } diracs" )
 
     idx = numpy.unique( numpy.linspace(
         0, len( plan.history ) - 1, min( 40, len( plan.history ) ) ).astype( int ) )
 
-    viz = Visualizer( title = f"SdotPlanNd 2D, { len( pos ) } diracs -- convergence", frame_axis = "pas" )
+    viz = Visualizer( title = f"SdotPlanNd 2D, { len( pos ) } diracs -- convergence", frame_axis = "step" )
     for j, i in enumerate( idx ):
         if j:
             viz.new_frame( int( plan.history[ i ][ "step" ] ) )
@@ -457,15 +457,15 @@ def _report( p, plan, pos, stem ):
 
 
 if p := experiment( "ot 2D newton",
-                    nb_points    = Param( 30, help = "nombre de diracs" ),
-                    nb_gaussians = Param( 2, help = "nombre de gaussiennes de la cible" ),
-                    max_iter     = Param( 100, help = "nombre de pas" ),
-                    seed         = Param( 5, help = "graine du tirage" ) ):
-    # ce que fait `SdotPlanNd` : PARTIR des poids nuls ( le Voronoï -- chaque cellule prend sa part
-    # purement géométrique ) et les faire GLISSER jusqu'à ce que chaque cellule pèse, contre la
-    # densité cible, exactement ce que pèse son dirac. La courbe de convergence dit SI ça converge
-    # et à quelle vitesse ; l'animation montre COMMENT : les PLANS glissent d'un pas à l'autre,
-    # pas les germes. Cible DOUCE ( `_overlapping_target` ).
+                    nb_points    = Param( 30, help = "number of diracs" ),
+                    nb_gaussians = Param( 2, help = "number of Gaussians in the target" ),
+                    max_iter     = Param( 100, help = "number of steps" ),
+                    seed         = Param( 5, help = "random draw seed" ) ):
+    # what `SdotPlanNd` does: START from zero weights ( the Voronoi -- each cell takes its purely
+    # geometric share ) and make them SLIDE until each cell weighs, against the target
+    # density, exactly what its dirac weighs. The convergence curve says WHETHER it converges
+    # and how fast; the animation shows HOW: the PLANES slide from one step to the next,
+    # not the seeds. SOFT target ( `_overlapping_target` ).
     pos = numpy.random.default_rng( p.seed ).uniform( 0.1, 0.9, size = ( p.nb_points, 2 ) )
     src = SumOfDiracs( pos )
     dst = _overlapping_target( 2, p.nb_gaussians, seed = p.seed + 1 )
@@ -475,13 +475,13 @@ if p := experiment( "ot 2D newton",
 
 
 if p := experiment( "ot 2D newton scattered",
-                    nb_points    = Param( 40, help = "nombre de diracs" ),
-                    nb_gaussians = Param( 4, help = "nombre de bosses, séparées et étroites" ),
-                    max_iter     = Param( 200, help = "nombre de pas" ),
-                    seed         = Param( 5, help = "graine du tirage" ) ):
-    # le cas DUR : des bosses étroites et séparées ( `_scattered_target` ). La courbe `mesure
-    # minimale` est celle qui compte ici : elle part quasi nulle ( un dirac dans un désert de
-    # densité, au Voronoï ) et doit REMONTER sans jamais retoucher 0.
+                    nb_points    = Param( 40, help = "number of diracs" ),
+                    nb_gaussians = Param( 4, help = "number of bumps, separate and narrow" ),
+                    max_iter     = Param( 200, help = "number of steps" ),
+                    seed         = Param( 5, help = "random draw seed" ) ):
+    # the HARD case: narrow, separate bumps ( `_scattered_target` ). The `minimum
+    # measure` curve is the one that matters here: it starts almost null ( a dirac in a density
+    # desert, at the Voronoi ) and must CLIMB BACK without ever touching 0 again.
     pos = numpy.random.default_rng( p.seed ).uniform( 0.1, 0.9, size = ( p.nb_points, 2 ) )
     src = SumOfDiracs( pos )
     dst = _scattered_target( 2, p.nb_gaussians, seed = p.seed + 1 )

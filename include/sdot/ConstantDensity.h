@@ -4,17 +4,17 @@
 
 namespace sdot {
 
-// La densité d'un MORCEAU sur lequel elle est constante -- ce que rend le découpage d'une image,
-// et ce que rend `UnitDensity` pour la cellule entière.
+// The density of a PIECE on which it is constant -- what the slicing of an image yields,
+// and what `UnitDensity` yields for the whole cell.
 //
-// C'est le cas où l'intégration est exacte et gratuite : `valeur * mesure du morceau`, sans
-// quadrature ni triangulation (voir `PowerDiagram::integrate_into`, qui branche là-dessus À LA
-// COMPILATION sur `is_constant`).
+// This is the case where integration is exact and free: `value * measure of the piece`, with no
+// quadrature or triangulation (see `PowerDiagram::integrate_into`, which branches on it AT
+// COMPILE TIME on `is_constant`).
 //
-// `sink` est ce qui rattache la valeur aux PARAMÈTRES de la distribution : l'intégrateur sait que
-// `d masse / d valeur` est le volume du morceau, mais pas où cette valeur est rangée -- une case de
-// `values` pour une image, rien du tout pour la densité unité. La fermeture est donc fabriquée là
-// où l'indice est connu, et l'intégrateur ne fait que l'appeler.
+// `sink` is what ties the value to the distribution's PARAMETERS: the integrator knows that
+// `d mass / d value` is the volume of the piece, but not where that value is stored -- a slot of
+// `values` for an image, nothing at all for the unit density. The closure is therefore built
+// where the index is known, and the integrator merely calls it.
 template<class TF_,class Sink>
 struct ConstantDensity {
     using TF = TF_;

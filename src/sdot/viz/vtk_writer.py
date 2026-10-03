@@ -1,20 +1,20 @@
-"""Sortie ParaView d'un `Visualizer` : XML VTK binaire compressé.
+"""ParaView output of a `Visualizer`: compressed binary VTK XML.
 
-Trois choix qui ne se devinent pas, et qui sont ici :
+Three choices that cannot be guessed, and that are here:
 
-- FORMAT. `.vtu` (grille non structurée) en binaire ajouté (`AppendedData encoding="raw"`) et
-  compressé zlib -- ce que ParaView préfère, et bien plus léger que l'ASCII. Un `.vtu` accepte
-  les trois natures de cellule d'un coup : polygones, segments, points isolés.
+- FORMAT. `.vtu` (unstructured grid) in appended binary (`AppendedData encoding="raw"`) and
+  zlib-compressed -- what ParaView prefers, and much lighter than ASCII. A `.vtu` accepts
+  the three kinds of cell at once: polygons, segments, isolated points.
 
-- LE TEMPS. Une image par fichier, rassemblées par un `.pvd` qui porte les abscisses. C'est ce
-  que ParaView attend pour une série temporelle dont la géométrie change complètement d'un pas à
-  l'autre -- ce qui est notre cas : ni les sommets ni la connectivité ne se correspondent.
+- TIME. One frame per file, gathered by a `.pvd` that carries the abscissas. This is what
+  ParaView expects for a time series whose geometry changes completely from one step to
+  the next -- which is our case: neither the vertices nor the connectivity correspond.
 
-- AU-DELÀ DE LA 3D. ParaView est 3D. On écrit les trois dimensions choisies en GÉOMÉTRIE et les
-  autres coordonnées en DONNÉES DE POINTS (`x3`, `x4`, ...) : ParaView peut alors couper et
-  seuiller dessus lui-même, ce qui vaut mieux que de figer une coupe à l'écriture.
+- BEYOND 3D. ParaView is 3D. The three chosen dimensions are written as GEOMETRY and the
+  other coordinates as POINT DATA (`x3`, `x4`, ...): ParaView can then slice and
+  threshold on them itself, which is better than freezing a slice at write time.
 
-Un polytope donné en demi-espaces n'a pas de sommets : il est énuméré ici, en Python
+A polytope given as half-spaces has no vertices: it is enumerated here, in Python
 (`polytope.polytope_mesh`).
 """
 import struct
@@ -35,12 +35,12 @@ _VTK_DTYPE = {
 
 
 class _Appended:
-    """Les tableaux du fichier, mis bout à bout dans le bloc binaire final.
+    """The arrays of the file, laid end to end in the final binary block.
 
-    `add` rend l'OFFSET à écrire dans l'attribut du `DataArray` ; `data` rend le bloc entier.
-    Chaque tableau est compressé par morceaux, avec l'en-tête que VTK attend :
-    `[ nb_morceaux, taille_morceau, taille_du_dernier, taille_compressée_de_chacun ]`, tous en
-    UInt64 (d'où le `header_type` du fichier).
+    `add` returns the OFFSET to write in the `DataArray` attribute; `data` returns the whole block.
+    Each array is compressed in chunks, with the header that VTK expects:
+    `[ nb_chunks, chunk_size, last_size, compressed_size_of_each ]`, all in
+    UInt64 (hence the file's `header_type`).
     """
     BLOCK = 32768
 
@@ -58,7 +58,7 @@ class _Appended:
 
     def _encode( self, raw ):
         if not raw:
-            return struct.pack( "<Q", 0 )                  # tableau vide : zéro morceau
+            return struct.pack( "<Q", 0 )                  # empty array: zero chunks
         parts = [ raw[ i : i + self.BLOCK ] for i in range( 0, len( raw ), self.BLOCK ) ]
         comp  = [ zlib.compress( part, 6 ) for part in parts ]
         head  = struct.pack( f"<{ 3 + len( parts ) }Q", len( parts ), self.BLOCK,
@@ -77,13 +77,13 @@ def _array_tag( name, arr, offset, nb_components = 1 ):
 
 
 def _write_vtu( path, coords, extra, cells, colors, extra_names, radii ):
-    """Un fichier `.vtu`.
+    """A `.vtu` file.
 
-    `coords` : `[n, 3]` la géométrie. `extra` : `[n, k]` les coordonnées au-delà de la 3D, nommées
-    par `extra_names`. `cells` : `( types [m], connectivity, offsets )`. `colors` : `[m, 4]` uint8.
-    `radii` : `[m]` le rayon MONDE de chaque cellule -- celui des points (`add_points( radius )`),
-    0 pour tout le reste : de quoi faire un `Glyph` de sphères à leur vraie taille dans ParaView
-    (`Scale Array = radius`, facteur 1), là où la page HTML a son curseur.
+    `coords`: `[n, 3]` the geometry. `extra`: `[n, k]` the coordinates beyond 3D, named
+    by `extra_names`. `cells`: `( types [m], connectivity, offsets )`. `colors`: `[m, 4]` uint8.
+    `radii`: `[m]` the WORLD radius of each cell -- that of the points (`add_points( radius )`),
+    0 for everything else: enough to make a sphere `Glyph` at their true size in ParaView
+    (`Scale Array = radius`, factor 1), where the HTML page has its slider.
     """
     types, conn, offs = cells
     app = _Appended()
@@ -133,11 +133,11 @@ def _write_vtu( path, coords, extra, cells, colors, extra_names, radii ):
 
 
 def _frame_mesh( viz, index, axes ):
-    """L'image `index`, mise à plat : sommets, cellules VTK, couleurs, rayons.
+    """Frame `index`, flattened: vertices, VTK cells, colors, radii.
 
-    Les sommets sont RENUMÉROTÉS : le vivier porte toute la scène, un fichier ne doit contenir que
-    ce que son image utilise. Les POINTS ne passent par aucune boucle Python : une image d'une
-    reconstruction en porte des centaines de milliers, et il y en a une par pas.
+    The vertices are RENUMBERED: the pool carries the whole scene, a file must only contain
+    what its frame uses. The POINTS go through no Python loop: a frame of a
+    reconstruction carries hundreds of thousands of them, and there is one per step.
     """
     fr   = viz.frame( index )
     pool = viz.positions
@@ -156,7 +156,7 @@ def _frame_mesh( viz, index, axes ):
     remap = { int( v ): k for k, v in enumerate( used ) }
 
     verts = [ pool[ used ].reshape( -1, d ) ]
-    cells, rgba = [], []                      # ( type, [ indices ] ) et la couleur de la cellule
+    cells, rgba = [], []                      # ( type, [ indices ] ) and the color of the cell
 
     for f, ci in zip( polys, fr[ "polygon_colors" ] ):
         cells.append( ( VTK_POLYGON, [ remap[ int( i ) ] for i in f ] ) )
@@ -164,13 +164,13 @@ def _frame_mesh( viz, index, axes ):
     for ( a, b ), ci in zip( edges, fr[ "edge_colors" ] ):
         cells.append( ( VTK_LINE, [ remap[ int( a ) ], remap[ int( b ) ] ] ) )
         rgba.append( colors[ int( ci ) ] )
-    # les points, vectorisés : `used` est trié, donc le rang d'un sommet s'y cherche par dichotomie
+    # the points, vectorized: `used` is sorted, so the rank of a vertex is found by bisection
     pnt_ids = np.searchsorted( used, pts.astype( np.int64 ) ) if len( pts ) else np.zeros( 0, np.int64 )
     pnt_rgba = colors[ np.asarray( fr[ "point_colors" ], np.int64 ) ].reshape( -1, 4 )
     pnt_radii = np.asarray( fr[ "point_radii" ], np.float32 ).reshape( -1 )
 
-    # polytopes : ils n'ont pas de sommets, on les énumère (la boîte de la scène les borne, sans
-    # quoi un polytope ouvert n'aurait rien à montrer).
+    # polytopes: they have no vertices, we enumerate them (the scene box bounds them, without
+    # which an open polytope would have nothing to show).
     bounds = viz.bounds()
     for dirs, offs, col, with_edges in fr[ "polytopes" ]:
         pv, pe, pf = polytope_mesh( dirs, offs, bounds = bounds )
@@ -183,13 +183,13 @@ def _frame_mesh( viz, index, axes ):
             rgba.append( np.asarray( col, np.float64 ) )
         for a, b in ( pe if with_edges else [] ):
             cells.append( ( VTK_LINE, [ base + int( a ), base + int( b ) ] ) )
-            # l'arête reprend la teinte de la face, assombrie, et toujours OPAQUE (l'opacité
-            # d'une face n'a pas de sens pour un trait)
+            # the edge takes the face's tint, darkened, and always OPAQUE (the opacity
+            # of a face makes no sense for a line)
             rgba.append( np.array( [ 0.72 * col[ 0 ], 0.72 * col[ 1 ], 0.72 * col[ 2 ], 1.0 ] ) )
 
     allv = np.concatenate( verts, axis = 0 ) if verts else np.zeros( ( 0, d ) )
 
-    # les cellules à connectivité libre ( polygones, arêtes ), puis les points en bloc
+    # the free-connectivity cells ( polygons, edges ), then the points as a block
     conn  = np.array( [ i for _, ids in cells for i in ids ], np.int64 )
     sizes = np.array( [ len( ids ) for _, ids in cells ], np.int64 )
     types = np.array( [ t for t, _ in cells ], np.uint8 )
@@ -202,10 +202,10 @@ def _frame_mesh( viz, index, axes ):
 
 
 def write_vtk( viz, filename, axes = ( 0, 1, 2 ) ):
-    """Voir `Visualizer.write_vtk`."""
+    """See `Visualizer.write_vtk`."""
     path = Path( filename )
     if viz.nb_dims is None:
-        raise ValueError( "write_vtk: rien à écrire (aucune primitive ajoutée)" )
+        raise ValueError( "write_vtk: nothing to write (no primitive added)" )
 
     d = viz.nb_dims
     axes = tuple( a for a in axes if a < d )

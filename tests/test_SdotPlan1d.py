@@ -4,6 +4,7 @@ from loom import driver
 from sdot import Image, SdotPlan1d, SumOfDiracs1d
 from loom.devices import Cpu
 from errand import test
+from loom.testing import need
 from loom.util import info
 from loom.testing import check_grad
 
@@ -20,39 +21,42 @@ if test( "basic" ):
     info( otp.barycenters )
 
 if test( "cost_uniform" ):
-    # Un seul dirac (masse 1) face à une densité uniforme sur [0,1] (masse 1) : le coût est
-    # exactement Integral_0^1 (x - 0.5)^2 dx = 1/12, et le barycentre de la tranche cible est 0.5.
-    # Ce cas franchit aussi la garde de bornes `udp_cont` (une seule cellule, boucle non entrée).
+    # A single dirac (mass 1) against a uniform density on [0,1] (mass 1) : the cost is
+    # exactly Integral_0^1 (x - 0.5)^2 dx = 1/12, and the barycenter of the target slice is 0.5.
+    # This case also crosses the `udp_cont` bounds guard (a single cell, loop not entered).
     otp = SdotPlan1d( SumOfDiracs1d( positions = [ 0.5 ] ), Image( values = [ 1 ] ), with_barycenters = True )
 
     assert abs( float( otp.cost ) - 1 / 12 ) < 1e-6
     assert abs( float( otp.barycenters.sum() ) - 0.5 ) < 1e-6
 
 if test( "cost_two_cells" ):
-    # Densité uniforme 0.5 sur [0,2] (masse 1), un dirac en 1.0 : le prélèvement traverse DEUX
-    # cellules (la boucle `while` de `udp_cont` s'exécute une fois), coût attendu 1/3.
+    # Uniform density 0.5 on [0,2] (mass 1), a dirac at 1.0 : the draw crosses TWO
+    # cells (the `while` loop of `udp_cont` runs once), expected cost 1/3.
     otp = SdotPlan1d( SumOfDiracs1d( positions = [ 1.0 ] ), Image( values = [ 1, 1 ] ) )
 
     assert abs( float( otp.cost ) - 1 / 3 ) < 1e-6
 
 if test( "grad_cost" ):
-    # Dérivée de `cost` par rapport aux positions des diracs (via `update_outputs_bwd`). Positions
-    # bien séparées pour que la perturbation de `check_grad` ne change ni l'ordre trié ni
-    # l'assignation des tranches ; le coût est alors lisse et l'adjoint 2 w_i ( p_i - b_i ) exact.
+    need( "grad" )
+    # Derivative of `cost` with respect to the dirac positions (via `update_outputs_bwd`). Positions
+    # well separated so that the `check_grad` perturbation changes neither the sorted order nor
+    # the slice assignment ; the cost is then smooth and the adjoint 2 w_i ( p_i - b_i ) exact.
     positions = driver.array( [ 0.2, 0.5, 0.9 ] )
 
     check_grad( lambda p: SdotPlan1d( SumOfDiracs1d( positions = p ), Image( values = [ 1, 0, 1 ] ) ).cost, positions )
 
 if test( "grad_values" ):
-    # Dérivée de `cost` par rapport aux valeurs de l'image : terme direct Integral (x-p)^2 + terme
-    # de bord -Phi_k. Valeurs strictement positives et bords de tranches (W = 1/3, 2/3) intérieurs à
-    # la cellule centrale -> CDF C1 en ces points, donc adjoint exact.
+    need( "grad" )
+    # Derivative of `cost` with respect to the image values : direct term Integral (x-p)^2 + boundary
+    # term -Phi_k. Strictly positive values and slice boundaries (W = 1/3, 2/3) interior to
+    # the central cell -> CDF C1 at these points, hence an exact adjoint.
     values = driver.array( [ 1.0, 3.0, 1.0 ] )
     info( values )
 
     check_grad( lambda v: SdotPlan1d( SumOfDiracs1d( positions = [ 0.2, 0.5, 0.9 ] ), Image( values = v ) ).cost, values )
 
 if test( "group_size_cooperative" ):
+    need( "grad" )
     # Force `local_size > 1` on CPU (never the perf path there -- see `Cpu.group_size`'s docstring --
     # but the only place to cheaply exercise the cooperative code against a `local_size == 1` case it
     # would trivially degenerate around). The SORT stays bit-identical regardless of `local_size` (each
@@ -81,12 +85,13 @@ if test( "group_size_cooperative" ):
         Cpu.group_size = orig_group_size
 
 if test( "zero_density_cells" ):
-    # Cellules de densité nulle en tête ET en queue -- vise directement le cas non trivial de
-    # `Image::udp_at` : une limite tombant EXACTEMENT sur une masse cumulée nulle doit atterrir sur la
-    # PREMIÈRE cellule qui partage cette valeur (règle du plus petit `c`), pas la dernière -- sinon
-    # `udp_start()`'s comportement (jamais d'avance anticipée sur une cellule de tête nulle) ne serait
-    # pas reproduit, et une cellule nulle de fin ne recevrait jamais sa pièce (perdant sa contribution
-    # directe à `grad_values`, non nulle même à densité nulle -- voir `second_moment_about`).
+    need( "grad" )
+    # Zero-density cells at the head AND at the tail -- directly targets the non-trivial case of
+    # `Image::udp_at` : a limit falling EXACTLY on a zero cumulative mass must land on the
+    # FIRST cell that shares this value (smallest-`c` rule), not the last -- otherwise
+    # `udp_start()`'s behavior (never an early advance onto a zero head cell) would not be
+    # reproduced, and a zero tail cell would never receive its piece (losing its direct
+    # contribution to `grad_values`, nonzero even at zero density -- see `second_moment_about`).
     positions = [ 0.1, 0.3, 0.5, 0.7, 0.9 ]
 
     for values in ( [ 0, 0, 1, 2, 1 ], [ 1, 2, 1, 0, 0 ] ):
@@ -122,6 +127,7 @@ if test( "single_cell_target" ):
         Cpu.group_size = orig_group_size
 
 if test( "more_threads_than_diracs" ):
+    need( "grad" )
     # `local_size (8) > nb (2)` -- most work-items own an EMPTY dirac chunk (`lo == hi`): exercises
     # `chunked_weight_prefix`/the sweep's per-work-item loop bounds when several chunks never execute.
     positions = [ 0.3, 0.7 ]
@@ -142,14 +148,15 @@ if test( "more_threads_than_diracs" ):
         Cpu.group_size = orig_group_size
 
 if test( "boundary_straddling_cell_grad" ):
-    # 6 diracs uniformément répartis, poids uniformes -> à `group_size = 3` (chunks de 2), les limites
-    # de chunk tombent en masse-cible 1/3 et 2/3 -- STRICTEMENT À L'INTÉRIEUR des deux cellules de masse
-    # égale (bords cumulés 0, 1/2, 1), pas sur un bord. Vise directement l'ajout ATOMIQUE de
-    # `update_outputs_bwd` sur `grad_values` : sans lui, la cellule scindée entre deux work-items
-    # concurrents perdrait une des deux contributions (écriture non protégée). Note : AdaptiveCpp exécute
-    # les work-items coopératifs du CPU via Boost.Fiber (coopératif, pas préemptif) -- ce test valide
-    # l'ARITHMÉTIQUE du chemin phase-1/phase-2/atomic_add (via différence finie), pas la détection de la
-    # course elle-même (qui demanderait un thread sanitizer ou une exécution GPU sous stress).
+    need( "grad" )
+    # 6 uniformly spread diracs, uniform weights -> at `group_size = 3` (chunks of 2), the chunk
+    # limits fall at target mass 1/3 and 2/3 -- STRICTLY INSIDE the two cells of equal
+    # mass (cumulative edges 0, 1/2, 1), not on an edge. Directly targets the ATOMIC add of
+    # `update_outputs_bwd` on `grad_values` : without it, the cell split between two concurrent
+    # work-items would lose one of the two contributions (unprotected write). Note : the CPU
+    # work-items run cooperatively (not preemptively) -- this test validates
+    # the ARITHMETIC of the phase-1/phase-2/atomic_add path (via finite differences), not the detection of
+    # the race itself (which would require a thread sanitizer or a GPU run under stress).
     positions = [ 0.1, 0.2, 0.3, 0.7, 0.8, 0.9 ]
     values = driver.array( [ 1.0, 1.0 ] )
 
@@ -163,18 +170,20 @@ if test( "boundary_straddling_cell_grad" ):
         Cpu.group_size = orig_group_size
 
 if test( "grad_weights" ):
-    # Dérivée de `cost` par rapport aux poids des diracs : somme suffixe des sauts de potentiel Phi.
-    # Poids positifs ; les bords restent intérieurs à une cellule (coût lisse). La normalisation
-    # (Python, dérivée par le framework) est traversée de bout en bout par `check_grad`.
+    need( "grad" )
+    # Derivative of `cost` with respect to the dirac weights : suffix sum of the potential jumps Phi.
+    # Positive weights ; the edges stay interior to a cell (smooth cost). The normalization
+    # (Python, differentiated by the framework) is traversed end to end by `check_grad`.
     weights = driver.array( [ 1.0, 1.0, 2.0 ] )
 
     check_grad( lambda w: SdotPlan1d( SumOfDiracs1d( positions = [ 0.2, 0.5, 0.9 ], weights = w ), Image( values = [ 1, 3, 1 ] ) ).cost, weights )
 
 if test( "joint_position_and_weight_value_grad" ):
-    # Différencie positions ET poids ET valeurs de l'image EN MÊME TEMPS (barycentres NON stockés,
-    # le défaut) -- le seul cas où `update_outputs_bwd`'s position-grad block (recompute-b_i path)
-    # ET son weights/values-grad block s'exécutent tous les deux dans le MÊME appel, exerçant donc
-    # le tri hissé (hoisted `sort_diracs`) partagé entre les deux.
+    need( "grad" )
+    # Differentiates positions AND weights AND image values AT THE SAME TIME (barycenters NOT stored,
+    # the default) -- the only case where `update_outputs_bwd`'s position-grad block (recompute-b_i path)
+    # AND its weights/values-grad block both run in the SAME call, thus exercising
+    # the hoisted sort (hoisted `sort_diracs`) shared between the two.
     positions = driver.array( [ 0.2, 0.5, 0.9 ] )
     weights   = driver.array( [ 1.0, 1.0, 2.0 ] )
     values    = driver.array( [ 1.0, 3.0, 1.0 ] )

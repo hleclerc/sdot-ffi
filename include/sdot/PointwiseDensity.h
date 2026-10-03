@@ -5,87 +5,87 @@
 #include <loom/support/containers/Vector.h>
 #include <loom/support/math.h>
 
-// `sdot::` et non `std::` pour les mathématiques -- voir `SumOfGaussians.cxx` et
-// `loom/support/math.h` : c'est le device qui choisit l'implémentation.
+// `sdot::` and not `std::` for the mathematics -- see `SumOfGaussians.cxx` and
+// `loom/support/math.h`: it is the device that picks the implementation.
 
 namespace sdot {
 
-// « Je ne sais pas m'intégrer, mais je sais me VALOIR en un point » -- la densité boîte noire,
-// emballée dans une quadrature adaptative.
+// "I do not know how to integrate myself, but I know how to EVALUATE myself at a point" -- the
+// black-box density, wrapped in an adaptive quadrature.
 //
-// C'est une IMPLÉMENTATION du contrat de morceau (voir `distributions/Distribution.py`), pas un
-// régime de l'intégrateur : `PowerDiagram::integrate_into` ne connaît aucune quadrature, il demande
-// à la densité l'intégrale sur un simplexe et lui rend la cotangente des sommets. Une densité qui
-// SAIT s'intégrer -- une formule fermée, une réduction à une fonction spéciale, comme
-// `SumOfGaussians` en 2D -- répond directement et ne passe jamais par ici. Une qui ne sait pas
-// s'emballe là-dedans, en une ligne :
+// It is an IMPLEMENTATION of the piece contract (see `distributions/Distribution.py`), not a
+// regime of the integrator: `PowerDiagram::integrate_into` knows no quadrature, it asks the
+// density for the integral over a simplex and hands it the cotangent of the vertices. A density
+// that KNOWS how to integrate itself -- a closed formula, a reduction to a special function, like
+// `SumOfGaussians` in 2D -- answers directly and never comes through here. One that does not
+// wraps itself in this, in one line:
 //
 //     void for_each_piece( const auto &cell, auto &&, auto &&func ) const {
 //         func( cell, PointwiseDensity{ *this } );
 //     }
 //
-// Ce qu'elle demande à `D` : `value_at( x )`, `gradient_at( x )`, `add_value_grad_at( gd, x, g )`.
+// What it asks of `D`: `value_at( x )`, `gradient_at( x )`, `add_value_grad_at( gd, x, g )`.
 //
-// = La règle, et pourquoi elle ne suffit pas seule
+// = The rule, and why it is not enough on its own
 //
-// `d + 1` noeuds de poids égal `1 / ( d + 1 )`, chacun portant `alpha` sur un sommet et `beta` sur
-// les `d` autres : la règle symétrique exacte jusqu'au degré 2. `alpha` sort de l'exactitude sur les
-// `lambda_i^2` : `alpha^2 + d beta^2 = 2 / ( d + 2 )` avec `alpha + d beta = 1`, donc
-// `( d + 1 ) alpha^2 - 2 alpha + ( 2 - d ) / ( d + 2 ) = 0`. En 2D on retrouve `( 2/3, 1/6 )`, en 3D
-// `( 0.585410, 0.138197 )` : les règles classiques du triangle et du tétraèdre.
+// `d + 1` nodes of equal weight `1 / ( d + 1 )`, each carrying `alpha` on one vertex and `beta` on
+// the other `d`: the symmetric rule exact up to degree 2. `alpha` comes from exactness on the
+// `lambda_i^2`: `alpha^2 + d beta^2 = 2 / ( d + 2 )` with `alpha + d beta = 1`, hence
+// `( d + 1 ) alpha^2 - 2 alpha + ( 2 - d ) / ( d + 2 ) = 0`. In 2D we recover `( 2/3, 1/6 )`, in 3D
+// `( 0.585410, 0.138197 )`: the classical rules of the triangle and the tetrahedron.
 //
-// Son erreur est en `( taille du simplexe / échelle de la densité ) ^ 4` -- inacceptable dès qu'une
-// cellule est grande devant une gaussienne étroite. D'où la SUBDIVISION : on bissecte le simplexe
-// sur sa plus longue arête tant que la règle et ses deux moitiés ne s'accordent pas. C'est le seul
-// moyen générique de rattraper une échelle qu'on ne connaît pas -- on ne demande justement pas à la
-// densité de la déclarer, elle est une boîte noire.
+// Its error goes as `( simplex size / density scale ) ^ 4` -- unacceptable as soon as a cell is
+// large compared to a narrow gaussian. Hence the SUBDIVISION: the simplex is bisected along its
+// longest edge as long as the rule and its two halves disagree. It is the only generic way to
+// catch up with a scale we do not know -- we precisely do not ask the density to declare it, it
+// is a black box.
 //
-// Une bissection DÉPILE UN élément et en EMPILE DEUX, donc la pile est bornée par la PROFONDEUR et
-// non par le nombre de feuilles : `max_depth + 2` entrées, chacune une matrice barycentrique
-// `( d + 1 ) ^ 2`. C'est ce qui la rend utilisable dans un kernel -- pas d'allocation, une borne
-// écrite en dur. Ce n'est pas gratuit pour autant (en 3D, ~1 Ko par work-item) et ce budget-là
-// n'est PAS compté par `PowerDiagram.measures`, qui ne connaît pas la densité.
+// A bisection POPS ONE element and PUSHES TWO, so the stack is bounded by the DEPTH and not by
+// the number of leaves: `max_depth + 2` entries, each a barycentric matrix `( d + 1 ) ^ 2`. That
+// is what makes it usable in a kernel -- no allocation, a bound written in the code. It is not
+// free for all that (in 3D, ~1 KB per work-item) and that budget is NOT counted by
+// `PowerDiagram.measures`, which does not know the density.
 //
-// = L'adjoint
+// = The adjoint
 //
-// Celui de CE QU'ON CALCULE, pas de l'intégrale idéale -- la seule façon d'être cohérent avec le
-// forward, et c'est pourquoi le backward REFAIT la même subdivision (le critère est déterministe,
-// donc il retombe sur les mêmes feuilles). Sur une feuille, deux termes : le volume bouge avec ses
-// sommets (cofacteur du déterminant), et un noeud est une combinaison barycentrique FIXE de ces
-// sommets, donc la cotangente de `gradient_at` s'y répartit avec ces poids-là. Les sommets d'une
-// feuille étant eux-mêmes des combinaisons barycentriques des sommets d'ORIGINE, une dernière
-// multiplication ramène tout où l'intégrateur l'attend.
+// That of WHAT IS COMPUTED, not of the ideal integral -- the only way to be consistent with the
+// forward, and that is why the backward REDOES the same subdivision (the criterion is
+// deterministic, so it lands on the same leaves). On a leaf, two terms: the volume moves with its
+// vertices (cofactor of the determinant), and a node is a FIXED barycentric combination of those
+// vertices, so the cotangent of `gradient_at` is spread over them with those weights. The vertices
+// of a leaf being themselves barycentric combinations of the ORIGINAL vertices, a final
+// multiplication brings everything back where the integrator expects it.
 template<class D>
 struct PointwiseDensity {
     using TF = typename D::TF;
     static constexpr int ct_dim = D::ct_dim;
 
-    /// pas constante sur un morceau : l'intégrateur passera par le découpage en simplices.
+    /// not constant over a piece: the integrator will go through the simplex decomposition.
     static constexpr bool is_constant = false;
 
-    /// Bissecter au moins jusque là avant d'avoir le droit de s'arrêter : la règle ne voit que
-    /// `d + 1` points, et une densité étroite peut tomber pile entre eux -- auquel cas le simplexe
-    /// et ses moitiés s'accorderaient sur zéro. C'est le garde-fou classique d'une quadrature
-    /// adaptative, et il coûte quatre évaluations.
+    /// Bisect at least down to here before being allowed to stop: the rule only sees
+    /// `d + 1` points, and a narrow density can fall exactly between them -- in which case the simplex
+    /// and its halves would agree on zero. It is the classical safeguard of an adaptive
+    /// quadrature, and it costs four evaluations.
     static constexpr int min_depth = 2;
-    static constexpr int max_depth = 8;     ///< borne la pile ET le pire cas de coût
-    /// Écart relatif toléré entre un simplexe et ses deux moitiés -- ce qui borne l'erreur
-    /// d'intégration, et c'est son seul rôle.
+    static constexpr int max_depth = 8;     ///< bounds the stack AND the worst-case cost
+    /// Relative gap tolerated between a simplex and its two halves -- what bounds the
+    /// integration error, and that is its only role.
     ///
-    /// Il borne AUSSI, involontairement, le saut que la valeur fait quand un sous-simplexe bascule
-    /// de « raffiner » à « accepter » : un schéma adaptatif par la valeur n'est lisse qu'à `rtol`
-    /// près, par construction. Ce n'est pas un réglage à durcir -- une différence finie divise ce
-    /// saut par son pas, donc AUCUN `rtol` raisonnable ne rend le schéma vérifiable à pas serré,
-    /// et le durcir ne fait que payer des niveaux de bissection pour rien. C'est au VÉRIFICATEUR
-    /// de prendre un pas à la mesure du schéma (voir les tests), et à un optimiseur de savoir qu'il
-    /// travaille sur une fonction lisse par morceaux.
+    /// It ALSO bounds, unintentionally, the jump the value makes when a sub-simplex flips
+    /// from "refine" to "accept": a value-driven adaptive scheme is only smooth to within `rtol`,
+    /// by construction. It is not a setting to tighten -- a finite difference divides this
+    /// jump by its step, so NO reasonable `rtol` makes the scheme checkable at a tight step,
+    /// and tightening it only pays bisection levels for nothing. It is up to the CHECKER
+    /// to take a step matched to the scheme (see the tests), and to an optimizer to know that it
+    /// works on a piecewise smooth function.
     static constexpr TF  rtol      = 1e-5;
 
     D dens;
 
-    /// Un sous-simplexe : ses `d + 1` sommets en coordonnées BARYCENTRIQUES du simplexe d'origine.
-    /// C'est cette représentation-là, et pas les points, qui permet à l'adjoint de revenir aux
-    /// sommets d'origine sans rien résoudre.
+    /// A sub-simplex: its `d + 1` vertices in BARYCENTRIC coordinates of the original simplex.
+    /// It is this representation, and not the points, that lets the adjoint get back to the
+    /// original vertices without solving anything.
     using Bary = Vector<Vector<TF,ct_dim+1>,ct_dim+1>;
 
     HD static Bary whole() {
@@ -104,20 +104,20 @@ struct PointwiseDensity {
         } );
     }
 
-    /// Bissection de MAUBACH : on coupe TOUJOURS l'arête `( sommet 0, sommet d )`, et les enfants
-    /// remettent le nouveau sommet en deuxième position, les autres décalés d'un cran.
+    /// MAUBACH bisection: we ALWAYS cut the edge `( vertex 0, vertex d )`, and the children
+    /// put the new vertex back in second position, the others shifted by one.
     ///
-    /// La règle est COMBINATOIRE -- elle ne regarde aucune longueur -- et c'est ce qui compte le
-    /// plus ici. Couper « la plus longue arête » paraît mieux, mais c'est un choix DISCONTINU :
-    /// deux arêtes presque égales, et un déplacement infinitésimal d'un germe fait basculer tout le
-    /// motif, donc la valeur calculée saute de l'erreur de quadrature -- et l'adjoint ne peut plus
-    /// correspondre à une différence finie. Avec une règle d'indices, le motif étant fixé, chaque
-    /// sous-simplexe est une fonction AFFINE des sommets d'origine : la valeur est lisse, et la
-    /// seule discontinuité restante est la décision de raffiner, bornée par `rtol`.
+    /// The rule is COMBINATORIAL -- it looks at no length -- and that is what matters most
+    /// here. Cutting "the longest edge" seems better, but it is a DISCONTINUOUS choice:
+    /// two almost equal edges, and an infinitesimal move of a seed flips the whole
+    /// pattern, so the computed value jumps by the quadrature error -- and the adjoint can no
+    /// longer match a finite difference. With an index rule, the pattern being fixed, each
+    /// sub-simplex is an AFFINE function of the original vertices: the value is smooth, and the
+    /// only remaining discontinuity is the decision to refine, bounded by `rtol`.
     ///
-    /// Le roulement des sommets est ce qui borne la dégradation des formes (Maubach 1995). Mesuré
-    /// sur 8 niveaux, la qualité minimale tient : 0.32 en 2D, 0.14 en 3D, 0.13 en 4D -- contre
-    /// 0.50 / 0.22 / 0.18 pour la plus longue arête, et 0.13 / 0.09 / 0.08 pour un cyclique naïf.
+    /// The vertex rotation is what bounds the degradation of shapes (Maubach 1995). Measured
+    /// over 8 levels, the minimal quality holds: 0.32 in 2D, 0.14 in 3D, 0.13 in 4D -- against
+    /// 0.50 / 0.22 / 0.18 for the longest edge, and 0.13 / 0.09 / 0.08 for a naive cyclic rule.
     HD static void bisect( const Bary &b, const auto &/*pts*/, Bary &lo, Bary &hi ) {
         Vector<TF,ct_dim+1> mid;
         for ( SI j = 0; j <= ct_dim; ++j )
@@ -133,8 +133,8 @@ struct PointwiseDensity {
         }
     }
 
-    /// Les feuilles de la subdivision, avec la valeur de la règle sur chacune. Le forward les somme,
-    /// le backward les redérive -- même parcours, donc mêmes feuilles.
+    /// The leaves of the subdivision, with the value of the rule on each. The forward sums them,
+    /// the backward differentiates them again -- same traversal, hence same leaves.
     HD void for_each_leaf( const auto &pts, auto &&func ) const {
         Vector<Bary,max_depth+2> stack;
         Vector<int,max_depth+2>  depth;
@@ -165,8 +165,8 @@ struct PointwiseDensity {
             const TF diff = fine > cv ? fine - cv : cv - fine;
             const TF mag  = fine < 0 ? -fine : fine;
             if ( dp >= min_depth && diff <= rtol * mag ) {
-                // on garde les DEUX MOITIÉS comme feuilles, pas le père : c'est `fine` que le
-                // forward additionne, donc c'est `fine` que le backward doit dériver.
+                // we keep the TWO HALVES as leaves, not the parent: it is `fine` that the
+                // forward adds up, so it is `fine` that the backward must differentiate.
                 func( lo, v0 );
                 func( hi, v1 );
                 continue;
@@ -183,8 +183,8 @@ struct PointwiseDensity {
         return res;
     }
 
-    /// les moments d'ordre 0, 1, 2 de la densité sur le simplexe, ACCUMULÉS dans `m` / `mx` / `m2`
-    /// -- la même règle, sur les mêmes feuilles, chaque noeud pesant `vol / ( d + 1 ) * rho( x )`.
+    /// the moments of order 0, 1, 2 of the density over the simplex, ACCUMULATED into `m` / `mx` / `m2`
+    /// -- the same rule, on the same leaves, each node weighing `vol / ( d + 1 ) * rho( x )`.
     HD void integrate_moments_over_simplex( const auto &pts, TF &m, auto &mx, TF &m2 ) const {
         for_each_leaf( pts, [&]( const Bary &b, TF ) {
             const auto P = points_of( b, pts );
@@ -207,8 +207,8 @@ struct PointwiseDensity {
 
             rule_bwd( points_of( b, pts ), g, gl, grad_dist );
 
-            // le sommet `k` de la feuille est `somme_j b[k][j] * pts[j]` : sa cotangente se
-            // redistribue avec exactement ces poids-là.
+            // vertex `k` of the leaf is `sum_j b[k][j] * pts[j]`: its cotangent is
+            // redistributed with exactly those weights.
             for ( SI k = 0; k <= ct_dim; ++k )
                 for ( SI j = 0; j <= ct_dim; ++j )
                     for ( PI c = 0; c < ct_dim; ++c )
@@ -216,7 +216,7 @@ struct PointwiseDensity {
         } );
     }
 
-    // ---- la règle elle-même, sur UN simplexe donné par ses points ---------------------------------
+    // ---- the rule itself, on ONE simplex given by its points ---------------------------------
 
     HD static auto barycentric() {
         const TF d = ct_dim;
@@ -231,13 +231,13 @@ struct PointwiseDensity {
         return res;
     }
 
-    /// `M` = les `d` arêtes issues de `P[ 0 ]`, en colonnes : son déterminant donne le volume, et
-    /// ses cofacteurs la dérivée de ce volume.
+    /// `M` = the `d` edges issued from `P[ 0 ]`, as columns: its determinant gives the volume, and
+    /// its cofactors the derivative of that volume.
     HD static auto edge_matrix( const auto &P ) {
         return Matrix<TF,ct_dim>::with_func( [&]( auto r, auto c ) { return P[ c + 1 ][ r ] - P[ 0 ][ r ]; } );
     }
 
-    /// le noeud `q` : `beta` partout, `alpha` sur le sommet `q`.
+    /// node `q`: `beta` everywhere, `alpha` on vertex `q`.
     HD static auto node( const auto &P, SI q ) {
         const auto ab = barycentric();
         auto tot = Vector<TF,ct_dim>::zeros();
@@ -267,8 +267,8 @@ struct PointwiseDensity {
             s += dens.value_at( node( P, q ) );
         s /= ( ct_dim + 1 );
 
-        // ---- la part du VOLUME : `d|det|/dM = signe( det ) * cofacteur( M )`, et chaque colonne de
-        // `M` est un sommet moins le premier, donc le premier ramasse MOINS la somme des colonnes.
+        // ---- the VOLUME part: `d|det|/dM = sign( det ) * cofactor( M )`, and each column of
+        // `M` is a vertex minus the first, so the first picks up MINUS the sum of the columns.
         const TF gv = ( det < 0 ? -g : g ) * s / factorial();
         for ( PI r = 0; r < ct_dim; ++r ) {
             TF row_sum = 0;
@@ -281,7 +281,7 @@ struct PointwiseDensity {
             gP[ 0 ][ r ] -= row_sum;
         }
 
-        // ---- la part des NOEUDS, et au même point celle des PARAMÈTRES de la densité
+        // ---- the NODES part, and at the same point that of the density PARAMETERS
         const TF gn = g * vol / ( ct_dim + 1 );
         for ( SI q = 0; q <= ct_dim; ++q ) {
             const auto x = node( P, q );

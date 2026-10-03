@@ -1,28 +1,28 @@
-// LE PENDANT 2D DE `power_3d_light.cpp` : ce que couterait une version allegee de CGAL en 2D.
+// THE 2D COUNTERPART OF `power_3d_light.cpp` : what a lightened version of CGAL would cost in 2D.
 //
-// La question posee est celle du NOYAU. `Exact_predicates_inexact_constructions_kernel` (Epick)
-// evalue chaque predicat d'orientation / in_power_circle d'abord en ARITHMETIQUE D'INTERVALLES ; si
-// l'intervalle contient zero -- c'est-a-dire si le signe n'est pas certain -- il rejoue le predicat
-// en exact. `-DLIGHT_KERNEL` remplace le tout par `Simple_cartesian<double>` : le predicat devient
-// un determinant FP64 nu, sans intervalle et sans repli. C'est EXACTEMENT ce que fait notre coupe.
+// The question asked is that of the KERNEL. `Exact_predicates_inexact_constructions_kernel` (Epick)
+// evaluates each orientation / in_power_circle predicate first in INTERVAL ARITHMETIC ; if
+// the interval contains zero -- that is, if the sign is not certain -- it replays the predicate
+// in exact arithmetic. `-DLIGHT_KERNEL` replaces all of it with `Simple_cartesian<double>` : the predicate becomes
+// a bare FP64 determinant, with no interval and no fallback. This is EXACTLY what our cut does.
 //
-// La difference des deux binaires est donc le prix de la robustesse, et rien d'autre : meme
-// algorithme, meme structure, meme ordre d'insertion (Hilbert, insertion en vrac).
+// The difference between the two binaries is therefore the price of robustness, and nothing else : same
+// algorithm, same structure, same insertion order (Hilbert, bulk insertion).
 //
-//   `--cells` enchaine NOTRE cellule 2D (`CellSoAT`) et NOTRE mesure sur les voisins rendus par la
-//   triangulation. C'est la « rejoue de la connectivite » : on ne tente que les coupes FINALES.
+//   `--cells` chains OUR 2D cell (`CellSoAT`) and OUR measure on the neighbours returned by the
+//   triangulation. This is the "connectivity replay" : only the FINAL cuts are attempted.
 //
-// Attention : sans filtre, une degenerescence peut casser la triangulation. Les controles sont le
-// nombre de sommets et la somme des aires (qui doit valoir 1).
+// Warning : without a filter, a degeneracy can break the triangulation. The checks are the
+// number of vertices and the sum of the areas (which must equal 1).
 
 #ifdef LIGHT_KERNEL
 #   include <CGAL/Simple_cartesian.h>
 using K = CGAL::Simple_cartesian<double>;
-static constexpr const char *nom_noyau = "Simple_cartesian<double> (predicats FP64 nus)";
+static constexpr const char *kernel_name = "Simple_cartesian<double> (bare FP64 predicates)";
 #else
 #   include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 using K = CGAL::Exact_predicates_inexact_constructions_kernel;
-static constexpr const char *nom_noyau = "Epick (predicats filtres exacts)";
+static constexpr const char *kernel_name = "Epick (exact filtered predicates)";
 #endif
 
 #include <CGAL/Regular_triangulation_2.h>
@@ -44,7 +44,7 @@ using Bare = Rt::Bare_point;
 
 namespace {
 
-std::size_t sommets_att( const Rt &rt ) { return rt.number_of_vertices(); }
+std::size_t vertex_count( const Rt &rt ) { return rt.number_of_vertices(); }
 
 double now() {
     using namespace std::chrono;
@@ -53,7 +53,7 @@ double now() {
 
 bool load_cloud( const std::string &path, std::vector<Wp> &pts ) {
     std::FILE *f = std::fopen( path.c_str(), "rb" );
-    if ( ! f ) { std::printf( "impossible d'ouvrir '%s'\n", path.c_str() ); return false; }
+    if ( ! f ) { std::printf( "cannot open '%s'\n", path.c_str() ); return false; }
     std::fseek( f, 0, SEEK_END );
     const long sz = std::ftell( f );
     std::fseek( f, 0, SEEK_SET );
@@ -120,8 +120,8 @@ int main( int argc, char **argv ) {
     }
 
     double tt = 1e30, ta = 1e30, tc = 1e30;
-    double voisins = 0, somme = 0;
-    std::size_t sommets = 0, caches = 0;
+    double neighbors = 0, sum = 0;
+    std::size_t vertices = 0, hidden = 0;
 
     for ( int r = 0; r < reps; ++r ) {
         const double t0 = now();
@@ -129,9 +129,9 @@ int main( int argc, char **argv ) {
         rt.insert( pts.begin(), pts.end() );
         const double t1 = now();
 
-        // L'ADJACENCE. En 2D elle est DEJA legere : `incident_vertices` est un circulateur qui suit
-        // les faces autour du sommet, sans conteneur associatif temporaire -- contrairement a la
-        // version 3D. Il n'y a donc pas de variante « maison » a opposer ici.
+        // THE ADJACENCY. In 2D it is ALREADY light : `incident_vertices` is a circulator that follows
+        // the faces around the vertex, with no temporary associative container -- unlike the
+        // 3D version. There is therefore no "home-made" variant to oppose here.
         std::vector<Rt::Vertex_handle> adj;
         double vs = 0;
         for ( auto v = rt.finite_vertices_begin(); v != rt.finite_vertices_end(); ++v ) {
@@ -144,47 +144,47 @@ int main( int argc, char **argv ) {
         }
         const double t2 = now();
 
-        // LA REJOUE DE LA CONNECTIVITE. En deux temps, et c'est le point : la LISTE finale des
-        // voisins est batie d'abord, HORS chronometre (c'est le travail que notre accelerateur
-        // remplace, pas celui qu'on veut mesurer) ; puis on ne chronometre que la coupe et la
-        // mesure, sur cette liste et sur elle seule. Ce que ca donne est donc le plancher
-        // geometrique : le temps d'UNE cellule si l'on savait d'avance, sans jamais se tromper,
-        // quels germes la coupent.
+        // THE CONNECTIVITY REPLAY. In two steps, and that is the point : the final LIST of
+        // neighbours is built first, OUTSIDE the timer (this is the work that our accelerator
+        // replaces, not the one we want to measure) ; then only the cut and the
+        // measure are timed, on this list and on it alone. What this gives is therefore the geometric
+        // floor : the time of ONE cell if one knew in advance, without ever being wrong,
+        // which seeds cut it.
         double sv = 0;
         if ( cells ) {
-            std::vector<double> moi, vois;                  // `moi` : x,y,w du germe. `vois` : idem
-            std::vector<std::size_t> off( 1, 0 );           // decoupage de `vois` par germe
-            moi.reserve( 3 * sommets_att( rt ) );
+            std::vector<double> own, nbrs;                  // `own` : x,y,w of the seed. `nbrs` : same
+            std::vector<std::size_t> off( 1, 0 );           // split of `nbrs` per seed
+            own.reserve( 3 * vertex_count( rt ) );
             for ( auto v = rt.finite_vertices_begin(); v != rt.finite_vertices_end(); ++v ) {
                 const auto &p0 = v->point();
-                moi.push_back( p0.x() ); moi.push_back( p0.y() ); moi.push_back( p0.weight() );
+                own.push_back( p0.x() ); own.push_back( p0.y() ); own.push_back( p0.weight() );
                 Rt::Vertex_circulator c = rt.incident_vertices( v ), done( c );
                 if ( c != nullptr ) do {
                     if ( rt.is_infinite( c ) ) continue;
                     const auto &p1 = c->point();
-                    vois.push_back( p1.x() ); vois.push_back( p1.y() ); vois.push_back( p1.weight() );
+                    nbrs.push_back( p1.x() ); nbrs.push_back( p1.y() ); nbrs.push_back( p1.weight() );
                 } while ( ++c != done );
-                off.push_back( vois.size() / 3 );
+                off.push_back( nbrs.size() / 3 );
             }
 
             const double u0 = now();
             for ( std::size_t i = 0; i + 1 < off.size(); ++i ) {
-                const double x0 = moi[ 3 * i ], y0 = moi[ 3 * i + 1 ], w0 = moi[ 3 * i + 2 ];
+                const double x0 = own[ 3 * i ], y0 = own[ 3 * i + 1 ], w0 = own[ 3 * i + 2 ];
                 pd::CellSoAT<64> cl;
                 cl.init_as_unit_square();
                 pd::SI id = 0;
                 for ( std::size_t j = off[ i ]; j < off[ i + 1 ]; ++j ) {
-                    const double x1 = vois[ 3 * j ], y1 = vois[ 3 * j + 1 ], w1 = vois[ 3 * j + 2 ];
+                    const double x1 = nbrs[ 3 * j ], y1 = nbrs[ 3 * j + 1 ], w1 = nbrs[ 3 * j + 2 ];
                     const double dx = x1 - x0, dy = y1 - y0;
                     const double o = dx * ( x0 + x1 ) / 2 + dy * ( y0 + y1 ) / 2 + ( w0 - w1 ) / 2;
                     cl.cut( dx, dy, o, id++ );
                 }
-                // LES LEURRES : `--decoy K` ajoute K plans PRIS SUR DE VRAIS GERMES, mais assez
-                // loin pour qu'aucun ne coupe. La pente en K est le prix d'UNE COUPE INUTILE --
-                // celle que notre accelerateur tente et qui ne rapporte rien.
+                // THE DECOYS : `--decoy K` adds K planes TAKEN FROM REAL SEEDS, but far enough
+                // away that none of them cuts. The slope in K is the price of ONE USELESS CUT --
+                // the kind our accelerator attempts and that yields nothing.
                 for ( int d = 0; d < decoy; ++d ) {
                     const std::size_t j = ( i + 50 + std::size_t( d ) * 7 ) % ( off.size() - 1 );
-                    const double x1 = moi[ 3 * j ], y1 = moi[ 3 * j + 1 ], w1 = moi[ 3 * j + 2 ];
+                    const double x1 = own[ 3 * j ], y1 = own[ 3 * j + 1 ], w1 = own[ 3 * j + 2 ];
                     const double dx = x1 - x0, dy = y1 - y0;
                     const double o = dx * ( x0 + x1 ) / 2 + dy * ( y0 + y1 ) / 2 + ( w0 - w1 ) / 2;
                     cl.cut( dx, dy, o, id++ );
@@ -192,43 +192,43 @@ int main( int argc, char **argv ) {
                 sv += cl.measure();
             }
             tc = std::min( tc, now() - u0 );
-            somme = sv;
+            sum = sv;
 
-            // LE VIDAGE, une seule fois et HORS chronometre (voir la version 3D).
+            // THE DUMP, only once and OUTSIDE the timer (see the 3D version).
             if ( ! dump.empty() && r == 0 ) {
                 std::vector<double> ref( off.size() - 1 );
                 for ( std::size_t i = 0; i + 1 < off.size(); ++i ) {
-                    const double x0 = moi[ 3 * i ], y0 = moi[ 3 * i + 1 ], w0 = moi[ 3 * i + 2 ];
+                    const double x0 = own[ 3 * i ], y0 = own[ 3 * i + 1 ], w0 = own[ 3 * i + 2 ];
                     pd::CellSoAT<64> cl;
                     cl.init_as_unit_square();
                     pd::SI id = 0;
                     for ( std::size_t j = off[ i ]; j < off[ i + 1 ]; ++j ) {
-                        const double x1 = vois[ 3 * j ], y1 = vois[ 3 * j + 1 ], w1 = vois[ 3 * j + 2 ];
+                        const double x1 = nbrs[ 3 * j ], y1 = nbrs[ 3 * j + 1 ], w1 = nbrs[ 3 * j + 2 ];
                         const double dx = x1 - x0, dy = y1 - y0;
                         const double o = dx * ( x0 + x1 ) / 2 + dy * ( y0 + y1 ) / 2 + ( w0 - w1 ) / 2;
                         cl.cut( dx, dy, o, id++ );
                     }
                     ref[ i ] = cl.measure();
                 }
-                dump_csr( dump, 2, moi, off, vois, ref );
+                dump_csr( dump, 2, own, off, nbrs, ref );
             }
         }
         tt = std::min( tt, t1 - t0 );
         ta = std::min( ta, t2 - t1 );
-        sommets = rt.number_of_vertices();
-        caches = std::size_t( n ) - sommets;
-        voisins = vs / double( sommets );
+        vertices = rt.number_of_vertices();
+        hidden = std::size_t( n ) - vertices;
+        neighbors = vs / double( vertices );
     }
 
-    std::printf( "%-46s n=%d   noyau %s\n", load.empty() ? "uniforme" : load.c_str(), n, nom_noyau );
-    std::printf( "   triangulation  %7.3f s (%7.0f ns/germe)\n", tt, 1e9 * tt / n );
-    std::printf( "   adjacence      %7.3f s (%7.0f ns/germe)\n", ta, 1e9 * ta / n );
+    std::printf( "%-46s n=%d   kernel %s\n", load.empty() ? "uniforme" : load.c_str(), n, kernel_name );
+    std::printf( "   triangulation  %7.3f s (%7.0f ns/seed)\n", tt, 1e9 * tt / n );
+    std::printf( "   adjacency      %7.3f s (%7.0f ns/seed)\n", ta, 1e9 * ta / n );
     if ( cells ) {
-        std::printf( "   coupe + mesure %7.3f s (%7.0f ns/germe)   leurres %d\n", tc, 1e9 * tc / n, decoy );
-        std::printf( "   CHAINE ENTIERE %7.3f s (%7.0f ns/germe)   voisins %.2f   caches %zu   somme %.9f\n",
-                     tt + ta + tc, 1e9 * ( tt + ta + tc ) / n, voisins, caches, somme );
+        std::printf( "   cut + measure  %7.3f s (%7.0f ns/seed)   decoys %d\n", tc, 1e9 * tc / n, decoy );
+        std::printf( "   FULL CHAIN     %7.3f s (%7.0f ns/seed)   neighbours %.2f   hidden %zu   sum %.9f\n",
+                     tt + ta + tc, 1e9 * ( tt + ta + tc ) / n, neighbors, hidden, sum );
     } else
-        std::printf( "   BORNE INF      %7.3f s (%7.0f ns/germe)   voisins %.2f   caches %zu\n",
-                     tt + ta, 1e9 * ( tt + ta ) / n, voisins, caches );
+        std::printf( "   LOWER BOUND    %7.3f s (%7.0f ns/seed)   neighbours %.2f   hidden %zu\n",
+                     tt + ta, 1e9 * ( tt + ta ) / n, neighbors, hidden );
     return 0;
 }

@@ -9,12 +9,12 @@
 
 namespace sdot {
 
-// LE POLYGONE ( `Cell_2.py` ) : les sommets en ordre cyclique, la coupe `i` porte `[ v_i, v_i+1 ]`.
+// THE POLYGON ( `Cell_2.py` ): the vertices in cyclic order, cut `i` carries `[ v_i, v_i+1 ]`.
 //
-// Les tenseurs sont ceux de `Cell_2.py` -- le format PRATIQUE, un sommet par ligne, dans le flottant
-// de l'appelant. Un kernel ne travaille jamais dessus directement : il pose la cellule dans sa
-// forme locale ( `Local`, sur le scratch de l'item, dans le flottant du noyau ), travaille, et la
-// repose. Les operations elles-memes sont dans `cell/Ops.h`, communes aux trois regimes.
+// The tensors are those of `Cell_2.py` -- the CONVENIENT format, one vertex per row, in the caller's
+// float. A kernel never works on them directly: it puts the cell into its local
+// form ( `Local`, on the item's scratch, in the kernel's float ), works, and puts it
+// back. The operations themselves are in `cell/Ops.h`, shared by the three regimes.
 SDOT_TEMPLATE_DECL_FOR_Cell_2
 struct Cell_2 {
     SDOT_ATTRIBUTES_OF_Cell_2

@@ -1,62 +1,62 @@
-"""LA SOLUTION d'un transport semi-discret en dimension `d >= 2` : les poids d'un diagramme de
-puissance tels que la masse de chaque cellule contre la densité cible égale la masse du dirac
-correspondant.
+"""THE SOLUTION of a semi-discrete transport in dimension `d >= 2`: the weights of a power
+diagram such that the mass of each cell against the target density equals the mass of the
+matching dirac.
 
-Elle se demande à un `OtProblem`, et pas autrement :
+It is requested from an `OtProblem`, and in no other way:
 
     sol = OtProblem( SumOfDiracs( pos ), image ).solve()
-    sol = ot_solve( SumOfDiracs( pos ), image )        # le même, pour un transport résolu UNE fois
+    sol = ot_solve( SumOfDiracs( pos ), image )        # the same, for a transport solved ONCE
 
-TOUT L'AJUSTEMENT EST EN C++ ( `sdot/sdotplan/` ), en UN `driver.call` : le point de départ, le
-Newton amorti, ses diagrammes, le laplacien, le solveur linéaire, l'amortissement. Python ne fait
-que poser le problème et lire ce qui en sort. C'est ce que le banc `solvers_des_familles` a
-conclu ( README § 3, § 7, § 9, § 10 ) :
+THE WHOLE FIT IS IN C++ ( `sdot/sdotplan/` ), in ONE `driver.call`: the starting point, the
+damped Newton, its diagrams, the laplacian, the linear solver, the damping. Python only sets up
+the problem and reads what comes out. That is what the `solvers_des_familles` bench concluded
+( README § 3, § 7, § 9, § 10 ):
 
-  * le NEWTON AMORTI de Kitagawa-Mérigot-Thibert gagne partout, de 2x à 4x en diagrammes comme en
-    temps, contre L-BFGS et le gradient conjugué sur le dual, quel que soit leur
-    préconditionnement -- la difficulté du transport semi-discret n'est pas la non-linéarité du
-    dual, c'est sa NON-RÉGULARITÉ ( les cellules qui se vident ), et un pas de gradient s'y
-    écrase comme un pas de Newton, en moins bien ( `sdotplan/Newton.h` ) ;
-  * la hessienne est le laplacien du graphe de Laguerre, assemblé SANS TRI depuis les facettes
-    du diagramme qui a mesuré le résidu -- un balayage livre les deux ( `sdotplan/Balayage.h`,
-    `sdotplan/Laplacien.h` ) ; Cholesky creux en 2D, multigrille algébrique au-delà et en grand
-    ( `sdotplan/Lineaire.h` ) ;
-  * le pas d'essai repart du dernier pas accepté, jamais de 1 ( dix diagrammes par pas gagnés
-    dans la phase linéaire ) ; en 2D, les LIMITES des cellules qui s'écrasent le long de la
-    direction remplacent les essais à l'aveugle ( `sdotplan/Limites.h` ).
+  * the DAMPED NEWTON of Kitagawa-Mérigot-Thibert wins everywhere, by 2x to 4x in diagrams as in
+    time, against L-BFGS and the conjugate gradient on the dual, whatever their
+    preconditioning -- the difficulty of semi-discrete transport is not the non-linearity of the
+    dual, it is its NON-REGULARITY ( cells that empty out ), and a gradient step is crushed
+    there just like a Newton step, only worse ( `sdotplan/Newton.h` );
+  * the hessian is the laplacian of the Laguerre graph, assembled WITHOUT SORTING from the facets
+    of the diagram that measured the residual -- one sweep delivers both ( `sdotplan/Sweep.h`,
+    `sdotplan/Laplacian.h` ); sparse Cholesky in 2D, algebraic multigrid beyond and at large
+    sizes ( `sdotplan/Linear.h` );
+  * the trial step restarts from the last accepted step, never from 1 ( ten diagrams per step
+    saved in the linear phase ); in 2D, the LIMITS of the cells being crushed along the
+    direction replace blind trials ( `sdotplan/Bounds.h` ).
 
-= Le point de départ
+= The starting point
 
-Newton demande un départ ADMISSIBLE ( aucune cellule vide ). Le Voronoï l'est dès que les diracs
-sont dans le domaine ; sinon, ou si les poids donnés vident une cellule, le C++ choisit lui-même le
-meilleur des trois -- les poids donnés, le Voronoï, la SIMILITUDE qui ramène le nuage dans le
-domaine -- et le dit ( `stats[ "depart" ]` ). Voir `sdotplan/Solve.h`.
+Newton needs an ADMISSIBLE start ( no empty cell ). Voronoi is one as soon as the diracs are in
+the domain; otherwise, or if the given weights empty a cell, the C++ itself picks the best of
+the three -- the given weights, Voronoi, the SIMILARITY that brings the cloud back into the
+domain -- and reports it ( `stats[ "start" ]` ). See `sdotplan/Solve.h`.
 
-= Ce que la solution PORTE, et pourquoi ce n'est pas qu'un vecteur de poids
+= What the solution CARRIES, and why it is not just a weight vector
 
-`weights` est la réponse quand les germes sont distincts. Quand deux germes sont CONFONDUS à `1e-8`,
-il n'existe pas de couple de `double` qui code le plan qui les sépare à `1e-9` près : le banc l'a
-mesuré et calculé ( README § 23.11 ), et c'est pourquoi un solveur dont l'interface est `w` plafonne
-vers `1e-6` sur un nuage dégénéré. La solution porte donc AUSSI l'agrégat -- `clusters`,
-`cluster_nu` -- même quand il n'y a aucune grappe, pour que la règle soit lisible une fois pour
-toutes : si le consommateur veut des CELLULES, il prend le diagramme réduit plus les plans, et tout
-est exact ; s'il veut des POIDS, il accepte le plancher `eps |w| / ( 2 delta h )`.
+`weights` is the answer when the seeds are distinct. When two seeds are MERGED to `1e-8`,
+there is no pair of `double`s that encodes the plane separating them to within `1e-9`: the bench
+measured and computed it ( README § 23.11 ), and that is why a solver whose interface is `w`
+plateaus around `1e-6` on a degenerate cloud. The solution therefore ALSO carries the aggregate
+-- `clusters`, `cluster_nu` -- even when there is no cluster, so that the rule is readable once
+and for all: if the consumer wants CELLS, it takes the reduced diagram plus the planes, and
+everything is exact; if it wants WEIGHTS, it accepts the floor `eps |w| / ( 2 delta h )`.
 
-Ce que ça ne coûte pas : le COÛT DE TRANSPORT est aveugle à cette dégénérescence ( § 23.12, écart
-relatif `1.2e-17` ), donc tout ce qui est une somme pondérée par les masses -- le coût, la masse
-totale, un moment global -- n'a rien à en savoir.
+What it does not cost: the TRANSPORT COST is blind to this degeneracy ( § 23.12, relative gap
+`1.2e-17` ), so anything that is a sum weighted by the masses -- the cost, the total mass, a
+global moment -- need know nothing about it.
 
-= Un seul diagramme
+= A single diagram
 
-Les positions sont les CONSTANTES de l'ajustement : le diagramme est bâti UNE FOIS ( son arbre
-avec ), et le solveur ne fait que lui POSER les poids essayés -- ce qui, pour un stockage BSP,
-refait le majorant des poids de chaque nœud et rien d'autre. Ce qu'il écrit ( les poids triés, les
-majorants ) sont des SORTIES de l'appel, reprises par le diagramme après coup : les entrées d'un
-appel sont en lecture seule.
+The positions are the CONSTANTS of the fit: the diagram is built ONCE ( its tree included ), and
+the solver only SETS the trial weights on it -- which, for BSP storage, recomputes the weight
+upper bound of each node and nothing else. What it writes ( the sorted weights, the upper
+bounds ) are OUTPUTS of the call, taken back by the diagram afterwards: the inputs of a call
+are read-only.
 
-`PowerDiagram` et `Cell` sont des OUTILS À LA DEMANDE : `sol.power_diagram()` les fabrique pour
-dessiner ou pour une fonctionnelle qu'on n'avait pas prévue. Rien dans la résolution ne passe par
-eux côté Python.
+`PowerDiagram` and `Cell` are ON-DEMAND TOOLS: `sol.power_diagram()` builds them for drawing or
+for a functional that was not anticipated. Nothing in the solve goes through them on the
+Python side.
 """
 
 import warnings
@@ -71,43 +71,43 @@ from .CellScratch import fp_size
 from .PowerDiagram import PowerDiagram
 
 
-# ce que `stats` porte, dans l'ordre de `sdotplan/Solve.h::Stat`
-_STATS = [ "fin", "reste", "reste0", "nb_iter", "nb_diag", "nb_recul", "t_maj", "t_diag", "t_asm", "t_lin", "t_lim", "eps",
-           "masse_domaine", "nb_deborde", "nb_cell_lim", "nb_tours_essai", "lin_nb_hier", "lin_nb_iter", "lin_pire", "depart", "t_total",
-           "nb_etapes", "min_masse_depart" ]
-# une ligne de `history`, dans l'ordre de `sdotplan/Solve.h::Hist`
+# what `stats` carries, in the order of `sdotplan/Solve.h::Stat`
+_STATS = [ "status", "residual", "residual0", "nb_iter", "nb_diag", "nb_backtracks", "t_majorant", "t_diag", "t_asm", "t_lin", "t_lim", "eps",
+           "domain_mass", "nb_overflowed", "nb_cell_lim", "nb_limit_rounds", "lin_nb_hierarchies", "lin_nb_iter", "lin_worst", "start", "t_total",
+           "nb_continuation_steps", "min_start_mass" ]
+# one row of `history`, in the order of `sdotplan/Solve.h::Hist`
 _HISTORY = [ "step", "t", "residual_l2", "min_measure", "max_abs_residual", "nb_diag", "nb_evals", "s" ]
-_FIN = { 0: "en cours", 1: "converge", 2: "max iterations", 3: "stagnation", 4: "solveur lineaire en echec" }
-_DEPART = { 0: "weights0", 1: "voronoi", 2: "similitude" }
+_STATUS = { 0: "running", 1: "converged", 2: "max iterations", 3: "stagnation", 4: "linear solver failure" }
+_START = { 0: "weights0", 1: "voronoi", 2: "similarity" }
 _LIN = { "auto": 0, "cholesky": 1, "amg": 2, "cg": 3 }
-_PAS = { "trials": 0, "limits": 1 }
+_STEP = { "trials": 0, "limits": 1 }
 _CONTINUATION = { "never": 0, "auto": 1, "always": 2 }
 
-#: les anciens arguments de `SdotPlanNd( src, dst, ... )`, et où ils vivent maintenant -- lu par le
-#: chemin déprécié ( voir `__init__` )
+#: the old arguments of `SdotPlanNd( src, dst, ... )`, and where they live now -- read by the
+#: deprecated path ( see `__init__` )
 _DEPRECATED_TO_TUNING = ( "accelerator", "memory", "step", "linear_solver", "mass_rtol", "t_min",
                           "max_backtracks", "restart_factor", "conv_start", "conv_ratio", "conv_min",
                           "conv_threshold" )
 
 
 class _Options( Aggregate ):
-    """les réglages du solveur, tels que `sdotplan/Solve.h` les lit"""
+    """the solver settings, as `sdotplan/Solve.h` reads them"""
     mass_tol       : RealTensor
     mass_rtol      : RealTensor
     t_min          : RealTensor
     mult_ok        : RealTensor
-    facteur        : RealTensor
+    factor         : RealTensor
     beta0          : RealTensor
     mult_lim       : RealTensor
-    confiance      : RealTensor
+    confidence     : RealTensor
     conv_s0        : RealTensor
     conv_ratio     : RealTensor
     conv_min       : RealTensor
-    conv_seuil     : RealTensor
+    conv_threshold : RealTensor
     max_iter       : IntTensor
-    max_reculs     : IntTensor
+    max_backtracks : IntTensor
     lin            : IntTensor
-    pas            : IntTensor
+    step           : IntTensor
     trace          : IntTensor
     continuation   : IntTensor
     cap0           : IntTensor
@@ -115,8 +115,8 @@ class _Options( Aggregate ):
 
 
 class _History( Aggregate ):
-    """un pas ACCEPTÉ par ligne ( `step = 0` : le départ ), et les poids de chaque pas si on les a
-    demandés ( `weights`, sinon `Unbound` -- un tableau `[ pas, n ]` qu'on ne veut pas toujours )"""
+    """one ACCEPTED step per row ( `step = 0`: the start ), and the weights of each step if they
+    were requested ( `weights`, otherwise `Unbound` -- a `[ step, n ]` array that is not always wanted )"""
     rows      : RealTensor[ "num_step", "num_hist" ]
     weights   : RealTensor[ "num_step", "num_point" ]
     num_step  : Axis[ "nb_steps" ]
@@ -128,27 +128,27 @@ class _History( Aggregate ):
 
 
 class SdotPlanNd:
-    """voir la docstring du module"""
+    """see the module docstring"""
 
-    # -- comment on en obtient une -------------------------------------------------------------
+    # -- how to get one -----------------------------------------------------------------------
 
     @classmethod
     def _solve( cls, problem, settings, verbose, warm = None ):
-        """LE chemin : `OtProblem.solve()` et lui seul passe par ici. `warm` est la dernière SOLUTION
-        que le problème a rendue -- le départ quand les réglages n'en imposent pas ( voir
-        `_depart_du_plan` )."""
+        """THE path: `OtProblem.solve()` and only it goes through here. `warm` is the last SOLUTION
+        the problem returned -- the start when the settings do not impose one ( see
+        `_start_from_plan` )."""
         self = cls.__new__( cls )
         self._build( problem, settings, verbose, warm )
         return self
 
     def __init__( self, src_dist, dst_dist, verbose = False, **kwargs ):
-        """DÉPRÉCIÉ -- `OtProblem( src_dist, dst_dist ).solve( Iterative( ... ) )`.
+        """DEPRECATED -- `OtProblem( src_dist, dst_dist ).solve( Iterative( ... ) )`.
 
-        Il y a maintenant une seule porte d'entrée : un problème se pose ( `OtProblem` ), puis on
-        lui demande une solution. Ce constructeur traduit les anciens arguments et sera retiré."""
-        warnings.warn( "SdotPlanNd( src, dst, ... ) est deprecie : poser le probleme puis le "
-                       "resoudre -- OtProblem( src, dst ).solve( Iterative( ... ) ). Voir la "
-                       "docstring d'`OtProblem`.", DeprecationWarning, stacklevel = 2 )
+        There is now a single entry point: a problem is posed ( `OtProblem` ), then a solution is
+        requested from it. This constructor translates the old arguments and will be removed."""
+        warnings.warn( "SdotPlanNd( src, dst, ... ) is deprecated: pose the problem then "
+                       "solve it -- OtProblem( src, dst ).solve( Iterative( ... ) ). See the "
+                       "docstring of `OtProblem`.", DeprecationWarning, stacklevel = 2 )
         from .OtProblem import Iterative, OtProblem, Tuning
 
         kw = dict( kwargs )
@@ -160,49 +160,49 @@ class SdotPlanNd:
         tuning = Tuning( **{ k: kw.pop( k ) for k in _DEPRECATED_TO_TUNING if k in kw } )
         self._build( OtProblem( src_dist, dst_dist ), Iterative( tuning = tuning, **kw ), verbose )
 
-    # -- ce que l'appel fait -------------------------------------------------------------------
+    # -- what the call does -------------------------------------------------------------------
 
     def _build( self, problem, settings, verbose, warm = None ):
-        # le solveur est du code HOTE sur la file CPU ( `sdotplan/Balayage.h` ) : un driver dont le device
-        # est un GPU ne peut pas l'appeler aujourd'hui -- `LOOM_DEVICE=cpu`, ou un driver CPU
+        # the solver is HOST code on the CPU queue ( `sdotplan/Sweep.h` ): a driver whose device
+        # is a GPU cannot call it today -- `LOOM_DEVICE=cpu`, or a CPU driver
         if not driver.device.is_cpu:
-            raise NotImplementedError( "SdotPlanNd : le solveur tourne sur le CPU pour l'instant ( les balayages et le "
-                                       "solveur lineaire sont du code hote ) ; choisir le device CPU ( LOOM_DEVICE=cpu )" )
+            raise NotImplementedError( "SdotPlanNd: the solver runs on the CPU for now ( the sweeps and the "
+                                       "linear solver are host code ); choose the CPU device ( LOOM_DEVICE=cpu )" )
         tun = settings.tuning
-        #: le problème dont on est la solution
+        #: the problem this is the solution of
         self.problem = problem
         src_dist, dst_dist = problem.source, problem.target
         d = problem.nb_dims
 
-        # le domaine : le support de la densité, qui doit le borner ( lève sinon ). `PowerDiagram`
-        # l'ajoute lui-même depuis la distribution -- on le DEMANDE ici pour que le refus soit dit
-        # avant qu'on ait alloué quoi que ce soit.
+        # the domain: the support of the density, which must bound it ( raises otherwise ).
+        # `PowerDiagram` adds it itself from the distribution -- we ASK for it here so that the
+        # refusal is reported before anything has been allocated.
         problem.domain
 
-        # le pas par les limites n'existe qu'en 2D ( `sdotplan/Limites.h` ) ; ailleurs, les essais
+        # the limits-based step only exists in 2D ( `sdotplan/Bounds.h` ); elsewhere, trials
         step = { "auto": "limits" if d == 2 else "trials" }.get( tun.step, tun.step )
         if step == "limits" and d != 2:
-            raise ValueError( "step = 'limits' : 2D seulement pour l'instant ( voir `sdotplan/Limites.h` )" )
-        if step not in _PAS:
-            raise ValueError( f"step inconnu : { tun.step !r } ( 'auto', 'trials' ou 'limits' )" )
+            raise ValueError( "step = 'limits': 2D only for now ( see `sdotplan/Bounds.h` )" )
+        if step not in _STEP:
+            raise ValueError( f"unknown step: { tun.step !r } ( 'auto', 'trials' or 'limits' )" )
         if tun.linear_solver not in _LIN:
-            raise ValueError( f"linear_solver inconnu : { tun.linear_solver !r } ( { ', '.join( _LIN ) } )" )
+            raise ValueError( f"unknown linear_solver: { tun.linear_solver !r } ( { ', '.join( _LIN ) } )" )
 
-        # LE DÉPART. Trois sources, dans cet ordre : le plan donné, les poids nus donnés, le dernier
-        # plan du problème. `_depart_du_plan` dit ce qu'il a pu en tirer, et `stats[ "repris" ]` le
-        # rapporte -- un départ à chaud silencieusement jeté est exactement ce qui fait perdre une
-        # après-midi.
+        # THE START. Three sources, in this order: the given plan, the given bare weights, the last
+        # plan of the problem. `_start_from_plan` says what it could draw from it, and
+        # `stats[ "warm_start" ]` reports it -- a silently discarded warm start is exactly what loses
+        # an afternoon.
         plan = settings.ot_plan if settings.ot_plan is not None else warm
         impose = settings.ot_plan is not None
         if settings.weights0 is not None:
-            w0_given, self._repris = settings.weights0, "weights0"
+            w0_given, self._warm_start = settings.weights0, "weights0"
         elif plan is not None:
-            w0_given, self._repris = self._depart_du_plan( plan, src_dist, impose )
+            w0_given, self._warm_start = self._start_from_plan( plan, src_dist, impose )
         else:
-            w0_given, self._repris = None, "rien"
+            w0_given, self._warm_start = None, "none"
 
-        # LE diagramme, bâti une fois sur les positions ( voir la docstring du module ) ; les poids
-        # qu'il porte à un instant donné sont les derniers posés
+        # THE diagram, built once on the positions ( see the module docstring ); the weights it
+        # carries at a given moment are the last ones set
         self._pd = PowerDiagram( src_dist.positions,
                                  RealTensor[ src_dist.num_dirac ].full( 0.0 ) if w0_given is None else w0_given,
                                  accelerator = tun.accelerator, kernel_dtype = settings.kernel_dtype,
@@ -211,26 +211,26 @@ class SdotPlanNd:
         pd = self._pd
         n = int( pd.nb_points.value )
 
-        #: les masses cibles, indexées comme les cellules
+        #: the target masses, indexed like the cells
         self._masses = RealTensor[ pd.num_point ]( src_dist.weights.raw )
 
         options = _Options(
             mass_tol = float( settings.tol ), mass_rtol = float( tun.mass_rtol ), t_min = float( tun.t_min ),
-            mult_ok = float( tun.restart_factor ), facteur = 0.9, beta0 = 0.25, mult_lim = 2.0, confiance = 0.0,
+            mult_ok = float( tun.restart_factor ), factor = 0.9, beta0 = 0.25, mult_lim = 2.0, confidence = 0.0,
             conv_s0 = float( tun.conv_start or 0.0 ), conv_ratio = float( tun.conv_ratio ),
-            conv_min = float( tun.conv_min or 0.0 ), conv_seuil = float( tun.conv_threshold ),
-            max_iter = int( settings.max_iter ), max_reculs = int( tun.max_backtracks ), lin = _LIN[ tun.linear_solver ],
-            pas = _PAS[ step ], trace = int( bool( verbose ) ), continuation = _CONTINUATION[ settings.continuation ],
+            conv_min = float( tun.conv_min or 0.0 ), conv_threshold = float( tun.conv_threshold ),
+            max_iter = int( settings.max_iter ), max_backtracks = int( tun.max_backtracks ), lin = _LIN[ tun.linear_solver ],
+            step = _STEP[ step ], trace = int( bool( verbose ) ), continuation = _CONTINUATION[ settings.continuation ],
             cap0 = int( pd._scratch_capacity ),
             kernel_fp_size = fp_size( pd.kernel_dtype ),
         )
 
         weights = RealTensor[ pd.num_point ]()
         history = _History( nb_hist = len( _HISTORY ), nb_points = n )
-        # LES AXES SONT CEUX DU DIAGRAMME, et c'est la seule chose a ne pas rater ici : un axe
-        # `num_point` fabrique a part porte le meme NOM sans etre le meme, et
-        # `cell_masses * ( positions - barycenters )` devient alors un produit exterieur `[ n, n, d, d ]`
-        # au lieu du gradient. Ils se declarent donc depuis `pd`.
+        # THE AXES ARE THOSE OF THE DIAGRAM, and it is the one thing not to miss here: a `num_point`
+        # axis built separately carries the same NAME without being the same, and
+        # `cell_masses * ( positions - barycenters )` then becomes an outer product `[ n, n, d, d ]`
+        # instead of the gradient. They are therefore declared from `pd`.
         cell_masses = RealTensor[ pd.num_point ]()
         barycenters = RealTensor[ pd.num_point, pd.dim ]()
         cost        = RealTensor()
@@ -243,33 +243,33 @@ class SdotPlanNd:
 
         loom.ffi_call(
             "sdotplan_solve",
-            # `handler` et pas le noyau echafaude par defaut : ce corps EST le handler. Il est du
-            # code HOTE -- il a besoin de la `queue`, et il pilote lui-meme son parallelisme ( cent
-            # diagrammes dans un seul appel ), donc il n'y a ni foncteur par item ni `run_parallel`
-            # a engendrer autour de lui. Voir la docstring de `FfiCode`.
-            # `inline` : le corps EST celui du handler, loom n'ecrit que son enveloppe
-            # ( `void kernel( queue, batch_axes, args )` ). Il est du code HOTE -- il a besoin de la
-            # `queue`, et il pilote lui-meme son parallelisme ( cent diagrammes dans un seul appel ),
-            # donc il n'y a ni foncteur par item ni `run_parallel` a engendrer autour de lui.
+            # `handler` and not the default scaffolded kernel: this body IS the handler. It is
+            # HOST code -- it needs the `queue`, and it drives its own parallelism ( a hundred
+            # diagrams in a single call ), so there is no per-item functor nor `run_parallel`
+            # to generate around it. See the docstring of `FfiCode`.
+            # `inline`: the body IS that of the handler, loom only writes its wrapper
+            # ( `void kernel( queue, batch_axes, args )` ). It is HOST code -- it needs the
+            # `queue`, and it drives its own parallelism ( a hundred diagrams in a single call ),
+            # so there is no per-item functor nor `run_parallel` to generate around it.
             FfiCode.inline( includes = [ "sdot/sdotplan/Solve.h" ],
-                sources = [ "sdot/sdotplan/Lineaire.cpp" ],
+                sources = [ "sdot/sdotplan/Linear.cpp" ],
                 code = "\n".join( [
-                    # les expressions que `PowerDiagram` engendre nomment `inputs` / `outputs` ( la forme
-                    # d'un noyau par item ) : on les RETROUVE ici sous leur nom, et rien n'a a le savoir
+                    # the expressions that `PowerDiagram` generates name `inputs` / `outputs` ( the shape
+                    # of a per-item kernel ): we FIND them again here under their name, and nothing needs to know it
                     "auto &inputs = args.inputs; auto &outputs = args.outputs;",
                     "using TK_sdotplan = std::conditional_t<CT_VALUE( inputs.options.kernel_fp_size ) == 64, double, float>;",
                     f"auto pd_sdotplan = { pd_expr };",
-                    "sdotplan::OptionsSolveur os;",
+                    "sdotplan::SolverOptions os;",
                     "sdotplan::NewtonOptions &no = os.newton;",
                     "no.tol_abs = double( inputs.options.mass_tol ); no.tol_rel = double( inputs.options.mass_rtol ); no.t_min = double( inputs.options.t_min );",
-                    "no.mult_ok = double( inputs.options.mult_ok ); no.facteur = double( inputs.options.facteur ); no.beta0 = double( inputs.options.beta0 );",
-                    "no.mult_lim = double( inputs.options.mult_lim ); no.confiance = double( inputs.options.confiance );",
-                    "no.maxit = int( SI( inputs.options.max_iter ) ); no.max_reculs = int( SI( inputs.options.max_reculs ) );",
-                    "no.pas = int( SI( inputs.options.pas ) ); no.trace = SI( inputs.options.trace ) != 0;",
+                    "no.mult_ok = double( inputs.options.mult_ok ); no.factor = double( inputs.options.factor ); no.beta0 = double( inputs.options.beta0 );",
+                    "no.mult_lim = double( inputs.options.mult_lim ); no.confidence = double( inputs.options.confidence );",
+                    "no.maxit = int( SI( inputs.options.max_iter ) ); no.max_backtracks = int( SI( inputs.options.max_backtracks ) );",
+                    "no.step = int( SI( inputs.options.step ) ); no.trace = SI( inputs.options.trace ) != 0;",
                     "os.lin = sdotplan::Lin( int( SI( inputs.options.lin ) ) ); os.cap0 = SI( inputs.options.cap0 );",
-                    "os.continuation = int( SI( inputs.options.continuation ) ); os.seuil_continuation = double( inputs.options.conv_seuil );",
+                    "os.continuation = int( SI( inputs.options.continuation ) ); os.continuation_threshold = double( inputs.options.conv_threshold );",
                     "os.conv_s0 = double( inputs.options.conv_s0 ); os.conv_ratio = double( inputs.options.conv_ratio ); os.conv_min = double( inputs.options.conv_min );",
-                    f"sdotplan::resoudre<TK_sdotplan>( queue, pd_sdotplan, inputs.power_diagram, inputs.dom_cell, { dist_expr }, inputs.nu, inputs.w0, os, "
+                    f"sdotplan::solve<TK_sdotplan>( queue, pd_sdotplan, inputs.power_diagram, inputs.dom_cell, { dist_expr }, inputs.nu, inputs.w0, os, "
                     "outputs.weights, outputs.history, outputs.stats, outputs.cell_masses, outputs.barycenters, outputs.cost );",
                 ] ) ),
             power_diagram = pd,
@@ -278,10 +278,10 @@ class SdotPlanNd:
             w0 = w0,
             options = options,
             weights = loom.out( weights ),
-            # `nb_steps` est ECRIT par le noyau ( le nombre de pas acceptes ), donc il doit etre
-            # nomme : un `ShapeVar` qu'on ne declare pas reste non lie, et le C++ ne voit qu'une vue
-            # nulle. Les poids de chaque pas, eux, ne sont ecrits que si on les a demandes --
-            # `weights` non nomme reste observe, donc ni alloue ni lu.
+            # `nb_steps` is WRITTEN by the kernel ( the number of accepted steps ), so it must be
+            # named: a `ShapeVar` that is not declared stays unbound, and the C++ only sees a null
+            # view. The weights of each step, for their part, are only written if they were requested --
+            # an unnamed `weights` stays observed, hence neither allocated nor read.
             history = loom.out( history, writes = ( [ "rows", "nb_steps", "weights" ] if settings.keep_weights
                                                     else [ "rows", "nb_steps" ] ),
                                 capacities = { "nb_steps": int( settings.max_iter ) + 1 } ),
@@ -295,61 +295,62 @@ class SdotPlanNd:
         )
         pd._solver_weights_after( pd_produced )
 
-        #: les poids AJUSTÉS, `[ n ]`, indexés comme `positions` ( `weights[ 0 ] == 0` : la jauge )
+        #: the FITTED weights, `[ n ]`, indexed like `positions` ( `weights[ 0 ] == 0`: the gauge )
         self.weights = weights
-        #: la mesure de chaque cellule aux poids AJUSTÉS, `[ n ]` -- celle que Newton a mesurée
+        #: the measure of each cell at the FITTED weights, `[ n ]` -- the one Newton measured
         self.cell_masses = cell_masses
-        #: le barycentre de chaque cellule, `[ n, d ]` ( son germe si elle est vide )
+        #: the barycenter of each cell, `[ n, d ]` ( its seed if it is empty )
         self.barycenters = barycenters
-        #: le coût de transport `W_2^2` ( un `Tensor` scalaire : `float( sol.cost )` pour le nombre )
+        #: the transport cost `W_2^2` ( a scalar `Tensor`: `float( sol.cost )` for the number )
         self.cost = cost
         self._read_stats( stats, settings )
         self._read_history( history, settings, pd )
 
     @staticmethod
-    def _depart_du_plan( plan, src_dist, impose ):
-        """Ce qu'un PLAN précédent fournit comme départ : `( weights0, ce_qu_on_a_repris )`.
+    def _start_from_plan( plan, src_dist, impose ):
+        """What a previous PLAN provides as a start: `( weights0, what_was_taken_back )`.
 
-        Un plan dont le nombre de diracs ne correspond plus ne vaut rien ( le cas courant : un étage
-        de multi-échelle ). On le laisse tomber, mais on le DIT -- et si l'appelant l'avait imposé
-        explicitement par `ot_plan`, on lève, parce qu'il croit repartir à chaud et ne le fait pas.
+        A plan whose number of diracs no longer matches is worthless ( the common case: a stage
+        of multi-scale ). It is dropped, but REPORTED -- and if the caller had imposed it
+        explicitly through `ot_plan`, we raise, because they believe they are warm-starting and
+        are not.
 
-        Les GRAPPES ne sont pas encore reprises : il n'y en a pas ( l'agrégation est l'étape 7 de
-        `notes/2026-10-02-sdotplan.md` ). Quand elles arriveront, c'est ici qu'elles passent -- et
-        c'est pourquoi le départ est un plan et non un vecteur de poids : `plan.clusters` et les
-        positions pour lesquelles il a été résolu sont ce qui permet de ne pas redétecter les
-        grappes quand les germes n'ont pas bougé ( README § 23.11, § 23.8 )."""
+        The CLUSTERS are not yet taken back: there are none ( aggregation is step 7 of
+        `notes/2026-10-02-sdotplan.md` ). When they arrive, this is where they go through -- and
+        that is why the start is a plan and not a weight vector: `plan.clusters` and the
+        positions it was solved for are what allows not re-detecting the clusters when the seeds
+        have not moved ( README § 23.11, § 23.8 )."""
         n_plan = int( plan.weights.shape[ 0 ] )
         n = int( src_dist.nb_diracs.value )
         if n_plan != n:
             if impose:
-                raise ValueError( f"Iterative( ot_plan = ... ) : ce plan porte { n_plan } poids et la "
-                                  f"source en a { n } -- il ne peut pas servir de depart. Le retirer, "
-                                  "ou garder un `OtProblem` ( il perime sa solution tout seul )" )
-            return None, f"rien ( le plan garde porte { n_plan } poids, la source en a { n } )"
+                raise ValueError( f"Iterative( ot_plan = ... ): this plan carries { n_plan } weights and the "
+                                  f"source has { n } -- it cannot serve as a start. Remove it, "
+                                  "or keep an `OtProblem` ( it expires its solution on its own )" )
+            return None, f"none ( the kept plan carries { n_plan } weights, the source has { n } )"
         return plan.weights, "ot_plan"
 
     def _read_stats( self, stats, settings ):
-        #: ce que le solveur rapporte ( voir `sdotplan/Solve.h::Stat` ), plus `fin` et `depart` en clair
+        #: what the solver reports ( see `sdotplan/Solve.h::Stat` ), plus `status` and `start` spelled out
         st = stats.raw
         self.stats = { name: float( st[ k ] ) for k, name in enumerate( _STATS ) }
-        self.stats[ "fin" ] = _FIN.get( int( self.stats[ "fin" ] ), "?" )
-        self.stats[ "depart" ] = _DEPART.get( int( self.stats[ "depart" ] ), "?" )
-        for name in ( "nb_iter", "nb_diag", "nb_recul", "nb_deborde", "nb_cell_lim", "nb_tours_essai",
-                      "lin_nb_hier", "lin_nb_iter", "nb_etapes" ):
+        self.stats[ "status" ] = _STATUS.get( int( self.stats[ "status" ] ), "?" )
+        self.stats[ "start" ] = _START.get( int( self.stats[ "start" ] ), "?" )
+        for name in ( "nb_iter", "nb_diag", "nb_backtracks", "nb_overflowed", "nb_cell_lim", "nb_limit_rounds",
+                      "lin_nb_hierarchies", "lin_nb_iter", "nb_continuation_steps" ):
             self.stats[ name ] = int( self.stats[ name ] )
-        # l'agrégation : DEMANDÉE ici, pas encore faite par le C++ ( étape 7 de
-        # `notes/2026-10-02-sdotplan.md` ) -- et c'est dit plutôt que tu, parce qu'un nuage dégénéré
-        # plafonne alors vers `1e-6` sans le moindre message ( README § 23.11 ).
-        self.stats[ "agregation" ] = ( "demandee, pas encore branchee ( etape 7 )" if settings.aggregate
-                                       else "non demandee" )
-        #: ce que le départ à chaud a fourni : `"ot_plan"`, `"weights0"`, ou `"rien"` ( et pourquoi )
-        self.stats[ "repris" ] = self._repris
+        # aggregation: REQUESTED here, not yet done by the C++ ( step 7 of
+        # `notes/2026-10-02-sdotplan.md` ) -- and that is reported rather than kept quiet, because a
+        # degenerate cloud then plateaus around `1e-6` without the slightest message ( README § 23.11 ).
+        self.stats[ "aggregation" ] = ( "requested, not wired yet ( step 7 )" if settings.aggregate
+                                       else "not requested" )
+        #: what the warm start provided: `"ot_plan"`, `"weights0"`, or `"none"` ( and why )
+        self.stats[ "warm_start" ] = self._warm_start
 
     def _read_history( self, history, settings, pd ):
-        #: un dict par pas ACCEPTÉ -- `step = 0` est le point de départ : `t`, `residual_l2`,
-        #: `min_measure`, `max_abs_residual`, `nb_diag` ( cumulé ), `nb_evals` ( les diagrammes de
-        #: ce pas ), et `weights` si `keep_weights`
+        #: one dict per ACCEPTED step -- `step = 0` is the starting point: `t`, `residual_l2`,
+        #: `min_measure`, `max_abs_residual`, `nb_diag` ( cumulative ), `nb_evals` ( the diagrams of
+        #: this step ), and `weights` if `keep_weights`
         nb_steps = int( history.nb_steps.value )
         rows = history.rows.raw[ :nb_steps ]
         self.history = []
@@ -360,56 +361,56 @@ class SdotPlanNd:
                 entry[ "weights" ] = RealTensor[ pd.num_point ]( history.weights.raw[ s ] )
             self.history.append( entry )
 
-    # -- ce que la solution dit ----------------------------------------------------------------
+    # -- what the solution says ----------------------------------------------------------------
 
     @property
     def converged( self ):
-        return self.stats[ "fin" ] == "converge"
+        return self.stats[ "status" ] == "converged"
 
     @property
     def clusters( self ):
-        """À quelle GRAPPE chaque dirac appartient, ou `None` quand aucun n'a été fusionné.
+        """Which CLUSTER each dirac belongs to, or `None` when none was merged.
 
-        `None` est le cas courant et il veut dire « les poids suffisent ». Dès qu'il y a des
-        grappes, c'est le couple ( diagramme réduit, plans de coupe ) qui porte la précision et non
-        `weights` -- voir la docstring du module et le README § 23.11."""
+        `None` is the common case and it means "the weights suffice". As soon as there are
+        clusters, it is the pair ( reduced diagram, cutting planes ) that carries the accuracy and
+        not `weights` -- see the module docstring and README § 23.11."""
         return None
 
     @property
     def target_masses( self ) -> Tensor:
-        """`nu` : la masse cible de chaque cellule ( les masses des diracs, normalisées, puis remises
-        à l'échelle de ce que le domaine contient -- voir `sdotplan/Solve.h` )"""
-        return self._masses * ( self.stats[ "masse_domaine" ] / float( self._masses.sum() ) )
+        """`nu`: the target mass of each cell ( the masses of the diracs, normalized, then rescaled
+        to what the domain contains -- see `sdotplan/Solve.h` )"""
+        return self._masses * ( self.stats[ "domain_mass" ] / float( self._masses.sum() ) )
 
     def residual( self, weights = None ) -> Tensor:
-        """`mesure_i( weights ) - nu_i` -- ZÉRO au point cherché, DÉRIVABLE par rapport à `weights`
-        ( voir `PowerDiagram.measures` ). Un diagramme de plus : c'est un outil de diagnostic, pas
-        une sortie de la résolution ( `cell_masses` l'est )."""
+        """`measure_i( weights ) - nu_i` -- ZERO at the sought point, DIFFERENTIABLE with respect to
+        `weights` ( see `PowerDiagram.measures` ). One more diagram: it is a diagnostic tool, not
+        an output of the solve ( `cell_masses` is )."""
         w = self.weights if weights is None else weights
         return self.power_diagram( w ).measures - self.target_masses
 
     def power_diagram( self, weights = None ) -> PowerDiagram:
-        """L'OUTIL À LA DEMANDE : le `PowerDiagram` pour `weights` ( par défaut : les poids AJUSTÉS )
-        -- toujours le MÊME objet, auquel on pose ces poids-là. Pour dessiner, pour inspecter, pour
-        une fonctionnelle qu'on n'avait pas prévue ; rien dans la résolution ne passe par lui."""
+        """THE ON-DEMAND TOOL: the `PowerDiagram` for `weights` ( by default: the FITTED weights )
+        -- always the SAME object, on which those weights are set. For drawing, for inspecting, for
+        a functional that was not anticipated; nothing in the solve goes through it."""
         self._pd.weights = self.weights if weights is None else weights
         return self._pd
 
-    # -- ce que le plan VAUT -------------------------------------------------------------------
+    # -- what the plan is WORTH -------------------------------------------------------------------
 
     def transport( self ):
-        """`( cost, barycenters, masses )` aux poids AJUSTÉS : le coût `W_2^2 = sum_i int_{cell_i}
-        |x - p_i|^2 rho` ( un `Tensor` scalaire ), le barycentre de chaque cellule ( `[ n, d ]` ) et
-        sa masse ( `[ n ]` ).
+        """`( cost, barycenters, masses )` at the FITTED weights: the cost `W_2^2 = sum_i int_{cell_i}
+        |x - p_i|^2 rho` ( a scalar `Tensor` ), the barycenter of each cell ( `[ n, d ]` ) and
+        its mass ( `[ n ]` ).
 
-        Les trois sont des SORTIES de l'appel -- le solveur les mesure sur les poids ajustés, dans le
-        même C++ et avec le même scratch. Une cellule vide garde son germe pour barycentre."""
+        All three are OUTPUTS of the call -- the solver measures them at the fitted weights, in the
+        same C++ and with the same scratch. An empty cell keeps its seed as barycenter."""
         return self.cost, self.barycenters, self.cell_masses
 
     def cost_and_position_grad( self ):
-        """`( cost, grad )` : le coût, et sa dérivée par rapport aux POSITIONS des diracs
-        ( `[ n, d ]` ) -- par le théorème de l'enveloppe : aux poids optimaux, la dérivée du coût
-        par rapport à `p_i` ne passe pas par les cellules, et vaut `2 m_i ( p_i - b_i )`, `b_i` le
-        barycentre de la cellule et `m_i` sa masse ( qui est la masse cible du dirac ). C'est la
-        même formule que `SdotPlan1d`, et ce qu'une reconstruction consomme ( `otrec` )."""
+        """`( cost, grad )`: the cost, and its derivative with respect to the dirac POSITIONS
+        ( `[ n, d ]` ) -- by the envelope theorem: at the optimal weights, the derivative of the cost
+        with respect to `p_i` does not go through the cells, and equals `2 m_i ( p_i - b_i )`, `b_i` the
+        barycenter of the cell and `m_i` its mass ( which is the target mass of the dirac ). It is the
+        same formula as `SdotPlan1d`, and what a reconstruction consumes ( `otrec` )."""
         return self.cost, 2 * self.cell_masses * ( self._pd.positions - self.barycenters )

@@ -3,38 +3,38 @@
 #include <loom/support/common_macros.h> // HD
 
 // =====================================================================================
-// LA CELLULE 2D EN MEMOIRE : la representation intermediaire, celle que les noyaux manipulent.
+// THE 2D CELL IN MEMORY: the intermediate representation, the one the kernels manipulate.
 //
-// Les sommets en ORDRE CYCLIQUE sont toute la geometrie : l'aire se lit par le lacet, et
-// l'invariant « LA COUPE `i` PORTE L'ARETE `[ v_i, v_i+1 ]` » donne la connectivite sans rien
-// chercher -- le sommet `i` est le coin des coupes `i-1` et `i`, et `nb_cuts == nb_vertices`. Tout
-// tient dans deux tableaux de coordonnees et un tableau d'identifiants de coupe, decoupes dans le
-// scratch du work-item ( `Scratch.h` ) a une capacite `cap` que l'hote a decidee.
+// The vertices in CYCLIC ORDER are all the geometry: the area is read by the shoelace formula, and
+// the invariant "CUT `i` CARRIES THE EDGE `[ v_i, v_i+1 ]`" gives the connectivity without searching
+// for anything -- vertex `i` is the corner of cuts `i-1` and `i`, and `nb_cuts == nb_vertices`. Everything
+// fits in two coordinate arrays and one array of cut identifiers, carved out of the
+// work-item's scratch ( `Scratch.h` ) at a capacity `cap` that the host has decided.
 //
-// Ce n'est PAS ce qu'un utilisateur voit (`Cell.py` en derive les tenseurs « pratiques ») : c'est
-// ce sur quoi les algorithmes deja ecrits tournent -- la coupe scalaire en place, l'excursion du
-// noyau a registres (`Moteur2Reg.h`), le calcul de la mesure et son adjoint.
+// This is NOT what a user sees (`Cell.py` derives the "convenient" tensors from it): it is
+// what the already-written algorithms run on -- the in-place scalar cut, the excursion of the
+// register kernel (`Engine2Reg.h`), the computation of the measure and its adjoint.
 //
-// = LES PLANS NE SONT PAS STOCKES, sauf quand il le faut
+// = THE PLANES ARE NOT STORED, unless they have to be
 //
-// Une cellule BORNEE n'a pas besoin de ses plans : ils se relisent sur ses aretes
-// (`planes_from_vertices`), et ni la coupe ni la mesure ne les lisent. Une cellule NON BORNEE, en
-// revanche, est un simplexe de remplacement dont les parois `INFINITE` portent des offsets
-// inventes qu'il faut REPOUSSER avant chaque coupe (`grow_for`) -- et pour cela il faut les plans.
-// Ils ne sont donc tenus (`has_planes`) que dans ce regime, qui est le rare.
+// A BOUNDED cell does not need its planes: they are read back from its edges
+// (`planes_from_vertices`), and neither the cut nor the measure reads them. An UNBOUNDED cell,
+// on the other hand, is a replacement simplex whose `INFINITE` walls carry invented
+// offsets that must be PUSHED BACK before each cut (`grow_for`) -- and for that the planes are needed.
+// They are thus kept (`has_planes`) only in that regime, which is the rare one.
 //
-// = LA COUPE SCALAIRE, EN PLACE
+// = THE SCALAR CUT, IN PLACE
 //
-// L'exterieur d'un convexe coupe par un demi-plan est une plage CYCLIQUE contigue : on compte les
-// sommets dehors, on trouve le debut de la plage, et la sortie fait EXACTEMENT
-// `nb - nb_out + 2` sommets. Les deux intersections sont ancrees sur le sommet DEDANS
-// (`v_in + ( v_out - v_in ) * t` vaut exactement `v_in` en `t == 0`, ce que la forme symetrique
-// n'a pas -- et sans quoi la plage cesse d'etre contigue).
+// The outside of a convex set cut by a half-plane is a contiguous CYCLIC range: we count the
+// vertices outside, find the start of the range, and the output has EXACTLY
+// `nb - nb_out + 2` vertices. The two intersections are anchored on the INSIDE vertex
+// (`v_in + ( v_out - v_in ) * t` is exactly `v_in` at `t == 0`, which the symmetric form
+// does not give -- and without which the range stops being contiguous).
 //
-// Le scan est en DEUX passes, et c'est le contraire de ce qu'on croit : compter et chercher le
-// debut de la plage dans la meme boucle fait moins d'instructions et va plus lentement, la
-// dependance portee empechant le vectoriseur de prendre le produit scalaire. Mesure sur le banc :
-// 17.1 ns par coupe en une passe, 13.2 en deux.
+// The scan is in TWO passes, and this is the opposite of what one would think: counting and looking
+// for the start of the range in the same loop makes fewer instructions and runs slower, the
+// carried dependency preventing the vectorizer from taking the dot product. Measured on the bench:
+// 17.1 ns per cut in one pass, 13.2 in two.
 // =====================================================================================
 
 #include <loom/support/math.h>
@@ -42,7 +42,7 @@
 #include <loom/support/containers/Vector.h>
 #include "Scratch.h"
 #include "Plane.h"
-#include "Etat.h"
+#include "State.h"
 #include "Ids.h"
 
 #include <type_traits>
@@ -57,23 +57,23 @@ struct Local2 {
     using TKernel = TK;
     using PlaneT  = Plane<TK,2>;
 
-    int  nb         = 0;      ///< sommets ( = coupes ) ; 0 = vide
-    int  cap        = 0;      ///< la capacite des tableaux
-    bool unbounded  = false;  ///< il reste des parois `INFINITE`
-    bool has_planes = false;  ///< `pdx / pdy / po` sont a jour
+    int  nb         = 0;      ///< vertices ( = cuts ); 0 = empty
+    int  cap        = 0;      ///< the capacity of the arrays
+    bool unbounded  = false;  ///< `INFINITE` walls remain
+    bool has_planes = false;  ///< `pdx / pdy / po` are up to date
 
     TK  *vx = nullptr, *vy = nullptr;
     int *cid = nullptr;
-    TK  *pdx = nullptr, *pdy = nullptr, *po = nullptr;   ///< le plan de la coupe `i` ( si `has_planes` )
-    TK  *s = nullptr;                                    ///< les produits scalaires de la coupe en cours
-    TK  *rx = nullptr, *ry = nullptr;                    ///< les vitesses de poussee ( non borne )
+    TK  *pdx = nullptr, *pdy = nullptr, *po = nullptr;   ///< the plane of cut `i` ( if `has_planes` )
+    TK  *s = nullptr;                                    ///< the dot products of the current cut
+    TK  *rx = nullptr, *ry = nullptr;                    ///< the push velocities ( unbounded )
 
-    // ---- le scratch --------------------------------------------------------------------------
+    // ---- the scratch -------------------------------------------------------------------------
 
-    /// ce qu'il faut de mots pour `cap` sommets -- LA MEME FORMULE que `Cell_2.scratch_words`
+    /// the number of words needed for `cap` vertices -- THE SAME FORMULA as `Cell_2.scratch_words`
     HD static constexpr SI words_for( SI cap ) { return 8 * words_of<TK>( cap ) + words_of<int>( cap ); }
 
-    /// pose les tableaux dans `c`. `false` s'il n'y a pas la place ( rien n'est alors utilisable )
+    /// lays the arrays out in `c`. `false` if there is no room ( nothing is then usable )
     HD bool attach( Carver &c, SI capacity ) {
         cap = int( capacity );
         vx = c.take<TK>( cap ); vy = c.take<TK>( cap ); cid = c.take<int>( cap );
@@ -83,7 +83,7 @@ struct Local2 {
         return ! c.overflow;
     }
 
-    /// recopie `o` ( geometrie et etat ) : `cap` doit suffire
+    /// copies `o` ( geometry and state ): `cap` must be enough
     HD bool copy_from( const Local2 &o ) {
         if ( o.nb > cap )
             return false;
@@ -95,22 +95,22 @@ struct Local2 {
         return true;
     }
 
-    // ---- ce que tout le monde lit ------------------------------------------------------------
+    // ---- what everyone reads -----------------------------------------------------------------
     HD int  nb_vertices() const { return nb; }
     HD int  nb_cuts () const { return nb; }
     HD bool bounded () const { return ! unbounded; }
     HD TK   coord   ( int i, int d ) const { return d ? vy[ i ] : vx[ i ]; }
 
-    /// les deux coupes du sommet `i`, dans l'ordre : `r == 0` -> la coupe `i-1`, `r == 1` -> `i`
+    /// the two cuts of vertex `i`, in order: `r == 0` -> cut `i-1`, `r == 1` -> `i`
     HD int  vertex_cut ( int i, int r ) const { return r ? i : ( i ? i - 1 : nb - 1 ); }
 
-    /// ce que le fournisseur voit ( voir `Moteur.h` )
-    HD EtatMem<TK> etat() const { return { nb, vx, vy, cid, ! unbounded }; }
+    /// what the supplier sees ( see `Engine.h` )
+    HD StateMem<TK> state() const { return { nb, vx, vy, cid, ! unbounded }; }
 
-    // ---- les etats de depart -----------------------------------------------------------------
+    // ---- the starting states -----------------------------------------------------------------
 
-    /// le parallelogramme `origin + s * axes( 0 ) + t * axes( 1 )`, `s, t` dans `[ 0, 1 ]`, en ordre
-    /// cyclique direct si `axes` l'est. Toutes les coupes portent `cut_id`.
+    /// the parallelogram `origin + s * axes( 0 ) + t * axes( 1 )`, `s, t` in `[ 0, 1 ]`, in direct
+    /// cyclic order if `axes` is. All the cuts carry `cut_id`.
     HD bool init_hypercube( const auto &origin, const auto &axes, int cut_id ) {
         if ( cap < 4 )
             return false;
@@ -131,8 +131,8 @@ struct Local2 {
         return true;
     }
 
-    /// « TOUT LE PLAN » : le triangle `( 0, 0 ), ( 1, 0 ), ( 0, 1 )` dont les trois cotes sont
-    /// marques `INFINITE`. Ses offsets sont inventes ; `grow_for` les repousse coupe apres coupe.
+    /// "THE WHOLE PLANE": the triangle `( 0, 0 ), ( 1, 0 ), ( 0, 1 )` whose three sides are
+    /// marked `INFINITE`. Its offsets are invented; `grow_for` pushes them back cut after cut.
     HD bool init_unbounded() {
         if ( cap < 3 )
             return false;
@@ -148,13 +148,13 @@ struct Local2 {
     }
 
     HD void make_empty() { nb = 0; unbounded = false; has_planes = false; }
-    HD void tidy() {}                                 ///< rien a ranger : pas de coupe morte en 2D
+    HD void tidy() {}                                 ///< nothing to tidy: no dead cut in 2D
 
-    // ---- les plans, relus sur la geometrie ---------------------------------------------------
+    // ---- the planes, read back from the geometry ---------------------------------------------
 
-    /// le plan de l'arete `i` : la normale SORTANTE de `[ v_i, v_i+1 ]` pour un polygone direct,
-    /// et l'offset lu sur `v_i`. Exact pour un plan reel comme pour une paroi repoussee -- les
-    /// deux bouts d'une arete sont sur son plan.
+    /// the plane of edge `i`: the OUTWARD normal of `[ v_i, v_i+1 ]` for a direct polygon,
+    /// and the offset read on `v_i`. Exact for a real plane as well as for a pushed wall -- both
+    /// ends of an edge are on its plane.
     HD void plane_of_edge( int i, TK &dx, TK &dy, TK &off ) const {
         const int j = i + 1 < nb ? i + 1 : 0;
         dx  = vy[ j ] - vy[ i ];
@@ -168,8 +168,8 @@ struct Local2 {
         has_planes = true;
     }
 
-    /// le plan de la coupe `i`, dans le flottant `T` de l'appelant ( relu sur les sommets, ou
-    /// pris dans la table quand elle est tenue )
+    /// the plane of cut `i`, in the caller's float `T` ( read back from the vertices, or
+    /// taken from the table when it is kept )
     template<class T>
     HD void plane( int i, T *dir, T &off ) const {
         if ( has_planes ) {
@@ -181,9 +181,9 @@ struct Local2 {
         }
     }
 
-    // ---- la coupe ----------------------------------------------------------------------------
+    // ---- the cut -----------------------------------------------------------------------------
 
-    /// Coupe par `p`, EN PLACE. Rend un `CutStatus` ; sur `OVERFLOW` la cellule est restee intacte.
+    /// Cuts by `p`, IN PLACE. Returns a `CutStatus`; on `NO_ROOM` the cell is left intact.
     HD int cut( const PlaneT &p ) {
         if ( unbounded ) {
             grow_for( p );
@@ -192,9 +192,9 @@ struct Local2 {
         return has_planes ? cut_impl<true>( p ) : cut_impl<false>( p );
     }
 
-    /// Combien de sommets le demi-espace laisse DEHORS -- le test « rien a enlever », a part et
-    /// petit : le predicat `s > 0` n'est ecrit qu'ici et dans `cut_impl`, donc les deux ne peuvent
-    /// pas repondre differemment sur un sommet a l'epsilon du plan.
+    /// How many vertices the half-space leaves OUTSIDE -- the "nothing to remove" test, separate and
+    /// small: the predicate `s > 0` is only written here and in `cut_impl`, so the two cannot
+    /// answer differently on a vertex at the epsilon of the plane.
     HD int nb_outside( const PlaneT &p ) const {
         int res = 0;
         for ( int i = 0; i < nb; ++i )
@@ -205,7 +205,7 @@ struct Local2 {
     template<bool PL>
     HD int cut_impl( const PlaneT &p ) {
         int nb_out = 0;
-        for ( int i = 0; i < nb; ++i ) {                 // reduction pure : le vectoriseur la prend
+        for ( int i = 0; i < nb; ++i ) {                 // pure reduction: the vectorizer takes it
             s[ i ] = p.dir[ 0 ] * vx[ i ] + p.dir[ 1 ] * vy[ i ] - p.off;
             nb_out += s[ i ] > 0;
         }
@@ -217,8 +217,8 @@ struct Local2 {
             return CutStatus::EMPTY;
         }
 
-        int i1 = 0;                                      // unique : l'exterieur d'un convexe
-        for ( int i = 0; i < nb; ++i ) {                 // coupe est d'un seul tenant
+        int i1 = 0;                                      // unique: the outside of a convex set
+        for ( int i = 0; i < nb; ++i ) {                 // cut is in one piece
             const int q = i ? i - 1 : nb - 1;
             if ( s[ i ] > 0 && ! ( s[ q ] > 0 ) ) { i1 = i; break; }
         }
@@ -226,11 +226,11 @@ struct Local2 {
         const int nb_in  = nb - nb_out;
         const int new_nb = nb_in + 2;
         if ( new_nb > cap )
-            return CutStatus::OVERFLOW;                  // la cellule reste INTACTE
+            return CutStatus::NO_ROOM;                  // the cell stays INTACT
 
-        const int j0 = ( i1 + nb - 1 ) % nb;             // dernier DEDANS avant la plage
-        const int j2 = ( i1 + nb_out - 1 ) % nb;         // dernier DEHORS
-        const int j3 = ( j2 + 1 ) % nb;                  // premier DEDANS apres
+        const int j0 = ( i1 + nb - 1 ) % nb;             // last INSIDE before the range
+        const int j2 = ( i1 + nb_out - 1 ) % nb;         // last OUTSIDE
+        const int j3 = ( j2 + 1 ) % nb;                  // first INSIDE after
 
         const TK s0 = s[ j0 ], s1 = s[ i1 ], s2 = s[ j2 ], s3 = s[ j3 ];
         const TK ta  = s0 / ( s0 - s1 );
@@ -239,8 +239,8 @@ struct Local2 {
         const TK tb  = s3 / ( s3 - s2 );
         const TK pbx = vx[ j3 ] + ( vx[ j2 ] - vx[ j3 ] ) * tb;
         const TK pby = vy[ j3 ] + ( vy[ j2 ] - vy[ j3 ] ) * tb;
-        // la coupe `j2` porte l'arete `[ v_j2, v_j3 ]`, qui survit tronquee : elle est relue
-        // MAINTENANT, `j2` va etre ecrase.
+        // cut `j2` carries the edge `[ v_j2, v_j3 ]`, which survives truncated: it is read back
+        // NOW, `j2` is about to be overwritten.
         const int bid = cid[ j2 ];
         TK bdx = 0, bdy = 0, bo = 0;
         if constexpr ( PL ) { bdx = pdx[ j2 ]; bdy = pdy[ j2 ]; bo = po[ j2 ]; }
@@ -255,16 +255,16 @@ struct Local2 {
         };
 
         if ( i1 <= j2 ) {
-            if ( nb_out == 1 ) {                         // un cran de plus : la queue va A DROITE
+            if ( nb_out == 1 ) {                         // one notch more: the tail goes RIGHT
                 for ( int i = nb; i > i1 + 1; --i ) move( i, i - 1 );
-            } else if ( nb_out > 2 ) {                   // trop de place : la queue revient A GAUCHE
+            } else if ( nb_out > 2 ) {                   // too much room: the tail comes back LEFT
                 const int gap = nb_out - 2;
                 for ( int i = j2 + 1; i < nb; ++i ) move( i - gap, i );
-            }                                            // `nb_out == 2` : rien a decaler
+            }                                            // `nb_out == 2`: nothing to shift
             put( i1,     pax, pay, p.id, p.dir[ 0 ], p.dir[ 1 ], p.off );
             put( i1 + 1, pbx, pby, bid,  bdx, bdy, bo );
         } else {
-            // la plage BOUCLE, donc l'interieur est contigu : `[ j3, j3 + nb_in )`.
+            // the range WRAPS AROUND, so the inside is contiguous: `[ j3, j3 + nb_in )`.
             if ( j3 >= 2 ) for ( int o = 0; o < nb_in; ++o ) move( 2 + o, j3 + o );
             else           for ( int o = nb_in - 1; o >= 0; --o ) move( 2 + o, j3 + o );
             put( 0, pax, pay, p.id, p.dir[ 0 ], p.dir[ 1 ], p.off );
@@ -277,16 +277,16 @@ struct Local2 {
             for ( int i = 0; i < nb; ++i )
                 unbounded |= cid[ i ] == cell_ids::INFINITE;
             if ( ! unbounded )
-                has_planes = false;                      // plus rien a repousser : on ne les tient plus
+                has_planes = false;                      // nothing left to push back: we no longer keep them
         }
         return CutStatus::CUT;
     }
 
-    // ---- le simplexe de remplacement -----------------------------------------------------------
+    // ---- the replacement simplex ---------------------------------------------------------------
 
-    /// La VITESSE du sommet `i` quand on repousse les parois `INFINITE` de `g` : il est le coin de
-    /// ses deux coupes, donc il resout le meme 2x2 avec les indicatrices `INFINITE` en second
-    /// membre. Nulle pour un sommet reel, qui ne bouge pas.
+    /// The VELOCITY of vertex `i` when the `INFINITE` walls of `g` are pushed back: it is the corner of
+    /// its two cuts, so it solves the same 2x2 with the `INFINITE` indicators as right-hand
+    /// side. Zero for a real vertex, which does not move.
     HD void growth_rate( int i, TK &rx, TK &ry ) const {
         const int c0 = vertex_cut( i, 0 ), c1 = vertex_cut( i, 1 );
         const TK f0 = cid[ c0 ] == cell_ids::INFINITE, f1 = cid[ c1 ] == cell_ids::INFINITE;
@@ -298,29 +298,29 @@ struct Local2 {
         ry = ( a1 * f1 - f0 * a2 ) / det;
     }
 
-    /// REPOUSSE les parois `INFINITE` jusqu'a ce que le classement des sommets par `p` soit celui
-    /// qu'il a a l'infini. Chaque sommet voyage en ligne droite, donc sa distance signee au plan est
-    /// AFFINE en la poussee et « quand changerait-il de cote ? » est une division ; on pousse
-    /// au-dela du plus lointain, et un peu plus, pour qu'aucun sommet ne reste SUR le plan.
+    /// PUSHES BACK the `INFINITE` walls until the ranking of the vertices by `p` is the one
+    /// it has at infinity. Each vertex travels in a straight line, so its signed distance to the plane is
+    /// AFFINE in the push and "when would it change side?" is a division; we push
+    /// beyond the farthest one, and a bit more, so that no vertex stays ON the plane.
     HD void grow_for( const PlaneT &p ) {
         if ( ! has_planes )
             planes_from_vertices();
 
-        static constexpr int max_rounds = 4;   // 2 suffisent en arithmetique exacte
-        // LA MARGE N'EST PAS UN EPSILON MACHINE : un sommet repousse d'un epsilon retombe a la
-        // precision du produit scalaire, et deux sommets confondus a 1e-15 se classent alors
-        // chacun de son cote du plan -- ce qui casse la combinatoire de la coupe ( vu en 4D ).
-        // Elle est petite devant la geometrie, grande devant l'arrondi : ou se posent les sommets
-        // FACTICES n'a de toute facon aucun sens geometrique.
+        static constexpr int max_rounds = 4;   // 2 suffice in exact arithmetic
+        // THE MARGIN IS NOT A MACHINE EPSILON: a vertex pushed by one epsilon falls back to the
+        // precision of the dot product, and two vertices coincident to 1e-15 then rank
+        // each on its own side of the plane -- which breaks the combinatorics of the cut ( seen in 4D ).
+        // It is small compared to the geometry, large compared to the rounding: where the FAKE
+        // vertices land has no geometric meaning anyway.
         const TK margin = std::is_same_v<TK,float> ? TK( 1e-5 ) : TK( 1e-6 );
 
         for ( int i = 0; i < nb; ++i )
             growth_rate( i, rx[ i ], ry[ i ] );
 
-        // « la vitesse ne fait pas varier la distance au plan » se juge A UNE TOLERANCE, pas a zero :
-        // les plans sont RELUS sur la geometrie, donc une normale exactement axiale sort avec des
-        // composantes a 1e-17, et `root = - s / rate` ferait alors une poussee de 1e17. Un rayon
-        // parallele au plan a 1e-9 pres l'est.
+        // "the velocity does not change the distance to the plane" is judged AT A TOLERANCE, not at zero:
+        // the planes are READ BACK from the geometry, so an exactly axial normal comes out with
+        // components at 1e-17, and `root = - s / rate` would then make a push of 1e17. A ray
+        // parallel to the plane to within 1e-9 counts as parallel.
         const TK tol = TK( 1e-9 ) * std::sqrt( p.dir[ 0 ] * p.dir[ 0 ] + p.dir[ 1 ] * p.dir[ 1 ] );
 
         TK g = 0;
@@ -333,8 +333,8 @@ struct Local2 {
                 if ( nr == 0 || ( rate < 0 ? - rate : rate ) <= tol * nr )
                     continue;
                 const TK s = p.dir[ 0 ] * ( vx[ i ] + g * rx[ i ] ) + p.dir[ 1 ] * ( vy[ i ] + g * ry[ i ] ) - p.off;
-                // `>= 0`, pas `> 0` : un sommet exactement SUR le plan n'est pas encore du cote ou
-                // il serait a l'infini -- c'est precisement un cas a pousser.
+                // `>= 0`, not `> 0`: a vertex exactly ON the plane is not yet on the side where
+                // it would be at infinity -- it is precisely a case to push.
                 const TK root = - s / rate;
                 if ( root >= 0 ) {
                     push = true;
@@ -357,7 +357,7 @@ struct Local2 {
         }
     }
 
-    // ---- la mesure, dans le flottant `TF` de l'appelant ----------------------------------------
+    // ---- the measure, in the caller's float `TF` -----------------------------------------------
 
     template<class TF>
     HD TF measure() const {
@@ -371,8 +371,8 @@ struct Local2 {
         return sum / 2;
     }
 
-    /// l'adjoint du lacet : `grad_vp( i, d )` recoit la cotangente du sommet `i` ( ECRITE, pas
-    /// accumulee ). Rien pour une cellule non bornee, dont la mesure est une constante.
+    /// the adjoint of the shoelace formula: `grad_vp( i, d )` receives the cotangent of vertex `i` ( WRITTEN, not
+    /// accumulated ). Nothing for an unbounded cell, whose measure is a constant.
     template<class TF>
     HD void measure_bwd( TF grad_res, auto &&grad_vp ) const {
         if ( unbounded )
@@ -385,10 +385,10 @@ struct Local2 {
         }
     }
 
-    /// un eventail depuis le sommet 0 : les triangles `( 0, i, i+1 )` PAVENT le convexe.
-    /// `func( chain )` recoit trois indices de sommets.
-    /// `func( c, mesure )` pour chaque coupe `c` qui porte une arete : sa LONGUEUR ( la coupe `i`
-    /// porte l'arete `[ v_i, v_i+1 ]` ) -- ce que la hessienne d'un transport lit ( `diagram::hessian_row` )
+    /// a fan from vertex 0: the triangles `( 0, i, i+1 )` TILE the convex set.
+    /// `func( chain )` receives three vertex indices.
+    /// `func( c, measure )` for each cut `c` that carries an edge: its LENGTH ( cut `i`
+    /// carries the edge `[ v_i, v_i+1 ]` ) -- what the Hessian of a transport reads ( `diagram::hessian_row` )
     template<class TF>
     HD void for_each_facet( auto &&func ) const {
         for ( int i = 0; i < nb; ++i ) {
@@ -417,10 +417,10 @@ struct Local2 {
         }
     }
 
-    // ---- les tenseurs ( voir `Cell.py` pour leur forme ) ----------------------------------------
+    // ---- the tensors ( see `Cell.py` for their shape ) ----------------------------------------
 
-    /// depuis une vue `Cell_2` ( un item deja indexe ) : `vertex_positions [ nv, 2 ]`, `cut_ids`.
-    /// `false` si la cellule ne tient pas dans `cap`.
+    /// from a `Cell_2` view ( an already indexed item ): `vertex_positions [ nv, 2 ]`, `cut_ids`.
+    /// `false` if the cell does not fit in `cap`.
     HD bool load( const auto &c ) {
         const int n = int( SI( c.nb_vertices ) );
         if ( n > cap )
@@ -437,8 +437,8 @@ struct Local2 {
         return true;
     }
 
-    /// vers une vue `Cell_2`. Rend `false` si elle est trop petite : le compte voulu est alors
-    /// enregistre ( `ShapeVarView::set` ) et RIEN n'est ecrit -- l'hote reserve plus et relance.
+    /// to a `Cell_2` view. Returns `false` if it is too small: the wanted count is then
+    /// recorded ( `ShapeVarView::set` ) and NOTHING is written -- the host reserves more and retries.
     HD bool store( auto &&c ) const {
         if ( ! c.nb_vertices.set( nb ) )
             return false;

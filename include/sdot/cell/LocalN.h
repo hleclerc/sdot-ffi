@@ -3,39 +3,39 @@
 #include <loom/support/common_macros.h> // HD
 
 // =====================================================================================
-// LA CELLULE EN DIMENSION `D >= 3` : un polytope SIMPLE qui se coupe lui-meme.
+// THE CELL IN DIMENSION `D >= 3`: a SIMPLE polytope that cuts itself.
 //
-// Rien de la 2D ne survit ici : il n'y a plus d'ordre cyclique global, et une coupe porte une
-// FACE. La connectivite est donc portee par les SOMMETS, chacun nommant ses `D` coupes et ses `D`
-// voisins :
+// Nothing of 2D survives here: there is no global cyclic order any more, and a cut carries a
+// FACE. Connectivity is therefore carried by the VERTICES, each one naming its `D` cuts and its `D`
+// neighbors:
 //
-//     vk[ r ][ i ]   la `r`-ieme coupe du sommet `i`, comme INDICE dans `cid` -- triees croissant
-//     vn[ r ][ i ]   le voisin de `i` DE L'AUTRE COTE de l'arete portee par les `D - 1` autres
-//                    coupes que `vk[ r ][ i ]` : le voisin `r` est « en face » de la coupe `r`
+//     vk[ r ][ i ]   the `r`-th cut of vertex `i`, as an INDEX into `cid` -- sorted ascending
+//     vn[ r ][ i ]   the neighbor of `i` ON THE OTHER SIDE of the edge carried by the `D - 1` cuts
+//                    other than `vk[ r ][ i ]`: neighbor `r` is "opposite" cut `r`
 //
-// Un sommet d'un polytope simple a `D` coupes, donc `D` paquets de `D - 1` coupes, donc `D`
-// aretes, et cette mise en correspondance est une bijection. Elle rend GRATUIT ce qu'une liste
-// d'aretes faisait chercher : les faces qui portent l'arete `r` sont les coupes du sommet privees
-// de la `r`-ieme, sans rien parcourir.
+// A vertex of a simple polytope has `D` cuts, hence `D` bundles of `D - 1` cuts, hence `D`
+// edges, and this matching is a bijection. It makes FREE what an edge list made us
+// search for: the faces that carry edge `r` are the cuts of the vertex minus the
+// `r`-th one, without traversing anything.
 //
-// LA LISTE DE COUPES EST LOCALE : `cid[ 0 .. nc )` porte les identifiants globaux, tout le reste ne
-// manipule que des indices dedans. Elle ne fait qu'AJOUTER pendant la vie de la cellule -- une
-// coupe qui perd tous ses sommets y laisse une entree morte -- et `compacte()` ne l'enleve que
-// lorsqu'elle est pleine.
+// THE CUT LIST IS LOCAL: `cid[ 0 .. nc )` carries the global identifiers, everything else
+// handles only indices into it. It only ever ADDS during the life of the cell -- a
+// cut that loses all its vertices leaves a dead entry there -- and `compact()` removes them only
+// when it is full.
 //
-// L'HYPOTHESE : chaque sommet est sur EXACTEMENT `D` plans ( position generale ). C'est ce qui rend
-// la coupe purement combinatoire : deux sommets neufs de la face creee sont voisins exactement
-// quand ils partagent `D - 2` ANCIENNES coupes. Un plan qui passe exactement par un sommet ne
-// l'enleve pas ( `s > 0` strict ), ce qui est la seule concession faite aux configurations
-// degenerees.
+// THE ASSUMPTION: each vertex is on EXACTLY `D` planes ( general position ). This is what makes
+// the cut purely combinatorial: two new vertices of the created face are neighbors exactly
+// when they share `D - 2` OLD cuts. A plane that goes exactly through a vertex does not
+// remove it ( strict `s > 0` ), which is the only concession made to degenerate
+// configurations.
 //
-// LA COUPE REMPLIT LES TROUS : les sommets dehors laissent des places libres, les sommets neufs
-// s'y installent, et les survivants gardent leur indice -- donc leur adjacence reste valable
-// telle quelle, et il n'y a pas de table de renumerotation. Le commit est en `O( nm )`, pas en
-// `O( nv )` ; le seul cas ou un sommet garde bouge est celui d'une coupe qui enleve plus de
-// sommets qu'elle n'en cree, et il n'en bouge alors que la difference.
+// THE CUT FILLS THE HOLES: vertices that are outside leave free slots, the new vertices
+// settle into them, and the survivors keep their index -- so their adjacency stays valid
+// as is, and there is no renumbering table. The commit is `O( nm )`, not
+// `O( nv )`; the only case where a kept vertex moves is that of a cut that removes more
+// vertices than it creates, and then only the difference moves.
 //
-// C'est le `Cellule3D.h` du banc, la dimension en parametre.
+// This is the bench's `Cellule3D.h`, with the dimension as a parameter.
 // =====================================================================================
 
 #include <loom/support/math.h>
@@ -44,7 +44,7 @@
 #include <loom/support/containers/Vector.h>
 #include "Scratch.h"
 #include "Plane.h"
-#include "Etat.h"
+#include "State.h"
 #include "Ids.h"
 
 #include <type_traits>
@@ -55,13 +55,13 @@ namespace sdot {
 
 template<class TK,int D>
 struct LocalN {
-    static_assert( D >= 3, "en dessous de 3D, c'est `Local2`" );
+    static_assert( D >= 3, "below 3D, it is `Local2`" );
     static constexpr int ct_dim = D;
     using TKernel = TK;
     using PlaneT  = Plane<TK,D>;
 
     int  nv = 0, nc = 0;
-    int  cap = 0;                                        ///< la capacite : sommets ET coupes
+    int  cap = 0;                                        ///< the capacity: vertices AND cuts
     bool unbounded  = false;
     bool has_planes = false;
 
@@ -69,15 +69,15 @@ struct LocalN {
     int *vk[ D ];
     int *vn[ D ];
     int *cid;
-    TK  *pd[ D ], *po;                                   ///< le plan de la coupe `k` ( si `has_planes` )
+    TK  *pd[ D ], *po;                                   ///< the plane of cut `k` ( if `has_planes` )
 
-    // les temporaires, dans le scratch eux aussi
+    // the temporaries, in the scratch too
     TK  *s, *nx[ D ], *rate[ D ], *s3[ 3 ];
-    int *trou, *nk[ D - 1 ], *rec_v, *rec_f, *dest, *nn_[ D ], *nouv, *src, *dst, *m, *apex[ D ], *v0, *on_face;
+    int *hole, *nk[ D - 1 ], *rec_v, *rec_f, *dest, *nn_[ D ], *fresh, *src, *dst, *m, *apex[ D ], *v0, *on_face;
 
-    // ---- le scratch --------------------------------------------------------------------------
+    // ---- the scratch --------------------------------------------------------------------------
 
-    /// ce qu'il faut de mots pour `cap` sommets ( et autant de coupes ) -- LA MEME FORMULE que
+    /// how many words are needed for `cap` vertices ( and as many cuts ) -- THE SAME FORMULA as
     /// `Cell_N.scratch_words`
     HD static constexpr SI words_for( SI cap ) {
         return ( 4 * D + 5 ) * words_of<TK>( cap ) + ( 5 * D + 10 ) * words_of<int>( cap );
@@ -92,11 +92,11 @@ struct LocalN {
         s = c.take<TK>( cap );
         for ( int d = 0; d < D; ++d ) { nx[ d ] = c.take<TK>( cap ); rate[ d ] = c.take<TK>( cap ); }
         for ( int d = 0; d < 3; ++d ) s3[ d ] = c.take<TK>( cap );
-        trou = c.take<int>( cap );
+        hole = c.take<int>( cap );
         for ( int d = 0; d + 1 < D; ++d ) nk[ d ] = c.take<int>( cap );
         rec_v = c.take<int>( cap ); rec_f = c.take<int>( cap ); dest = c.take<int>( cap );
         for ( int d = 0; d < D; ++d ) nn_[ d ] = c.take<int>( cap );
-        nouv = c.take<int>( cap ); src = c.take<int>( cap ); dst = c.take<int>( cap ); m = c.take<int>( cap );
+        fresh = c.take<int>( cap ); src = c.take<int>( cap ); dst = c.take<int>( cap ); m = c.take<int>( cap );
         for ( int d = 0; d < D; ++d ) apex[ d ] = c.take<int>( cap );
         v0 = c.take<int>( cap ); on_face = c.take<int>( cap );
         nv = 0; nc = 0; unbounded = false; has_planes = false;
@@ -116,15 +116,15 @@ struct LocalN {
         return true;
     }
 
-    // ---- ce que tout le monde lit ------------------------------------------------------------
+    // ---- what everybody reads ------------------------------------------------------------
     HD int  nb_vertices() const { return nv; }
     HD int  nb_cuts () const { return nc; }
     HD bool bounded () const { return ! unbounded; }
     HD TK   coord   ( int i, int d ) const { return v[ d ][ i ]; }
     HD int  vertex_cut ( int i, int r ) const { return vk[ r ][ i ]; }
 
-    HD EtatMemN<TK,D> etat() const {
-        EtatMemN<TK,D> e;
+    HD StateMemN<TK,D> state() const {
+        StateMemN<TK,D> e;
         e.nb = nv;
         for ( int d = 0; d < D; ++d )
             e.v[ d ] = v[ d ];
@@ -132,11 +132,11 @@ struct LocalN {
         return e;
     }
 
-    // ---- les etats de depart -----------------------------------------------------------------
+    // ---- the starting states -----------------------------------------------------------------
 
-    /// le parallelotope `origin + sum_j t_j axes( j )`, `t` dans `[ 0, 1 ]^D`. Le sommet `b` a pour
-    /// coordonnees les bits de `b` ; la coupe `2 j + bit_j( b )` le porte, et son voisin en face
-    /// de cette coupe est `b ^ ( 1 << j )`. Les coupes sont dans l'ordre des axes, donc triees.
+    /// the parallelotope `origin + sum_j t_j axes( j )`, `t` in `[ 0, 1 ]^D`. Vertex `b` has the bits
+    /// of `b` as coordinates; cut `2 j + bit_j( b )` carries it, and its neighbor opposite
+    /// that cut is `b ^ ( 1 << j )`. The cuts are in axis order, hence sorted.
     HD bool init_hypercube( const auto &origin, const auto &axes, int cut_id ) {
         if ( ( 1 << D ) > cap )
             return false;
@@ -164,9 +164,9 @@ struct LocalN {
         return true;
     }
 
-    /// « TOUT L'ESPACE » : le simplexe unite, dont les `D + 1` parois sont marquees `INFINITE`. Le
-    /// sommet 0 est l'origine, sur les coupes `0 .. D-1` ( `x_c >= 0` ) ; le sommet `n >= 1` est
-    /// `e_{n-1}`, sur les memes privees de `n-1`, plus la coupe `D` ( `sum x <= 1` ).
+    /// "THE WHOLE SPACE": the unit simplex, whose `D + 1` walls are marked `INFINITE`. Vertex
+    /// 0 is the origin, on cuts `0 .. D-1` ( `x_c >= 0` ); vertex `n >= 1` is
+    /// `e_{n-1}`, on the same ones minus `n-1`, plus cut `D` ( `sum x <= 1` ).
     HD bool init_unbounded() {
         if ( D + 1 > cap )
             return false;
@@ -177,16 +177,16 @@ struct LocalN {
                 v[ d ][ n ] = TK( d + 1 == n );
         for ( int r = 0; r < D; ++r ) {
             vk[ r ][ 0 ] = r;
-            vn[ r ][ 0 ] = r + 1;                        // en face de `x_r >= 0` : le long de `e_r`
+            vn[ r ][ 0 ] = r + 1;                        // opposite `x_r >= 0`: along `e_r`
         }
         for ( int n = 1; n <= D; ++n ) {
             for ( int r = 0; r + 1 < D; ++r ) {
                 const int c = r + ( r >= n - 1 );
                 vk[ r ][ n ] = c;
-                vn[ r ][ n ] = c + 1;                    // le sommet qui manque aussi la coupe `c`
+                vn[ r ][ n ] = c + 1;                    // the vertex that also misses cut `c`
             }
             vk[ D - 1 ][ n ] = D;
-            vn[ D - 1 ][ n ] = 0;                        // en face de la fermeture : l'origine
+            vn[ D - 1 ][ n ] = 0;                        // opposite the closing cut: the origin
         }
         for ( int k = 0; k <= D; ++k )
             cid[ k ] = cell_ids::INFINITE;
@@ -205,16 +205,16 @@ struct LocalN {
 
     HD void make_empty() { nv = 0; nc = 0; unbounded = false; has_planes = false; }
 
-    // ---- les plans, relus sur la geometrie ---------------------------------------------------
+    // ---- the planes, read back from the geometry ---------------------------------------------------
 
-    /// la normale SORTANTE de la face `k` et son offset, relus sur ses sommets. `false` si la face
-    /// n'engendre pas un hyperplan ( morte, ou degeneree ).
+    /// the OUTWARD normal of face `k` and its offset, read back from its vertices. `false` if the face
+    /// does not span a hyperplane ( dead, or degenerate ).
     ///
-    /// PAS « les `D` premiers sommets trouves » : sur une facette de dimension `D - 1 >= 3`, `D`
-    /// sommets peuvent tres bien tenir dans une meme 2-face, et deux sommets confondus a 1e-15
-    /// ( une coupe passee par un sommet ) sont le cas courant. On construit donc une base
-    /// ORTHONORMEE de l'espace engendre par `p - p0`, par Gram-Schmidt, en ne gardant qu'un point
-    /// dont le residu est franc ; la normale est le produit vectoriel generalise de cette base.
+    /// NOT "the first `D` vertices found": on a facet of dimension `D - 1 >= 3`, `D`
+    /// vertices may well lie in the same 2-face, and two vertices coinciding to 1e-15
+    /// ( a cut passed through a vertex ) are the common case. So we build an
+    /// ORTHONORMAL basis of the space spanned by `p - p0`, by Gram-Schmidt, keeping only a point
+    /// whose residual is clear; the normal is the generalized cross product of that basis.
     HD bool plane_of_cut( int k, TK *dir, TK &off ) const {
         int p0 = -1;
         TK  base[ D - 1 ][ D ];
@@ -242,7 +242,7 @@ struct LocalN {
             TK r2 = 0;
             for ( int d = 0; d < D; ++d ) r2 += u[ d ] * u[ d ];
             if ( r2 <= scale * TK( 1e-12 ) )
-                continue;                                // dans l'espace deja engendre, ou confondu
+                continue;                                // in the space already spanned, or coincident
             const TK inv = 1 / std::sqrt( r2 );
             for ( int d = 0; d < D; ++d ) base[ nb ][ d ] = u[ d ] * inv;
             ++nb;
@@ -250,8 +250,8 @@ struct LocalN {
         if ( nb < D - 1 )
             return false;
 
-        // le produit vectoriel generalise des `D - 1` vecteurs de base : `n_i` est le mineur sans
-        // la colonne `i`, au signe `( -1 )^i`
+        // the generalized cross product of the `D - 1` basis vectors: `n_i` is the minor without
+        // column `i`, with sign `( -1 )^i`
         for ( int i = 0; i < D; ++i ) {
             const auto M = Matrix<TK,D-1>::with_func( [&]( auto r, auto c ) {
                 const int col = int( c ) + ( int( c ) >= i );
@@ -264,8 +264,8 @@ struct LocalN {
         for ( int d = 0; d < D; ++d )
             off += dir[ d ] * v[ d ][ p0 ];
 
-        // sortante : le sommet LE PLUS LOIN du plan est dedans ( pas le premier venu, qui peut etre
-        // un sommet confondu avec la face, a 1e-16 d'un cote ou de l'autre )
+        // outward: the vertex FARTHEST from the plane is inside ( not the first one that comes, which may be
+        // a vertex coinciding with the face, 1e-16 off on either side )
         TK far = 0;
         for ( int i = 0; i < nv; ++i ) {
             if ( on_face[ i ] )
@@ -312,7 +312,7 @@ struct LocalN {
         }
     }
 
-    // ---- la coupe ----------------------------------------------------------------------------
+    // ---- the cut ----------------------------------------------------------------------------
 
     HD int cut( const PlaneT &p ) {
         if ( unbounded )
@@ -349,30 +349,30 @@ struct LocalN {
         }
 
         if ( nc >= cap ) {
-            compacte();
+            compact();
             if ( nc >= cap )
-                return CutStatus::OVERFLOW;
+                return CutStatus::NO_ROOM;
         }
         const int knew = nc;
 
-        // ---- UNE SEULE PASSE SUR LES SOMMETS : les trous que laissent les sommets dehors et, pour
-        // chacun d'eux, ses aretes traversantes -- d'ou naissent les sommets neufs. `nk` : les
-        // coupes HERITEES, triees ; `rec_v` / `rec_f` : le sommet DEDANS a recoller, et sa fente.
+        // ---- A SINGLE PASS OVER THE VERTICES: the holes left by the outside vertices and, for
+        // each of them, its crossing edges -- from which the new vertices are born. `nk`: the
+        // INHERITED cuts, sorted; `rec_v` / `rec_f`: the INSIDE vertex to reattach, and its slot.
         int nt = 0, nm = 0;
 
         for ( int o = 0; o < nv; ++o ) {
             if ( ! ( s[ o ] > 0 ) )
                 continue;
-            trou[ nt++ ] = o;
+            hole[ nt++ ] = o;
             for ( int j = 0; j < D; ++j ) {
                 const int u = vn[ j ][ o ];
                 if ( s[ u ] > 0 )
-                    continue;                            // arete entierement dehors : elle meurt
+                    continue;                            // edge entirely outside: it dies
                 if ( nm >= cap )
-                    return CutStatus::OVERFLOW;
+                    return CutStatus::NO_ROOM;
 
-                // ANCRE SUR LE SOMMET DEDANS : avec `s_u == 0` la forme symetrique ne rend pas `v_u`
-                // en flottant, et le sommet passerait de l'autre cote du plan.
+                // ANCHORED ON THE INSIDE VERTEX: with `s_u == 0` the symmetric form does not return `v_u`
+                // in floating point, and the vertex would end up on the other side of the plane.
                 const TK t = s[ u ] / ( s[ u ] - s[ o ] );
                 for ( int d = 0; d < D; ++d )
                     nx[ d ][ nm ] = v[ d ][ u ] + ( v[ d ][ o ] - v[ d ][ u ] ) * t;
@@ -393,16 +393,16 @@ struct LocalN {
         const int nn = nv - nt;
         const int new_nv = nn + nm;
         if ( new_nv > cap )
-            return CutStatus::OVERFLOW;
+            return CutStatus::NO_ROOM;
 
-        // ou va chaque sommet neuf : dans un trou tant qu'il en reste, puis a la suite
+        // where each new vertex goes: into a hole while any remain, then appended
         for ( int j = 0; j < nm; ++j )
-            dest[ j ] = j < nt ? trou[ j ] : nv + ( j - nt );
+            dest[ j ] = j < nt ? hole[ j ] : nv + ( j - nt );
 
-        // ---- LES VOISINS DES SOMMETS NEUFS. En face de `knew` ( fente `D - 1` ) : le bout dedans
-        // dont il vient. Les autres sont ses voisins SUR LA FACE NEUVE : deux sommets neufs sont
-        // voisins exactement quand ils partagent `D - 2` anciennes coupes, et l'arete qui les joint
-        // est alors en face de la coupe heritee qu'ils NE partagent PAS.
+        // ---- THE NEIGHBORS OF THE NEW VERTICES. Opposite `knew` ( slot `D - 1` ): the inside end
+        // it comes from. The others are its neighbors ON THE NEW FACE: two new vertices are
+        // neighbors exactly when they share `D - 2` old cuts, and the edge joining them
+        // is then opposite the inherited cut that they do NOT share.
         for ( int i = 0; i < nm; ++i ) {
             for ( int r = 0; r + 1 < D; ++r )
                 nn_[ r ][ i ] = -1;
@@ -410,7 +410,7 @@ struct LocalN {
         }
         for ( int i = 0; i < nm; ++i ) {
             for ( int j = i + 1; j < nm; ++j ) {
-                // les deux listes sont triees : on les fusionne en comptant les communs
+                // both lists are sorted: we merge them while counting the common ones
                 int a = 0, b = 0, common = 0, ai = -1, bj = -1;
                 while ( a < D - 1 && b < D - 1 ) {
                     if      ( nk[ a ][ i ] == nk[ b ][ j ] ) { ++common; ++a; ++b; }
@@ -419,39 +419,39 @@ struct LocalN {
                 }
                 if ( common != D - 2 )
                     continue;
-                if ( a < D - 1 ) ai = a;                 // le reste, non partage
+                if ( a < D - 1 ) ai = a;                 // the remainder, not shared
                 if ( b < D - 1 ) bj = b;
                 nn_[ ai ][ i ] = dest[ j ];
                 nn_[ bj ][ j ] = dest[ i ];
             }
         }
 
-        // ---- COMMIT. Rien n'a bouge jusqu'ici.
+        // ---- COMMIT. Nothing has moved so far.
         for ( int j = 0; j < nm; ++j ) {
             const int m = dest[ j ];
             for ( int d = 0; d < D; ++d )
                 v[ d ][ m ] = nx[ d ][ j ];
             for ( int r = 0; r + 1 < D; ++r )
-                vk[ r ][ m ] = nk[ r ][ j ];             // < `knew`, donc trie
+                vk[ r ][ m ] = nk[ r ][ j ];             // < `knew`, hence sorted
             vk[ D - 1 ][ m ] = knew;
             for ( int r = 0; r < D; ++r )
                 vn[ r ][ m ] = nn_[ r ][ j ];
         }
-        for ( int i = 0; i < nm; ++i )                   // le recollage, cote sommet DEDANS
+        for ( int i = 0; i < nm; ++i )                   // the reattachment, on the INSIDE vertex side
             vn[ rec_f[ i ] ][ rec_v[ i ] ] = dest[ i ];
 
-        // ---- LES TROUS QUI RESTENT, quand la coupe enleve plus de sommets qu'elle n'en cree
+        // ---- THE HOLES THAT REMAIN, when the cut removes more vertices than it creates
         if ( nm < nt ) {
             int th = nt;
-            while ( th > nm && trou[ th - 1 ] >= new_nv ) --th;
+            while ( th > nm && hole[ th - 1 ] >= new_nv ) --th;
 
             int nmv = 0;
             int ct = th, cd = nm;
             for ( int i = new_nv; i < nv; ++i ) {
-                if ( ct < nt && trou[ ct ] == i ) { ++ct; continue; }   // ce slot EST un trou
+                if ( ct < nt && hole[ ct ] == i ) { ++ct; continue; }   // this slot IS a hole
                 src[ nmv ] = i;
-                dst[ nmv ] = trou[ cd++ ];
-                nouv[ i - new_nv ] = dst[ nmv ];
+                dst[ nmv ] = hole[ cd++ ];
+                fresh[ i - new_nv ] = dst[ nmv ];
                 ++nmv;
             }
             for ( int t = 0; t < nmv; ++t ) {
@@ -459,12 +459,12 @@ struct LocalN {
                 for ( int d = 0; d < D; ++d ) v[ d ][ b ] = v[ d ][ a ];
                 for ( int r = 0; r < D; ++r ) { vk[ r ][ b ] = vk[ r ][ a ]; vn[ r ][ b ] = vn[ r ][ a ]; }
             }
-            // et les voisins qui pointaient vers eux ; un voisin peut lui-meme avoir demenage
+            // and the neighbors that pointed to them; a neighbor may itself have moved
             for ( int t = 0; t < nmv; ++t ) {
                 const int a = src[ t ], b = dst[ t ];
                 for ( int j = 0; j < D; ++j ) {
                     const int w = vn[ j ][ b ];
-                    const int q = w >= new_nv ? nouv[ w - new_nv ] : w;
+                    const int q = w >= new_nv ? fresh[ w - new_nv ] : w;
                     for ( int r = 0; r < D; ++r )
                         if ( vn[ r ][ q ] == a ) { vn[ r ][ q ] = b; break; }
                 }
@@ -491,11 +491,11 @@ struct LocalN {
         return CutStatus::CUT;
     }
 
-    /// avant de poser la cellule en memoire : les coupes mortes ne sortent pas d'ici
-    HD void tidy() { compacte(); }
+    /// before putting the cell into memory: dead cuts do not leave from here
+    HD void tidy() { compact(); }
 
-    /// ENLEVER LES COUPES MORTES. La renumerotation est MONOTONE, donc les listes restent triees.
-    HD void compacte() {
+    /// REMOVE THE DEAD CUTS. The renumbering is MONOTONE, so the lists stay sorted.
+    HD void compact() {
         for ( int k = 0; k < nc; ++k ) m[ k ] = -1;
         for ( int i = 0; i < nv; ++i )
             for ( int r = 0; r < D; ++r )
@@ -517,10 +517,10 @@ struct LocalN {
         nc = q;
     }
 
-    // ---- le simplexe de remplacement -----------------------------------------------------------
+    // ---- the replacement simplex -----------------------------------------------------------
 
-    /// la vitesse du sommet `i` quand on repousse les parois `INFINITE` : il resout le `D x D` de
-    /// ses coupes avec les indicatrices `INFINITE` en second membre
+    /// the velocity of vertex `i` when the `INFINITE` walls are pushed back: it solves the `D x D` of
+    /// its cuts with the `INFINITE` indicators as right-hand side
     HD void growth_rate( int i, TK *rate ) const {
         bool any = false;
         for ( int r = 0; r < D; ++r )
@@ -541,11 +541,11 @@ struct LocalN {
             planes_from_vertices();
 
         static constexpr int max_rounds = 4;
-        // LA MARGE N'EST PAS UN EPSILON MACHINE : un sommet repousse d'un epsilon retombe a la
-        // precision du produit scalaire, et deux sommets confondus a 1e-15 se classent alors
-        // chacun de son cote du plan -- ce qui casse la combinatoire de la coupe ( vu en 4D ).
-        // Elle est petite devant la geometrie, grande devant l'arrondi : ou se posent les sommets
-        // FACTICES n'a de toute facon aucun sens geometrique.
+        // THE MARGIN IS NOT A MACHINE EPSILON: a vertex pushed back by an epsilon falls back to the
+        // precision of the dot product, and two vertices coinciding to 1e-15 then get classified
+        // each on its own side of the plane -- which breaks the combinatorics of the cut ( seen in 4D ).
+        // It is small compared to the geometry, large compared to rounding: where the FAKE
+        // vertices land has no geometric meaning anyway.
         const TK margin = std::is_same_v<TK,float> ? TK( 1e-5 ) : TK( 1e-6 );
 
         for ( int i = 0; i < nv; ++i ) {
@@ -555,10 +555,10 @@ struct LocalN {
                 rate[ d ][ i ] = r[ d ];
         }
 
-        // « la vitesse ne fait pas varier la distance au plan » se juge A UNE TOLERANCE, pas a zero :
-        // les plans sont RELUS sur la geometrie, donc une normale exactement axiale sort avec des
-        // composantes a 1e-17, et `root = - s / rate` ferait alors une poussee de 1e17 -- et 1e38 au
-        // tour suivant. Un rayon parallele au plan a 1e-9 pres l'est.
+        // "the velocity does not change the distance to the plane" is judged AT A TOLERANCE, not at zero:
+        // the planes are READ BACK from the geometry, so an exactly axial normal comes out with
+        // components at 1e-17, and `root = - s / rate` would then make a push of 1e17 -- and 1e38 on the
+        // next round. A ray parallel to the plane to within 1e-9 counts as parallel.
         TK nd = 0;
         for ( int d = 0; d < D; ++d )
             nd += p.dir[ d ] * p.dir[ d ];
@@ -599,7 +599,7 @@ struct LocalN {
                 v[ d ][ i ] += g * rate[ d ][ i ];
     }
 
-    // ---- la mesure : un eventail de simplexes sur le treillis des faces ----------------------
+    // ---- the measure: a fan of simplices over the face lattice ----------------------
 
     HD bool has_cut( int i, int k ) const {
         for ( int r = 0; r < D; ++r )
@@ -608,11 +608,11 @@ struct LocalN {
         return false;
     }
 
-    /// `func( chain )` pour chaque simplexe de la triangulation standard : un sommet de la cellule,
-    /// cone sur chaque facette qui ne le contient pas, chacune trianguee pareil une dimension plus
-    /// bas. Il faut, pour chaque face rencontree, UN de ses sommets ( « l'apex » ) : `apex` en garde
-    /// une ligne par profondeur et une case par coupe, remplie d'un seul passage sur les sommets
-    /// de la face -- `D * nc` mots, la ou indexer les faces par leur ENSEMBLE de coupes coute
+    /// `func( chain )` for each simplex of the standard triangulation: a vertex of the cell,
+    /// coned over each facet that does not contain it, each triangulated the same way one dimension
+    /// lower. For each face encountered we need ONE of its vertices ( "the apex" ): `apex` keeps
+    /// one row per depth and one slot per cut, filled in a single pass over the vertices
+    /// of the face -- `D * nc` words, where indexing the faces by their SET of cuts costs
     /// `nc^( D - 1 )`.
     HD void for_each_simplex( auto &&func ) const {
         if ( nv == 0 )
@@ -625,11 +625,11 @@ struct LocalN {
 
     template<int K>
     HD void for_each_simplex_rec( Vector<SI,D+1> &chain, Vector<SI,D> &face_cuts, auto &&func, Ct<int,K> ) const {
-        constexpr int depth = D - K;                     // le nombre de coupes qui definissent la face
+        constexpr int depth = D - K;                     // the number of cuts that define the face
         if constexpr ( K == 0 ) {
             func( chain );
         } else {
-            const SI p = chain[ depth ];                 // l'apex de la face, fixe pour ce sous-arbre
+            const SI p = chain[ depth ];                 // the apex of the face, fixed for this subtree
             for ( int c = 0; c < nc; ++c )
                 apex[ depth ][ c ] = -1;
             for ( int i = 0; i < nv; ++i ) {
@@ -647,8 +647,8 @@ struct LocalN {
                         apex[ depth ][ c ] = i;
                 }
             }
-            // ... puis coner `p` sur les facettes qui ne le contiennent PAS ( les autres donneraient
-            // des simplexes plats )
+            // ... then cone `p` over the facets that do NOT contain it ( the others would give
+            // flat simplices )
             for ( int c = 0; c < nc; ++c ) {
                 const int a = apex[ depth ][ c ];
                 if ( a < 0 || has_cut( int( p ), c ) )
@@ -660,16 +660,16 @@ struct LocalN {
         }
     }
 
-    /// EN 3D : ACCUMULER LES FACES PLUTOT QUE LES ORDONNER. Ni le volume ni l'aire d'une face n'ont
-    /// besoin de l'ORDRE des sommets : il suffit, par face, d'UN de ses sommets `v_f` et de la somme
-    /// `S_f` des produits vectoriels de ses aretes vues depuis lui -- la face est plane et convexe,
-    /// donc les triangles `( v_f, arete )` la pavent et leurs produits vectoriels sont paralleles.
-    /// Le volume vaut `sum_f | ( v_f - g ) . S_f | / 6` pour n'importe quel `g` interieur. Deux
-    /// passes sans jamais chercher : `O( V + E )` au lieu de `O( F ( V + E ) )` pour les cycles --
-    /// mesure sur le banc : -15 % sur le diagramme 3D entier.
-    /// EN 3D : par coupe `f`, UN sommet `v0[ f ]` et la somme `s3[ . ][ f ]` des produits vectoriels
-    /// de ses aretes vues depuis lui -- deux fois le vecteur aire de la face. Ce que `measure_3d` et
-    /// `for_each_facet` lisent tous deux ( voir `measure_3d` pour pourquoi accumuler plutot qu'ordonner ).
+    /// IN 3D: ACCUMULATE THE FACES RATHER THAN ORDER THEM. Neither the volume nor the area of a face
+    /// needs the ORDER of the vertices: it is enough, per face, to have ONE of its vertices `v_f` and the sum
+    /// `S_f` of the cross products of its edges seen from it -- the face is planar and convex,
+    /// so the triangles `( v_f, edge )` tile it and their cross products are parallel.
+    /// The volume is `sum_f | ( v_f - g ) . S_f | / 6` for any interior `g`. Two
+    /// passes without ever searching: `O( V + E )` instead of `O( F ( V + E ) )` for the cycles --
+    /// measured on the bench: -15 % on the whole 3D diagram.
+    /// IN 3D: per cut `f`, ONE vertex `v0[ f ]` and the sum `s3[ . ][ f ]` of the cross products
+    /// of its edges seen from it -- twice the area vector of the face. What `measure_3d` and
+    /// `for_each_facet` both read ( see `measure_3d` for why to accumulate rather than order ).
     HD void accumulate_faces_3d() const {
         static_assert( D == 3 );
         TK *const *s = s3;
@@ -682,8 +682,8 @@ struct LocalN {
             for ( int j = 0; j < 3; ++j ) {
                 const int b = vn[ j ][ a ];
                 if ( b <= a )
-                    continue;                            // chaque arete vue une seule fois
-                // les deux faces qui portent l'arete `j` : les coupes du sommet privees de la `j`-ieme
+                    continue;                            // each edge seen only once
+                // the two faces that carry edge `j`: the cuts of the vertex minus the `j`-th
                 for ( int r = 0; r < 3; ++r ) {
                     if ( r == j )
                         continue;
@@ -699,10 +699,10 @@ struct LocalN {
         }
     }
 
-    /// `func( c, mesure )` pour chaque coupe `c` qui porte une face : son AIRE ( 3D seulement )
+    /// `func( c, measure )` for each cut `c` that carries a face: its AREA ( 3D only )
     template<class TF>
     HD void for_each_facet( auto &&func ) const {
-        static_assert( D == 3, "for_each_facet : 3D seulement au-dela du plan" );
+        static_assert( D == 3, "for_each_facet: 3D only beyond the plane" );
         if ( nv < 4 )
             return;
         accumulate_faces_3d();
@@ -720,8 +720,8 @@ struct LocalN {
         static_assert( D == 3 );
         if ( nv < 4 )
             return 0;
-        // l'accumulation se fait dans le flottant du NOYAU ( les tableaux `s3` sont en `TK` ) ;
-        // la somme finale est en `TF`
+        // the accumulation is done in the KERNEL's float ( the `s3` arrays are `TK` );
+        // the final sum is in `TF`
         accumulate_faces_3d();
         TK *const *s = s3;
 
@@ -736,7 +736,7 @@ struct LocalN {
         for ( int k = 0; k < nc; ++k ) {
             const int o = v0[ k ];
             if ( o < 0 )
-                continue;                                // coupe morte, pas encore compactee
+                continue;                                // dead cut, not yet compacted
             const TF t = ( TF( v[0][o] ) - g[0] ) * TF( s[0][k] ) + ( TF( v[1][o] ) - g[1] ) * TF( s[1][k] ) + ( TF( v[2][o] ) - g[2] ) * TF( s[2][k] );
             vol += t < 0 ? -t : t;
         }
@@ -763,8 +763,8 @@ struct LocalN {
         return sum / fact;
     }
 
-    /// l'adjoint : `grad_vp( i, d )` ACCUMULE ( un sommet est dans plusieurs simplexes ), donc il
-    /// est mis a zero d'abord, sur les `nv` sommets.
+    /// the adjoint: `grad_vp( i, d )` ACCUMULATES ( a vertex is in several simplices ), so it
+    /// is zeroed first, over the `nv` vertices.
     template<class TF>
     HD void measure_bwd( TF grad_res, auto &&grad_vp ) const {
         for ( int i = 0; i < nv; ++i )
@@ -778,8 +778,8 @@ struct LocalN {
             fact *= i;
         const TF g = grad_res / fact;
 
-        // `d|det|/dM = sign( det ) * cofactor( M )`, et chaque colonne de `M` est un apex moins le
-        // premier, qui recoit donc MOINS la somme des colonnes
+        // `d|det|/dM = sign( det ) * cofactor( M )`, and each column of `M` is an apex minus the
+        // first, which therefore receives MINUS the sum of the columns
         for_each_simplex( [&]( const auto &chain ) {
             const auto M = Matrix<TF,D>::with_func( [&]( auto r, auto c ) {
                 return TF( v[ int( r ) ][ chain[ int( c ) + 1 ] ] ) - TF( v[ int( r ) ][ chain[ 0 ] ] );
@@ -809,10 +809,10 @@ struct LocalN {
             }
     }
 
-    // ---- les tenseurs ------------------------------------------------------------------------
+    // ---- the tensors ------------------------------------------------------------------------
 
-    /// depuis une vue `Cell_N` : `vertex_positions [ nv, D ]`, `vertex_cuts` / `vertex_nbrs`
-    /// `[ nv, D ]`, `cut_ids [ nc ]`. `false` si elle ne tient pas dans `cap`.
+    /// from a `Cell_N` view: `vertex_positions [ nv, D ]`, `vertex_cuts` / `vertex_nbrs`
+    /// `[ nv, D ]`, `cut_ids [ nc ]`. `false` if it does not fit in `cap`.
     HD bool load( const auto &c ) {
         const int n = int( SI( c.nb_vertices ) ), k = int( SI( c.nb_cuts ) );
         if ( n > cap || k > cap )
@@ -826,8 +826,8 @@ struct LocalN {
             }
         for ( int q = 0; q < nc; ++q )
             cid[ q ] = int( SI( c.cut_ids( q ) ) );
-        // sur les sommets et non sur la liste : une coupe MORTE ( sans sommet ) peut y trainer
-        // jusqu'a la prochaine compaction, et une paroi morte ne borne rien
+        // over the vertices and not over the list: a DEAD cut ( with no vertex ) may linger there
+        // until the next compaction, and a dead wall bounds nothing
         unbounded = false;
         for ( int i = 0; i < nv; ++i )
             for ( int r = 0; r < D; ++r )

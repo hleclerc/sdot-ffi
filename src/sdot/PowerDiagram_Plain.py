@@ -1,8 +1,8 @@
-"""Les germes tels qu'ils sont venus : `positions [ n, d ]`, `weights [ n ]`, et aucune
-accélération -- chaque cellule est coupée par les `n - 1` bissectrices, dans l'ordre.
+"""The seeds as they came: `positions [ n, d ]`, `weights [ n ]`, and no
+acceleration -- each cell is cut by the `n - 1` bisectors, in order.
 
-Le plancher contre lequel `PowerDiagram_Bsp` se mesure ( `O( n² )` ), et ce qui reste quand les
-positions sont un traceur, sur lequel aucun arbre ne se bâtit. Côté noyau : `PowerDiagram_Plain.h`.
+The floor against which `PowerDiagram_Bsp` is measured ( `O( n² )` ), and what remains when the
+positions are a tracer, on which no tree can be built. Kernel side: `PowerDiagram_Plain.h`.
 """
 
 import loom
@@ -14,9 +14,9 @@ from .PowerDiagram import PowerDiagram
 class PowerDiagram_Plain( PowerDiagram ):
     positions : RealTensor[ "num_point", "dim" ]
 
-    # FACULTATIF, comme le domaine : absent ( `Unbound`, `NoneTensor` côté C++ ), le terme de poids
-    # disparaît du plan À LA COMPILATION et le diagramme est l'euclidien. « Pas de poids » est un
-    # ÉTAT, pas un tableau de zéros.
+    # OPTIONAL, like the domain: absent ( `Unbound`, `NoneTensor` on the C++ side ), the weight term
+    # vanishes from the plane AT COMPILE TIME and the diagram is the Euclidean one. "No weights" is a
+    # STATE, not an array of zeros.
     weights   : RealTensor[ "num_point" ]
 
     def _init_seeds( self, positions, weights, accelerator ):
@@ -29,7 +29,7 @@ class PowerDiagram_Plain( PowerDiagram ):
     def _grad_seeds_expr( self ):
         return "grad_of_inputs.power_diagram.positions, grad_of_inputs.power_diagram.weights"
 
-    # ---- ce que le solveur de `SdotPlanNd` ecrit ( voir `PowerDiagram_Bsp` ) ----------------------------
+    # ---- what the `SdotPlanNd` solver writes ( see `PowerDiagram_Bsp` ) ----------------------------
 
     def _solver_weights_call( self ):
         w = RealTensor[ self.num_point ]()

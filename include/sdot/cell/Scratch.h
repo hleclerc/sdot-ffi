@@ -3,19 +3,19 @@
 #include <loom/support/common_macros.h> // HD
 
 // =====================================================================================
-// LE SCRATCH : un seul tenseur de mots par work-item, decoupe par le C++ en ce dont il a besoin.
+// THE SCRATCH : a single tensor of words per work-item, carved up by the C++ into what it needs.
 //
-// Une cellule en memoire ( `Local1` / `Local2` / `LocalN` ) est faite de tableaux -- les sommets,
-// les identifiants, les temporaires de la coupe -- dont la taille est UNE CAPACITE, decidee par
-// l'hote : exactement ce qu'il faut pour une operation de `Cell_*.py` ( le nombre de sommets qu'une
-// coupe peut produire se borne ), une supposition que loom fait grossir sur debordement pour un
-// diagramme entier. Ces tableaux vivent tous dans UN tenseur d'entiers par work-item, que `Carver`
-// decoupe : c'est le seul scratch qu'un kernel demande, et c'est lui qui porte l'axe de batch de
-// l'appel ( `Cell.py::CellScratch` ).
+// An in-memory cell ( `Local1` / `Local2` / `LocalN` ) is made of arrays -- the vertices,
+// the identifiers, the cut temporaries -- whose size is ONE CAPACITY, decided by the
+// host : exactly what is needed for an operation of `Cell_*.py` ( the number of vertices that a
+// cut can produce is bounded ), a guess that loom grows on overflow for a whole
+// diagram. These arrays all live in ONE integer tensor per work-item, which `Carver`
+// carves up : it is the only scratch a kernel asks for, and it is what carries the batch axis of
+// the call ( `Cell.py::CellScratch` ).
 //
-// LES DEUX COTES DOIVENT S'ACCORDER sur la taille : `Local*::words_for( cap )` ici,
-// `Cell_*.scratch_words( cap )` cote Python, avec la meme formule -- et `attach` verifie qu'il a la
-// place, sans quoi il ne pose rien et le dit ( `ShapeVarView::set` ), plutot que d'ecrire a cote.
+// THE TWO SIDES MUST AGREE on the size : `Local*::words_for( cap )` here,
+// `Cell_*.scratch_words( cap )` on the Python side, with the same formula -- and `attach` checks that it has the
+// room, otherwise it sets nothing and says so ( `ShapeVarView::set` ), rather than writing next to it.
 // =====================================================================================
 
 #include <loom/support/common_types.h>
@@ -24,17 +24,17 @@
 
 namespace sdot {
 
-/// l'alignement de chaque tableau decoupe : de quoi charger huit `float` d'un coup
+/// the alignment of each carved array : enough to load eight `float`s at once
 static constexpr SI scratch_align = 32;
 
-/// arrondi de `n` elements de `T` a l'alignement, en MOTS de 32 bits
+/// `n` elements of `T` rounded up to the alignment, in 32-bit WORDS
 template<class T>
 HD constexpr SI words_of( SI n ) {
     const SI bytes = n * SI( sizeof( T ) );
     return ( ( bytes + scratch_align - 1 ) / scratch_align ) * ( scratch_align / 4 );
 }
 
-/// decoupe une zone de `nb_words` mots en tableaux alignes, dans l'ordre des `take`
+/// carves a zone of `nb_words` words into aligned arrays, in the order of the `take` calls
 struct Carver {
     std::int32_t *base;
     SI            nb_words;

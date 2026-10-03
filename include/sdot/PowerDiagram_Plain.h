@@ -8,10 +8,10 @@
 
 namespace sdot {
 
-// LES GERMES TELS QU'ILS SONT VENUS ( `PowerDiagram_Plain.py` ) : `positions [ n, d ]`, `weights
-// [ n ]`, et aucune acceleration -- chaque cellule est coupee par les `n - 1` bissectrices, dans
-// l'ordre. Le plancher contre lequel `PowerDiagram_Bsp` se mesure, et ce qui reste quand les
-// positions sont un traceur ( pas d'arbre a batir dessus ).
+// THE SEEDS AS THEY CAME ( `PowerDiagram_Plain.py` ): `positions [ n, d ]`, `weights
+// [ n ]`, and no acceleration -- each cell is cut by the `n - 1` bisectors, in
+// order. The floor against which `PowerDiagram_Bsp` is measured, and what remains when the
+// positions are a tracer ( no tree to build on them ).
 SDOT_TEMPLATE_DECL_FOR_PowerDiagram_Plain
 struct PowerDiagram_Plain {
     SDOT_ATTRIBUTES_OF_PowerDiagram_Plain
@@ -20,10 +20,10 @@ struct PowerDiagram_Plain {
     HD SI user_id( SI k ) const { return k; }
 
     template<class TK>
-    HD auto fournisseur( SI k0 ) const { return FournisseurTous<PowerDiagram_Plain,TK,ct_dim>( *this, k0 ); }
+    HD auto provider( SI k0 ) const { return ProviderAll<PowerDiagram_Plain,TK,ct_dim>( *this, k0 ); }
 
-    /// le meme diagramme, les poids lus AILLEURS ( voir `PowerDiagram_Bsp::with_weights` ) ; l'ordre
-    /// des membres est celui de `PowerDiagram.py` + `PowerDiagram_Plain.py`
+    /// the same diagram, the weights read ELSEWHERE ( see `PowerDiagram_Bsp::with_weights` ); the order
+    /// of the members is that of `PowerDiagram.py` + `PowerDiagram_Plain.py`
     HD auto with_weights( auto &&weights_ ) const {
         return ::sdot::PowerDiagram_Plain{ box_min, box_max, bnd_directions, bnd_offsets, nb_points, nb_boundaries, nb_dims, positions, weights_ };
     }

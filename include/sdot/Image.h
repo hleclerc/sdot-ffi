@@ -14,8 +14,8 @@ struct Image {
     SCInt  ct_dim       = DECAYED_TYPE_OF( nb_dims )::value;
     using  TF           = DECAYED_TYPE_OF( values )::TF;
 
-    /// cette distribution DECOUPE la cellule en morceaux ( un par pave ) : l'integrateur lui
-    /// reserve une cellule de rechange dans le scratch ( `PowerDiagram::nb_work_cells` )
+    /// this distribution CUTS the cell into pieces ( one per block ): the integrator reserves
+    /// a spare cell for it in the scratch ( `PowerDiagram::nb_work_cells` )
     static constexpr bool cuts_pieces = true;
 
     // build a FULLY-POPULATED image -- each of `origin` / `frame` / `knots` that is unbound
@@ -26,21 +26,21 @@ struct Image {
     // total measure of the piecewise-constant function: sum over cells of value * cell volume.
     HD TF  measure   () const;
 
-    // ---- intégrer une CELLULE contre cette image -------------------------------------------------
-    // L'image comme DISTRIBUTION : ce que `PowerDiagram::measures` appelle quand on lui en donne
-    // une. Le contrat (celui de toute distribution) est écrit dans `distributions/Distribution.py` ;
-    // il tient en une phrase : découper `cell` en morceaux sur lesquels la densité est CONSTANTE,
-    // et passer chacun à `func( morceau, valeur, add_value_grad )`.
+    // ---- integrating a CELL against this image --------------------------------------------------
+    // The image as a DISTRIBUTION: what `PowerDiagram::measures` calls when given
+    // one. The contract (that of any distribution) is written in `distributions/Distribution.py`;
+    // it fits in one sentence: cut `cell` into pieces on which the density is CONSTANT,
+    // and pass each one to `func( piece, value, add_value_grad )`.
     //
-    // Ici un morceau est `cellule INTER pavé de la grille`. Le découpage n'est donc que 2d coupes
-    // par pavé rencontré, faites dans les deux cellules de rechange que l'appelant fournit
-    // (`PieceWorkspace.h`) -- la cellule d'origine, elle, n'est jamais touchée, ce qui permet
-    // d'ouvrir un morceau après l'autre sans la copier.
+    // Here a piece is `cell INTERSECT grid block`. The cutting is therefore only 2d cuts
+    // per block met, made in the two spare cells that the caller provides
+    // (`PieceWorkspace.h`) -- the original cell is never touched, which makes it possible
+    // to open one piece after another without copying it.
     HD void   for_each_piece ( const auto &cell, auto &&ws, auto &&func ) const;
     HD void   _for_each_piece( const auto &cell, auto &&ws, auto &&func ) const;
 
-    // le plus grand `i` tel que `knots( axis, i ) <= t`, borné dans `[ 0, nb_cells - 1 ]` (les
-    // noeuds sont croissants, donc une dichotomie -- une image de production a beaucoup de pavés).
+    // the largest `i` such that `knots( axis, i ) <= t`, clamped to `[ 0, nb_cells - 1 ]` (the
+    // knots are increasing, hence a binary search -- a production image has many blocks).
     HD SI  knot_index   ( SI axis, TF t, SI nb_cells ) const;
 
     // adjoint of `measure` w.r.t. `values`: since mass = Sum_c values(c) * cell_volume(c) is linear
@@ -69,3 +69,6 @@ struct Image {
 }
 
 #include "Image.cxx"
+
+// its convolved density, for the transport solver ( `sdotplan/Convolved.h` )
+#include "sdotplan/convolved/Image.h"

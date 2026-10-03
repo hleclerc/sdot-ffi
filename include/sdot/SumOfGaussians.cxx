@@ -5,15 +5,15 @@
 #include "SumOfGaussians.h"
 #include <loom/support/math.h>
 
-// Les mathématiques passent par `sdot::` (`loom/support/math.h`), JAMAIS par `std::`.
+// Mathematics goes through `sdot::` (`loom/support/math.h`), NEVER through `std::`.
 //
-// Ce n'est pas une préférence de style : `std::exp` / `std::atan` / `std::erf` sur un `float`
-// n'existent pas dans du code device CUDA (ils abaissent vers des intrinsèques que le compilateur
-// device ne sait pas résoudre), là où les surcharges du toolkit, elles, existent. `sdot::` désigne
-// l'une ou l'autre selon la cible, en un seul endroit.
+// It is not a style preference: `std::exp` / `std::atan` / `std::erf` on a `float`
+// do not exist in CUDA device code (they lower to intrinsics that the device compiler
+// cannot resolve), whereas the toolkit's overloads do exist. `sdot::` designates
+// one or the other depending on the target, in a single place.
 //
-// `sqrt` y est inclus bien qu'il passe partout (c'est une instruction native) : une règle qui
-// souffre une exception n'est pas une règle qu'on suit.
+// `sqrt` is included even though it works everywhere (it is a native instruction): a rule that
+// tolerates an exception is not a rule that gets followed.
 
 #define UTP SDOT_TEMPLATE_DECL_FOR_SumOfGaussians
 #define DTP SumOfGaussians<SDOT_TEMPLATE_ARGS_FOR_SumOfGaussians>
@@ -30,9 +30,9 @@ UTP HD auto DTP::kernel_at( SI i, const auto &x ) const {
         r2 += e * e;
     }
 
-    // `( 2 pi s^2 ) ^ ( -d/2 )`, écrit comme une puissance entière de `1 / ( s sqrt( 2 pi ) )` : d
-    // multiplications au lieu d'un `pow`, et `ct_dim` étant connu à la compilation la boucle
-    // disparaît.
+    // `( 2 pi s^2 ) ^ ( -d/2 )`, written as an integer power of `1 / ( s sqrt( 2 pi ) )`: d
+    // multiplications instead of a `pow`, and `ct_dim` being known at compile time the loop
+    // disappears.
     const TF two_pi = TF( 6.283185307179586476925286766559 );
     const TF inv = TF( 1 ) / ( s * sdot::sqrt( two_pi ) );
     TF norm = 1;
@@ -51,8 +51,8 @@ UTP HD typename DTP::TF DTP::value_at( const auto &x ) const {
 }
 
 UTP HD auto DTP::gradient_at( const auto &x ) const {
-    // `d/dx exp( -r^2 / 2s^2 ) = - ( x - c ) / s^2 * ...` : le gradient d'une gaussienne pointe vers
-    // son centre, avec le facteur `1 / s^2`.
+    // `d/dx exp( -r^2 / 2s^2 ) = - ( x - c ) / s^2 * ...`: the gradient of a gaussian points towards
+    // its center, with the factor `1 / s^2`.
     const SI n = nb_gaussians;
     auto res = Vector<TF,ct_dim>::zeros();
     for ( SI i = 0; i < n; ++i ) {
@@ -70,8 +70,8 @@ UTP HD void DTP::add_value_grad_at( auto &&grad_dist, const auto &x, TF g ) cons
             atomic_add( dst.ref(), v );
     };
 
-    // rien de demandé : pas une lecture, pas une exponentielle. Le test est à la COMPILATION, donc
-    // un forward pur ne paie pas l'existence de ce bloc.
+    // nothing requested: not a read, not an exponential. The test is at COMPILE time, so
+    // a pure forward does not pay for the existence of this block.
     if constexpr ( grad_dist.weights.surely_null
                 && grad_dist.positions.surely_null
                 && grad_dist.sigmas.surely_null ) {
@@ -82,43 +82,43 @@ UTP HD void DTP::add_value_grad_at( auto &&grad_dist, const auto &x, TF g ) cons
             const auto k = kernel_at( i, x );
             const TF w = TF( weights( i ) );
 
-            // d rho / d w_i = le noyau normalisé
+            // d rho / d w_i = the normalized kernel
             add_to( grad_dist.weights( i ), g * k.phi );
 
-            // d rho / d c_i = w_i * phi * ( x - c_i ) / s^2   ( le gradient EN x, changé de signe )
+            // d rho / d c_i = w_i * phi * ( x - c_i ) / s^2   ( the gradient AT x, sign flipped )
             if constexpr ( ! grad_dist.positions.surely_null ) {
                 const TF f = g * w * k.phi / ( k.s * k.s );
                 for ( PI c = 0; c < ct_dim; ++c )
                     add_to( grad_dist.positions( i, c ), f * ( TF( x[ c ] ) - TF( positions( i, c ) ) ) );
             }
 
-            // d rho / d s_i = w_i * phi * ( r^2 / s^3 - d / s ) : le premier terme vient de
-            // l'exponentielle, le second de la constante de normalisation `s^-d`.
+            // d rho / d s_i = w_i * phi * ( r^2 / s^3 - d / s ): the first term comes from
+            // the exponential, the second from the normalization constant `s^-d`.
             add_to( grad_dist.sigmas( i ),
                     g * w * k.phi * ( k.r2 / ( k.s * k.s * k.s ) - TF( ct_dim ) / k.s ) * ( TF( sigmas( i ) ) / k.s ) );
         }
     }
 }
 
-// ---- l'intégration exacte en 2D ---------------------------------------------------------------
-// Voir `SumOfGaussians.h` pour la réduction. Ici, les 8 noeuds de Gauss-Legendre (symétriques,
-// donnés en demi-table) et les quatre méthodes.
+// ---- exact integration in 2D ------------------------------------------------------------------
+// See `SumOfGaussians.h` for the reduction. Here, the 8 Gauss-Legendre nodes (symmetric,
+// given as a half-table) and the four methods.
 
 namespace detail {
-    // Gauss-Legendre à 8 points sur [ -1, 1 ], moitié positive
+    // 8-point Gauss-Legendre on [ -1, 1 ], positive half
     LOOM_CONSTANT( double gl8_x[ 4 ] ) = { 0.1834346424956498, 0.5255324099163290,
                                            0.7966664774136267, 0.9602898564975363 };
     LOOM_CONSTANT( double gl8_w[ 4 ] ) = { 0.3626837833783620, 0.3137066458778873,
                                            0.2223810344533745, 0.1012285362903763 };
 
-    // `Phi`, la fonction de répartition normale standard
+    // `Phi`, the standard normal cumulative distribution function
     template<class TF> HD TF std_normal_cdf( TF u ) {
         return TF( 0.5 ) * ( 1 + sdot::erf( u * TF( 0.70710678118654752440 ) ) );
     }
 }
 
 UTP HD typename DTP::TF DTP::facet_mass( const auto &pc, int cut ) const {
-    static_assert( ct_dim == 2, "facet_mass : 2D seulement ( une arete )" );
+    static_assert( ct_dim == 2, "facet_mass: 2D only ( an edge )" );
     const int nb = pc.nb_vertices();
     const int j = cut + 1 < nb ? cut + 1 : 0;
     const TF ax = TF( pc.coord( cut, 0 ) ), ay = TF( pc.coord( cut, 1 ) );
@@ -126,18 +126,18 @@ UTP HD typename DTP::TF DTP::facet_mass( const auto &pc, int cut ) const {
     const TF L = sdot::sqrt( ex * ex + ey * ey );
     if ( ! ( L > 0 ) )
         return 0;
-    const TF ux = ex / L, uy = ey / L;                    // la tangente, et une normale
+    const TF ux = ex / L, uy = ey / L;                    // the tangent, and a normal
     const TF nx = -uy, ny = ux;
     TF res = 0;
     const SI ng = SI( sigmas.shape( 0 ) );
     for ( SI i = 0; i < ng; ++i ) {
         const TF s = sigma_of( i ), m = TF( weights( i ) );
         const TF px = ax - TF( positions( i, 0 ) ), py = ay - TF( positions( i, 1 ) );
-        const TF d = px * nx + py * ny;                   // la distance signee du centre a la droite
+        const TF d = px * nx + py * ny;                   // the signed distance from the center to the line
         const TF t0 = px * ux + py * uy, t1 = t0 + L;
         const TF q = d * d / ( 2 * s * s );
         if ( q > TF( 700 ) )
-            continue;                                    // rien, a l'arrondi pres
+            continue;                                    // nothing, up to rounding
         const TF is2 = TF( 0.70710678118654752440 ) / s;
         const TF E = sdot::erf( t1 * is2 ) - sdot::erf( t0 * is2 );
         res += m * sdot::exp( -q ) * E / ( 2 * s * TF( 2.50662827463100050242 ) );   // `sqrt( 2 pi )`
@@ -146,7 +146,7 @@ UTP HD typename DTP::TF DTP::facet_mass( const auto &pc, int cut ) const {
 }
 
 UTP HD typename DTP::TF DTP::wedge_measure( const auto &P, const auto &Q ) const {
-    static_assert( ct_dim == 2, "le coin polaire est la réduction 2D (voir SumOfGaussians.h)" );
+    static_assert( ct_dim == 2, "the polar corner is the 2D reduction (see SumOfGaussians.h)" );
     const TF two_pi = TF( 6.283185307179586476925286766559 );
 
     const TF dx = Q[ 0 ] - P[ 0 ], dy = Q[ 1 ] - P[ 1 ];
@@ -154,13 +154,13 @@ UTP HD typename DTP::TF DTP::wedge_measure( const auto &P, const auto &Q ) const
     if ( ! ( L > 0 ) )
         return 0;
 
-    // `( n, u )` DIRECT, de sorte que `cross( P, Q ) = p * L` : le signe de `p` est celui de l'aire
-    // du coin, et `t` croît de `P` vers `Q`.
+    // `( n, u )` DIRECT, so that `cross( P, Q ) = p * L`: the sign of `p` is that of the area
+    // of the corner, and `t` grows from `P` towards `Q`.
     const TF ux = dx / L, uy = dy / L;
     const TF nx = uy, ny = -ux;
     const TF p = nx * P[ 0 ] + ny * P[ 1 ];
     const TF ap = p < 0 ? -p : p;
-    if ( ! ( ap > 0 ) )                     // l'origine EST sur la droite : coin plat
+    if ( ! ( ap > 0 ) )                     // the origin IS on the line: flat corner
         return 0;
 
     const TF t0 = ux * P[ 0 ] + uy * P[ 1 ];
@@ -168,13 +168,13 @@ UTP HD typename DTP::TF DTP::wedge_measure( const auto &P, const auto &Q ) const
 
     TF acc = 0;
     if ( ap >= tail_cut ) {
-        // la gaussienne ne vaut plus rien sur toute la droite : il ne reste que la lorentzienne
+        // the gaussian is worth nothing along the whole line: only the Lorentzian remains
         acc = sdot::atan( t1 / ap ) - sdot::atan( t0 / ap );
     } else {
-        // Les QUEUES d'abord, chacune bornée par le segment lui-même : un segment entièrement
-        // au-delà de `tail_cut` d'un seul côté n'a pas de coeur du tout, et sa queue va de `t0` à
-        // `t1`, pas de `tail_cut` à `t1`. Clipper « symétriquement » compterait `[ tail_cut, t0 ]`
-        // en trop -- une part d'angle bien visible quand l'arête est longue et rase l'origine.
+        // The TAILS first, each bounded by the segment itself: a segment entirely
+        // beyond `tail_cut` on one side only has no core at all, and its tail goes from `t0` to
+        // `t1`, not from `tail_cut` to `t1`. Clipping "symmetrically" would count `[ tail_cut, t0 ]`
+        // too much -- a clearly visible share of angle when the edge is long and grazes the origin.
         if ( t0 < -tail_cut ) {
             const TF e = t1 < -tail_cut ? t1 : -tail_cut;
             acc += sdot::atan( e / ap ) - sdot::atan( t0 / ap );
@@ -187,9 +187,9 @@ UTP HD typename DTP::TF DTP::wedge_measure( const auto &P, const auto &Q ) const
         const TF c0 = t0 > -tail_cut ? t0 : -tail_cut;
         const TF c1 = t1 <  tail_cut ? t1 :  tail_cut;
 
-        // le coeur, par Gauss-Legendre composite. L'intégrande y a une échelle `>= 1` (le facteur
-        // `1 - exp` annule le pic de la lorentzienne quand `p` est petit), donc quelques panneaux
-        // suffisent quelle que soit la configuration.
+        // the core, by composite Gauss-Legendre. The integrand has a scale `>= 1` there (the factor
+        // `1 - exp` cancels the Lorentzian peak when `p` is small), so a few panels
+        // suffice whatever the configuration.
         if ( c1 > c0 ) {
             const TF h = ( c1 - c0 ) / ( 2 * nb_panels );
             for ( int k = 0; k < nb_panels; ++k ) {
@@ -212,7 +212,7 @@ UTP HD typename DTP::TF DTP::std_triangle_measure( const auto &ys ) const {
     const TF s = wedge_measure( ys[ 0 ], ys[ 1 ] )
                + wedge_measure( ys[ 1 ], ys[ 2 ] )
                + wedge_measure( ys[ 2 ], ys[ 0 ] );
-    // la somme signée porte l'ORIENTATION du triangle ; la mesure, elle, n'en a pas.
+    // the signed sum carries the ORIENTATION of the triangle; the measure has none.
     return s < 0 ? -s : s;
 }
 
@@ -228,16 +228,16 @@ UTP HD typename DTP::EdgeInfo DTP::edge_info( const auto &A, const auto &B, cons
         return res;
     const TF L = sdot::sqrt( L2 );
 
-    // la normale SORTANTE : celle qui s'éloigne du troisième sommet
+    // the OUTWARD normal: the one that points away from the third vertex
     TF nx = dy / L, ny = -dx / L;
     if ( nx * ( C[ 0 ] - A[ 0 ] ) + ny * ( C[ 1 ] - A[ 1 ] ) > 0 ) { nx = -nx; ny = -ny; }
     res.n[ 0 ] = nx;
     res.n[ 1 ] = ny;
-    res.p = nx * A[ 0 ] + ny * A[ 1 ];      // constant le long de l'arête
+    res.p = nx * A[ 0 ] + ny * A[ 1 ];      // constant along the edge
 
-    // `| A + s ( B - A ) |^2 = L^2 ( s - s0 )^2 + p^2` : le pied de la perpendiculaire, et la
-    // distance à la droite. C'est ce qui fait sortir un `exp( -p^2/2 )` en facteur et laisse une
-    // gaussienne 1D, donc des `erf`.
+    // `| A + s ( B - A ) |^2 = L^2 ( s - s0 )^2 + p^2`: the foot of the perpendicular, and the
+    // distance to the line. That is what pulls out an `exp( -p^2/2 )` as a factor and leaves a
+    // 1D gaussian, hence `erf`s.
     const TF s0 = - ( A[ 0 ] * dx + A[ 1 ] * dy ) / L2;
     TF p2 = A[ 0 ] * A[ 0 ] + A[ 1 ] * A[ 1 ] - L2 * s0 * s0;
     if ( p2 < 0 ) p2 = 0;
@@ -253,7 +253,7 @@ UTP HD typename DTP::EdgeInfo DTP::edge_info( const auto &A, const auto &B, cons
 }
 
 UTP HD typename DTP::TF DTP::integrate_over_simplex( const auto &pts ) const {
-    static_assert( ct_dim == 2, "le chemin exact est le 2D ; au-delà on passe par PointwiseDensity" );
+    static_assert( ct_dim == 2, "the exact path is 2D; beyond that we go through PointwiseDensity" );
 
     const SI n = nb_gaussians;
     TF res = 0;
@@ -268,7 +268,7 @@ UTP HD typename DTP::TF DTP::integrate_over_simplex( const auto &pts ) const {
 }
 
 UTP HD void DTP::integrate_over_simplex_bwd( const auto &pts, TF g, auto &&grad_pts, auto &&grad_dist ) const {
-    static_assert( ct_dim == 2, "le chemin exact est le 2D ; au-delà on passe par PointwiseDensity" );
+    static_assert( ct_dim == 2, "the exact path is 2D; beyond that we go through PointwiseDensity" );
 
     auto add_to = []( auto &&dst, TF v ) {
         if constexpr ( ! dst.surely_null )
@@ -283,8 +283,8 @@ UTP HD void DTP::integrate_over_simplex_bwd( const auto &pts, TF g, auto &&grad_
             return Vector<TF,2>( Function(), [&]( PI c ) { return ( pts[ k ][ c ] - TF( positions( i, c ) ) ) / s; } );
         } );
 
-        // une passe sur les trois arêtes : chacune verse à ses DEUX sommets (avec le poids
-        // barycentrique qui vaut 1 chez l'un et 0 chez l'autre), et au sigma via `y . n`.
+        // one pass over the three edges: each one pays into its TWO vertices (with the
+        // barycentric weight that is 1 at one and 0 at the other), and into sigma via `y . n`.
         auto dm = Vector<Vector<TF,2>,3>( Function(), []( PI ) { return Vector<TF,2>::zeros(); } );
         TF dsig = 0;
         for ( SI k = 0; k < 3; ++k ) {
@@ -297,8 +297,8 @@ UTP HD void DTP::integrate_over_simplex_bwd( const auto &pts, TF g, auto &&grad_
             dsig += ei.p * ei.j0;
         }
 
-        // les sommets, puis le centre -- qui est MOINS leur somme (translater le triangle et la
-        // gaussienne ensemble ne change rien), ce qui évite une seconde dérivation.
+        // the vertices, then the center -- which is MINUS their sum (translating the triangle and the
+        // gaussian together changes nothing), which avoids a second differentiation.
         const TF f = g * w / s;
         auto dc = Vector<TF,2>::zeros();
         for ( SI k = 0; k < 3; ++k ) {

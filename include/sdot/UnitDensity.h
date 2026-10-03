@@ -5,19 +5,19 @@
 
 namespace sdot {
 
-// La distribution qui n'en est pas une : la mesure de Lebesgue, densité 1 partout.
+// The distribution that is not one: the Lebesgue measure, density 1 everywhere.
 //
-// Ce que `PowerDiagram::integrate_into` reçoit quand l'appelant n'a donné aucune distribution, de
-// sorte que « pas de distribution » soit un cas ORDINAIRE du même code et non une seconde
-// implémentation -- exactement le rôle que `EverySeed` tient pour les accélérateurs.
+// What `PowerDiagram::integrate_into` receives when the caller gave no distribution, so that
+// "no distribution" is an ORDINARY case of the same code and not a second implementation --
+// exactly the role `EverySeed` plays for the accelerators.
 //
-// Un seul morceau, la cellule elle-même, et aucun découpage : ni scratch, ni copie, ni la moindre
-// coupe. `measures` sans distribution calcule donc exactement ce qu'il calculait avant, à
-// l'instruction près (le `TF( 1 ) *` se replie à la compilation).
+// A single piece, the cell itself, and no slicing: no scratch, no copy, not the slightest cut.
+// `measures` without a distribution therefore computes exactly what it computed before, down to
+// the instruction (the `TF( 1 ) *` folds away at compile time).
 struct UnitDensity {
     HD void for_each_piece( const auto &cell, auto &&/*ws*/, auto &&func ) const {
-        // constante, et non paramétrée : le puits de gradient ne mène nulle part (voir
-        // `ConstantDensity`). Le `TF( 1 ) *` de l'intégrateur se replie à la compilation.
+        // constant, and not parameterized: the gradient sink leads nowhere (see
+        // `ConstantDensity`). The integrator's `TF( 1 ) *` folds away at compile time.
         using TF = typename DECAYED_TYPE_OF( cell )::TKernel;
         func( cell, ConstantDensity{ TF( 1 ), []( auto &&/*grad_dist*/, auto /*g*/ ) {} } );
     }

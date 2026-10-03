@@ -2,11 +2,11 @@
 
 #include <loom/support/common_macros.h> // HD
 
-// CE QUE LES DEUX STOCKAGES ONT EN COMMUN, cote C++ : les points de `positions`, le poids ( absent
-// -> zero, et le terme disparait a la compilation ), et les points d'entree que `PowerDiagram.py`
-// appelle -- qui ne font que passer la main a `diagram/Ops.h` en s'ajoutant eux-memes.
+// WHAT THE TWO STORAGES HAVE IN COMMON, C++ side: the points of `positions`, the weight ( absent
+// -> zero, and the term vanishes at compile time ), and the entry points that `PowerDiagram.py`
+// calls -- which only hand over to `diagram/Ops.h`, adding themselves.
 //
-// Un stockage l'instancie avec ses propres tenseurs : `DIAGRAM_COMMON( positions, weights )`.
+// A storage instantiates it with its own tensors: `DIAGRAM_COMMON( positions, weights )`.
 
 #include <loom/support/containers/Vector.h>
 #include "Ops.h"

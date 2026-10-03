@@ -1,11 +1,10 @@
-"""Le tenseur de travail des kernels de cellules.
+"""The working tensor of the cell kernels.
 
-Les tableaux d'une cellule dans la forme du noyau ( `cell/Local*.h` : SoA, dans le flottant du
-noyau ) et les temporaires de la coupe vivent dans UN tenseur de mots par work-item, que le C++
-découpe ( `cell/Scratch.h` ). Sa taille est décidée par l'hôte, avec la formule que le C++ partage
-( `Local*::words_for` / `Cell_*.scratch_words` ) : exactement ce qu'il faut pour une opération de
-`Cell_*` -- on sait borner ce qu'une coupe produit --, une supposition que loom fait grossir sur
-débordement pour un diagramme entier.
+A cell's arrays in the kernel's form ( `cell/Local*.h`: SoA, in the kernel's float ) and the
+temporaries of the cut live in ONE tensor of words per work-item, which the C++ slices up
+( `cell/Scratch.h` ). Its size is decided by the host, with the formula the C++ shares
+( `Local*::words_for` / `Cell_*.scratch_words` ): exactly what a `Cell_*` operation needs -- we
+can bound what a cut produces --, a guess that loom grows on overflow for a whole diagram.
 """
 
 import loom
@@ -14,23 +13,23 @@ from loom.util import Aggregate
 
 
 def fp_size( dtype ):
-    """32 ou 64, depuis `"FP32"` / `"FP64"` / `float` / un dtype numpy"""
+    """32 or 64, from `"FP32"` / `"FP64"` / `float` / a numpy dtype"""
     s = str( dtype ).lower()
     return 64 if "64" in s or s in ( "float", "double" ) else 32
 
 
 def words_of( itemsize, n ):
-    """`n` éléments de `itemsize` octets, arrondis à l'alignement de 32 octets, en mots de 32 bits
-    -- `words_of<T>( n )` de `cell/Scratch.h`."""
+    """`n` elements of `itemsize` bytes, rounded up to the 32-byte alignment, in 32-bit words
+    -- `words_of<T>( n )` of `cell/Scratch.h`."""
     return -( -n * itemsize // 32 ) * 8
 
 
 class CellScratch( Aggregate ):
-    """Une ligne de mots par work-item ( ou par item, quand l'appel est batché sur des cellules ),
-    et le flottant du noyau en constante de compilation.
+    """One row of words per work-item ( or per item, when the call is batched over cells ),
+    and the kernel's float as a compile-time constant.
 
-    `nb_words` est une SORTIE avec une capacité : c'est par là qu'un kernel dit qu'il a manqué de
-    place ( `cell/Ops.h::ask_more` ), et par là que `driver.call` le sait et relance en doublant.
+    `nb_words` is an OUTPUT with a capacity: it is how a kernel says it ran out of room
+    ( `cell/Ops.h::ask_more` ), and how `driver.call` finds out and retries with double the size.
     """
     words          : IntTensor[ "num_thread", "num_word", dict( size = 32 ) ]
 
@@ -42,13 +41,12 @@ class CellScratch( Aggregate ):
 
     @classmethod
     def for_call( cls, nb_words, kernel_dtype, nb_threads = 1, batch_axes = None ):
-        """Le scratch d'un appel, DÉJÀ MARQUÉ : `nb_words` mots par ligne, `nb_threads` lignes
-        ( batché sur `batch_axes` si l'appel l'est ), prêt à être passé sous le nom que le noyau
-        lui donne -- `scratch = CellScratch.for_call( ... )`.
+        """The scratch of a call, ALREADY MARKED: `nb_words` words per row, `nb_threads` rows
+        ( batched over `batch_axes` if the call is ), ready to be passed under the name the kernel
+        gives it -- `scratch = CellScratch.for_call( ... )`.
 
-        Il n'y a plus de `name` à répéter : le rôle est porté par la VALEUR, donc le nom de
-        l'argument est le nom, et rien ne peut plus se désaccorder entre les deux. C'est aussi ce
-        qui a fait disparaître `merge_call`, dont l'unique métier était de fondre ces listes de
-        chemins dans celles de l'appel."""
+        There is no `name` left to repeat: the role is carried by the VALUE, so the argument's
+        name is the name, and nothing can get out of sync between the two. This is also what made
+        `merge_call` disappear, whose only job was to merge these path lists into the call's."""
         sc = cls( kernel_fp_size = fp_size( kernel_dtype ), nb_threads = int( nb_threads ), batch_axes = batch_axes )
         return loom.scratch( sc, capacities = { "nb_words": int( nb_words ) } )

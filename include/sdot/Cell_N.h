@@ -9,12 +9,12 @@
 
 namespace sdot {
 
-// LE POLYTOPE SIMPLE EN DIMENSION >= 3 ( `Cell_N.py` ) : `D` coupes et `D` voisins par sommet.
+// THE SIMPLE POLYTOPE IN DIMENSION >= 3 ( `Cell_N.py` ) : `D` cuts and `D` neighbours per vertex.
 //
-// Les tenseurs sont ceux de `Cell_N.py` -- le format PRATIQUE, un sommet par ligne, dans le flottant
-// de l'appelant. Un kernel ne travaille jamais dessus directement : il pose la cellule dans sa
-// forme locale ( `Local`, sur le scratch de l'item, dans le flottant du noyau ), travaille, et la
-// repose. Les operations elles-memes sont dans `cell/Ops.h`, communes aux trois regimes.
+// The tensors are those of `Cell_N.py` -- the CONVENIENT format, one vertex per row, in the caller's
+// float. A kernel never works on them directly : it loads the cell into its local
+// form ( `Local`, on the item's scratch, in the kernel float ), works, and stores it
+// back. The operations themselves are in `cell/Ops.h`, common to the three regimes.
 SDOT_TEMPLATE_DECL_FOR_Cell_N
 struct Cell_N {
     SDOT_ATTRIBUTES_OF_Cell_N

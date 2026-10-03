@@ -6,40 +6,40 @@
 
 namespace sdot {
 
-// UN NIVEAU de la construction du BSP, pour UN noeud -- voir `AaBsp.py` pour ce qu'un noeud
-// porte, et pourquoi la forme de l'arbre ne depend pas des donnees.
+// ONE LEVEL of the BSP construction, for ONE node -- see `AaBsp.py` for what a node
+// carries, and why the shape of the tree does not depend on the data.
 //
-// = Pourquoi un niveau et pas l'arbre entier
+// = Why a level and not the whole tree
 //
-// Un niveau ne peut pas commencer avant que le precedent soit fini (il lit les tranches qu'il
-// produit), et il n'y a pas de barriere GLOBALE dans un kernel SYCL -- seulement au sein d'un
-// work-group. La barriere est donc la FIN DU LANCEMENT : l'hote enchaine `depth` appels, ce qui
-// est le motif habituel sur GPU et ne coute que `depth` lancements (une quinzaine a 1e6 germes).
+// A level cannot start before the previous one is finished (it reads the slices it
+// produces), and there is no GLOBAL barrier in a kernel -- only within a
+// work-group. The barrier is therefore the END OF THE LAUNCH: the host chains `depth` calls, which
+// is the usual pattern on GPU and costs only `depth` launches (about fifteen at 1e6 seeds).
 //
-// Rien de tout ca n'a de capacite a deviner : `depth` est `max_depth_for( n, leaf_size )`, une
-// fonction de `n` seul, donc la boucle se deroule sous un `jit` comme ailleurs.
+// None of this has a capacity to guess: `depth` is `max_depth_for( n, leaf_size )`, a
+// function of `n` alone, so the loop unrolls under a `jit` like anywhere else.
 //
-// = Ce qu'un work-item fait, et ce qui rend l'ecriture disjointe
+// = What a work-item does, and what makes the writes disjoint
 //
-// Un work-item par noeud du niveau. Les tranches `[ begin, end )` d'un niveau PARTITIONNENT
-// `[ 0, n )` -- c'est la raison d'etre de la propagation decrite plus bas (`mid = end`) -- donc
-// deux work-items n'ecrivent jamais la meme case, ni dans le nuage de sortie ni dans le scratch de
-// permutation. Aucun atomique, aucune barriere.
+// One work-item per node of the level. The slices `[ begin, end )` of a level PARTITION
+// `[ 0, n )` -- this is the reason for the propagation described below (`mid = end`) -- so
+// two work-items never write the same cell, neither in the output cloud nor in the permutation
+// scratch. No atomics, no barrier.
 //
-// Le nuage est DOUBLE-TAMPONNE (`pos_in` -> `pos_out`) parce que les entrees et les sorties d'un
-// appel sont disjointes (voir `driver.call`), et il porte les positions et les poids PERMUTES a
-// cote des indices : un noeud lit alors ses points d'un seul tenant, la ou une indirection par
-// `seed_indices` en ferait une collecte eparse -- ce qui compte d'autant plus que les niveaux du
-// haut sont traites par tres peu de work-items.
+// The cloud is DOUBLE-BUFFERED (`pos_in` -> `pos_out`) because the inputs and outputs of a
+// call are disjoint (see `driver.call`), and it carries the PERMUTED positions and weights
+// next to the indices: a node then reads its points in one piece, where an indirection through
+// `seed_indices` would make it a sparse gather -- which matters all the more since the top
+// levels are handled by very few work-items.
 
 
-// Quickselect (Hoare, pivot median de trois) : rearrange `perm[ b .. e )` de sorte que le rang
-// `t - b` soit a l'indice `t`, tout ce qui precede <= et tout ce qui suit >=.
+// Quickselect (Hoare, median-of-three pivot): rearranges `perm[ b .. e )` so that the rank
+// `t - b` is at index `t`, everything before it <= and everything after it >=.
 //
-// Ecrit a la main plutot que `std::nth_element` : rien de la libstdc++ n'est utilise dans les
-// kernels d'ici, et l'introselect en ferait dependre la compilation device. La cle est lue par
-// indirection (`pos( perm( k ), ax )`), mais `perm` part de l'identite et les deux balayages de
-// Hoare sont lineaires, donc les acces restent quasi sequentiels dans la tranche du noeud.
+// Written by hand rather than `std::nth_element`: nothing from libstdc++ is used in the
+// kernels here, and introselect would make device compilation depend on it. The key is read
+// through an indirection (`pos( perm( k ), ax )`), but `perm` starts as the identity and the two
+// Hoare sweeps are linear, so the accesses remain nearly sequential within the node's slice.
 HD void bsp_select( auto &&perm, const auto &pos, SI b, SI e, SI t, int ax ) {
     using TF = typename DECAYED_TYPE_OF( pos )::TF;
 
@@ -50,8 +50,8 @@ HD void bsp_select( auto &&perm, const auto &pos, SI b, SI e, SI t, int ax ) {
     while ( hi - lo > 2 ) {
         const SI c = lo + ( hi - lo ) / 2;
         const TF k0 = key( lo ), k1 = key( c ), k2 = key( hi - 1 );
-        // le pivot est TOUJOURS une valeur presente dans la tranche : c'est ce qui garantit que
-        // les deux balayages ci-dessous s'arretent sans test de borne.
+        // the pivot is ALWAYS a value present in the slice: this is what guarantees that
+        // the two sweeps below stop without a bounds test.
         const TF pivot = k0 < k1 ? ( k1 < k2 ? k1 : ( k0 < k2 ? k2 : k0 ) )
                                  : ( k0 < k2 ? k0 : ( k1 < k2 ? k2 : k1 ) );
 
@@ -64,8 +64,8 @@ HD void bsp_select( auto &&perm, const auto &pos, SI b, SI e, SI t, int ax ) {
             swp( i, j );
         }
 
-        // `[ lo, j ]` et `[ j + 1, hi )`, tous deux non vides (Hoare avec un pivot present coupe
-        // au milieu meme quand toutes les valeurs sont egales, donc la recursion converge).
+        // `[ lo, j ]` and `[ j + 1, hi )`, both non-empty (Hoare with a present pivot splits
+        // in the middle even when all values are equal, so the recursion converges).
         if ( t <= j )
             hi = j + 1;
         else
@@ -77,9 +77,9 @@ HD void bsp_select( auto &&perm, const auto &pos, SI b, SI e, SI t, int ax ) {
 }
 
 
-// `( a, b )` tels que `w_k <= a . y_k + b` pour tout germe de la tranche -- voir
-// `AaBsp.py::_weight_majorant` pour POURQUOI le majorant est affine et comment le candidat est
-// retenu. Meme regle, meme seuil ; seul l'ajustement differe (voir plus bas).
+// `( a, b )` such that `w_k <= a . y_k + b` for every seed of the slice -- see
+// `AaBsp.py::_weight_majorant` for WHY the majorant is affine and how the candidate is
+// retained. Same rule, same threshold; only the fit differs (see below).
 template<int ct_dim>
 HD void bsp_weight_majorant( const auto &pos, const auto &w, SI b, SI e, auto &&wa_out, auto &&wb_out ) {
     using TF = typename DECAYED_TYPE_OF( pos )::TF;
@@ -109,10 +109,10 @@ HD void bsp_weight_majorant( const auto &pos, const auto &w, SI b, SI e, auto &&
         const auto pm = Vector<TF,ct_dim>::with_func( [&]( PI d ) { return psum[ d ] * inv; } );
         const TF wm = wsum * inv;
 
-        // les EQUATIONS NORMALES du moindre carre centre, `[ q^T q | q^T dw ]`, resolues par Gauss
-        // avec pivot partiel. L'hote, lui, passe par une SVD (`lstsq`), mieux conditionnee -- et ca
-        // n'a pas a l'etre ici : quel que soit le `a` qui sort, le `b` calcule plus bas est RELEVE
-        // jusqu'a majorer, donc un ajustement mediocre ne peut qu'elaguer moins, jamais mentir.
+        // the NORMAL EQUATIONS of the centered least squares, `[ q^T q | q^T dw ]`, solved by Gauss
+        // with partial pivoting. The host goes through an SVD (`lstsq`) instead, better conditioned -- and that
+        // need not be the case here: whatever `a` comes out, the `b` computed below is RAISED
+        // until it majorizes, so a mediocre fit can only prune less, never lie.
         TF A[ ct_dim ][ ct_dim + 1 ];
         for ( int i = 0; i < ct_dim; ++i )
             for ( int j = 0; j <= ct_dim; ++j )
@@ -133,7 +133,7 @@ HD void bsp_weight_majorant( const auto &pos, const auto &w, SI b, SI e, auto &&
             for ( int i = c + 1; i < ct_dim; ++i )
                 if ( sdot::fabs( A[ i ][ c ] ) > sdot::fabs( A[ p ][ c ] ) )
                     p = i;
-            if ( ! ( sdot::fabs( A[ p ][ c ] ) > 0 ) ) {     // colonne nulle -> pas d'ajustement
+            if ( ! ( sdot::fabs( A[ p ][ c ] ) > 0 ) ) {     // zero column -> no fit
                 ok = false;
                 break;
             }
@@ -166,22 +166,22 @@ HD void bsp_weight_majorant( const auto &pos, const auto &w, SI b, SI e, auto &&
                 else { rmin = r < rmin ? r : rmin; rmax = r > rmax ? r : rmax; }
             }
 
-            // le resserrement que le HASARD donne deja a `d + 1` parametres sur `m` points : sans
-            // cette correction un noeud de poids purement aleatoires retiendrait l'affine une fois
-            // sur trois. Voir `AaBsp.py::_weight_majorant`.
+            // the tightening that CHANCE already gives to `d + 1` parameters on `m` points: without
+            // this correction a node of purely random weights would retain the affine fit one time
+            // out of three. See `AaBsp.py::_weight_majorant`.
             const TF u = TF( 1 ) - TF( ct_dim ) / TF( m - 1 );
             const TF by_chance = sdot::sqrt( u > 0 ? u : TF( 0 ) );
-            // et une pente qui, sur l'etendue du noeud, depasse de loin l'etalement des poids
-            // est un artefact du conditionnement ( germes alignes a 1e-8 pres ), pas un
-            // ajustement : elle ferait un `b` a 1e9 qui ne majore plus rien d'utile. Voir
+            // and a slope that, over the node's extent, far exceeds the spread of the weights
+            // is an artifact of conditioning ( seeds aligned to within 1e-8 ), not a
+            // fit: it would make a `b` at 1e9 that no longer majorizes anything useful. See
             // `AaBsp.py::_weight_majorant`.
-            bool sage = true;
+            bool well_behaved = true;
             for ( int d = 0; d < ct_dim; ++d ) {
                 const TF reach = sdot::fabs( plo[ d ] ) > sdot::fabs( phi[ d ] ) ? sdot::fabs( plo[ d ] ) : sdot::fabs( phi[ d ] );
                 if ( sdot::fabs( fit[ d ] ) * ( phi[ d ] - plo[ d ] ) > 8 * spread || sdot::fabs( fit[ d ] ) * reach > TF( 100 ) * spread )
-                    sage = false;                        // la marge sur `b`, relative a `|a . y|`, doit rester negligeable
+                    well_behaved = false;                        // the margin on `b`, relative to `|a . y|`, must stay negligible
             }
-            if ( sage && rmax - rmin < TF( 0.85 ) * by_chance * spread )
+            if ( well_behaved && rmax - rmin < TF( 0.85 ) * by_chance * spread )
                 a = fit;
         }
     }
@@ -199,15 +199,15 @@ HD void bsp_weight_majorant( const auto &pos, const auto &w, SI b, SI e, auto &&
     for ( int d = 0; d < ct_dim; ++d )
         wa_out( d ) = a[ d ];
 
-    // une MARGE d'arrondi sur la constante, et sur elle seule -- voir `_weight_majorant` : `b` est
-    // le seul terme que l'hote et le kernel calculeraient differemment, et un `b` arrondi vers le
-    // bas cesserait de majorer.
+    // a rounding MARGIN on the constant, and on it alone -- see `_weight_majorant`: `b` is
+    // the only term that the host and the kernel would compute differently, and a `b` rounded
+    // down would cease to majorize.
     wb_out = bb + TF( 1e-6 ) * ( sdot::fabs( bb ) + spread + amax );
 }
 
-/// le majorant d'UN noeud, refait sur des poids neufs ( `AaBsp.refresh_weight_majorants` ) : la
-/// tranche `[ b, e )` du nuage `src` -- les germes DANS L'ORDRE DE L'ARBRE. Ne prend que ce dont il
-/// a besoin, et surtout PAS l'arbre entier : ses majorants courants sont ce qu'on remplace.
+/// the majorant of ONE node, redone on fresh weights ( `AaBsp.refresh_weight_majorants` ): the
+/// slice `[ b, e )` of the cloud `src` -- the seeds IN THE TREE'S ORDER. Takes only what it
+/// needs, and above all NOT the whole tree: its current majorants are what is being replaced.
 HD void bsp_refresh_majorant( const auto &src, const auto &beg, const auto &end, auto &&wa_out, auto &&wb_out ) {
     constexpr int ct_dim = CT_VALUE( src.nb_dims );
     const SI b = SI( beg ), e = SI( end );
@@ -221,19 +221,19 @@ HD void bsp_refresh_majorant( const auto &src, const auto &beg, const auto &end,
 }
 
 
-// Le corps du niveau, pour le noeud dont la tranche est `[ beg_in, end_in )`.
+// The body of the level, for the node whose slice is `[ beg_in, end_in )`.
 //
-// `mid_out` dit ou couper : le fils gauche recoit `[ beg, mid )` et le droit `[ mid, end )`. Un
-// noeud qui n'a plus rien a couper rend `mid = end`, donc passe tout a gauche -- c'est la
-// PROPAGATION decrite dans `AaBsp.py`, ce qui garde la partition de `[ 0, n )` d'un niveau au
-// suivant, donc l'ecriture disjointe.
+// `mid_out` says where to cut: the left child receives `[ beg, mid )` and the right one `[ mid, end )`. A
+// node that has nothing left to cut returns `mid = end`, hence passes everything to the left -- this is the
+// PROPAGATION described in `AaBsp.py`, which keeps the partition of `[ 0, n )` from one level to the
+// next, hence the disjoint writes.
 HD void bsp_build_level( const auto &src, auto &&dst, auto &&perm,
                       const auto &beg_in, const auto &end_in,
                       auto &&box_out, auto &&wa_out, auto &&wb_out, auto &&mid_out,
                       SI leaf_size ) {
-    // la dimension est un compte COMPILE-TIME (`nb_dims : CtShapeVar`), et c'est LUI qui la porte :
-    // la forme d'un tenseur, elle, traverse en entiers d'execution. C'est la raison pour laquelle
-    // cette fonction prend les nuages entiers et non leurs membres.
+    // the dimension is a COMPILE-TIME count (`nb_dims : CtShapeVar`), and it is THAT which carries it:
+    // the shape of a tensor, for its part, crosses as runtime integers. This is why
+    // this function takes whole clouds and not their members.
     constexpr int ct_dim = CT_VALUE( src.nb_dims );
     using TF = typename DECAYED_TYPE_OF( src.positions )::TF;
 
@@ -247,16 +247,16 @@ HD void bsp_build_level( const auto &src, auto &&dst, auto &&perm,
     const SI b = SI( beg_in );
     const SI e = SI( end_in );
 
-    // un emplacement VIDE : le fils droit d'un noeud qui a tout passe a gauche. Il n'a rien a lire
-    // ni a ecrire dans le nuage, mais ses sorties par noeud sont a lui et personne d'autre ne les
-    // ecrira -- un tampon de sortie n'est pas remis a zero.
+    // an EMPTY slot: the right child of a node that passed everything to the left. It has nothing to read
+    // or write in the cloud, but its per-node outputs are its own and nobody else will
+    // write them -- an output buffer is not zeroed.
     mid_out = e;
     if ( e <= b ) {
         for ( int d = 0; d < ct_dim; ++d ) {
             box_out( 0, d ) = 0;
             box_out( 1, d ) = 0;
         }
-        if constexpr ( wa_out.is_valid ) {
+        if constexpr ( DECAYED_TYPE_OF( wa_out )::is_valid ) {
             for ( int d = 0; d < ct_dim; ++d )
                 wa_out( d ) = 0;
             wb_out = 0;
@@ -264,7 +264,7 @@ HD void bsp_build_level( const auto &src, auto &&dst, auto &&perm,
         return;
     }
 
-    // ---- la boite du sous-arbre
+    // ---- the subtree's box
     auto lo = Vector<TF,ct_dim>::with_func( [&]( PI d ) { return TF( pos_in( b, d ) ); } );
     auto hi = lo;
     for ( SI k = b + 1; k < e; ++k )
@@ -273,18 +273,18 @@ HD void bsp_build_level( const auto &src, auto &&dst, auto &&perm,
             lo[ d ] = v < lo[ d ] ? v : lo[ d ];
             hi[ d ] = v > hi[ d ] ? v : hi[ d ];
         }
-    // `lo` PUIS `hi`, dans le meme tableau : une boite = une lecture contigue cote marche.
+    // `lo` THEN `hi`, in the same array: one box = one contiguous read on the walk side.
     for ( int d = 0; d < ct_dim; ++d ) {
         box_out( 0, d ) = lo[ d ];
         box_out( 1, d ) = hi[ d ];
     }
 
-    // ---- le majorant des poids. Pas de poids -> les deux tenseurs sont des `NoneTensor` et tout
-    // ce bloc disparait a la COMPILATION, comme dans `AaBsp.cxx`.
-    if constexpr ( wa_out.is_valid )
+    // ---- the weights majorant. No weights -> both tensors are `NoneTensor` and this whole
+    // block disappears at COMPILE time, as in `AaBsp.cxx`.
+    if constexpr ( DECAYED_TYPE_OF( wa_out )::is_valid )
         bsp_weight_majorant<ct_dim>( pos_in, w_in, b, e, wa_out, wb_out );
 
-    // ---- couper, ou propager
+    // ---- cut, or propagate
     int ax = 0;
     for ( int d = 1; d < ct_dim; ++d )
         if ( hi[ d ] - lo[ d ] > hi[ ax ] - lo[ ax ] )
@@ -294,23 +294,23 @@ HD void bsp_build_level( const auto &src, auto &&dst, auto &&perm,
         perm( k ) = k;
 
     SI mid = e;
-    // `hi[ ax ] <= lo[ ax ]` : tous les germes au meme endroit, aucune coupe ne les separerait.
+    // `hi[ ax ] <= lo[ ax ]`: all the seeds at the same place, no cut would separate them.
     if ( e - b > leaf_size && hi[ ax ] > lo[ ax ] ) {
-        // la MEDIANE, pas le milieu de la boite : c'est ce qui borne la profondeur par
-        // `log2( n / leaf_size )` quelle que soit la distribution.
+        // the MEDIAN, not the middle of the box: this is what bounds the depth by
+        // `log2( n / leaf_size )` whatever the distribution.
         mid = b + ( e - b ) / 2;
         bsp_select( perm, pos_in, b, e, mid, ax );
     }
     mid_out = mid;
 
-    // ---- le nuage permute. Une feuille (ou un noeud qui propage) recopie sa tranche telle
-    // quelle : `perm` y est reste l'identite, donc c'est le meme code.
+    // ---- the permuted cloud. A leaf (or a node that propagates) copies its slice as
+    // is: `perm` has remained the identity there, so it is the same code.
     for ( SI j = b; j < e; ++j ) {
         const SI s = SI( perm( j ) );
         ord_out( j ) = ord_in( s );
         for ( int d = 0; d < ct_dim; ++d )
             pos_out( j, d ) = pos_in( s, d );
-        if constexpr ( w_in.is_valid )
+        if constexpr ( DECAYED_TYPE_OF( w_in )::is_valid )
             w_out( j ) = w_in( s );
     }
 }

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Les QUATRE binaires de l'etude « prix de la robustesse » : {2D, 3D} x {Epick, Simple_cartesian}.
+# The FOUR binaries of the "price of robustness" study: {2D, 3D} x {Epick, Simple_cartesian}.
 #
 #   power_2d_light   power_2d_lightk        power_3d_light   power_3d_lightk
-#                    ^ `k` = noyau allege (LIGHT_KERNEL)
+#                    ^ `k` = light kernel (LIGHT_KERNEL)
 #
-# Meme chaine que `build.sh` (CGAL depuis le clone git, gmp/mpfr depuis l'env), plus un `-I` sur
-# `2d_des_familles/src` : le mode `--cells` rejoue NOTRE cellule sur la connectivite de CGAL.
+# Same chain as `build.sh` (CGAL from the git clone, gmp/mpfr from the env), plus a `-I` on
+# `2d_des_familles/src`: the `--cells` mode replays OUR cell on CGAL's connectivity.
 set -euo pipefail
 
 here="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -32,4 +32,4 @@ for dim in 2 3; do
             -o "$out"
     done
 done
-echo "== fait"
+echo "== done"

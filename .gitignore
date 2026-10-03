@@ -5,7 +5,7 @@ __pycache__/
 *.egg-info/
 .venv/
 
-# sorties de compilation
+# build outputs
 build/
 *.o
 *.a
@@ -14,15 +14,15 @@ build/
 *.dylib
 compile_commands.json
 
-# LE CATALOGUE COMPILE : des `.so` par variante de machine, reconstruits par
-# `scripts/build_catalogue.py`. Seul le README, qui explique comment, est suivi.
+# THE COMPILED CATALOGUE: `.so` files per machine variant, rebuilt by
+# `scripts/build_catalogue.py`. Only the README, which explains how, is tracked.
 catalogue/*
 !catalogue/README.md
 
-# le runner ( errand )
+# the runner ( errand )
 .errand/
 runs/
 
-# divers
+# misc
 tmp/
 .cache/

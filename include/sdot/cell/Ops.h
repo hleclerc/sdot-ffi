@@ -1,17 +1,17 @@
 #pragma once
 
 // =====================================================================================
-// CE QUE LES TROIS `Cell_*.h` ONT EN COMMUN : poser une cellule locale sur le scratch d'un item, et
-// les operations de `Cell_*.py` ( init, coupe, mesure ) ecrites une fois sur `Local1 / 2 / N`.
+// WHAT THE THREE `Cell_*.h` HAVE IN COMMON: laying a local cell on the scratch of an item, and
+// the operations of `Cell_*.py` ( init, cut, measure ) written once over `Local1 / 2 / N`.
 //
-// LE FLOTTANT DU NOYAU est celui que le scratch declare ( `kernel_fp_size`, une constante de
-// compilation ) : `float` par defaut, `double` au choix. La cellule STOCKEE est dans le flottant
-// de l'appelant ( `TF`, celui de `vertex_positions` ) ; `load` / `store` convertissent.
+// THE KERNEL FLOAT is the one the scratch declares ( `kernel_fp_size`, a compile-time
+// constant ): `float` by default, `double` by choice. The STORED cell is in the caller's float
+// ( `TF`, that of `vertex_positions` ); `load` / `store` convert.
 //
-// LA CAPACITE se deduit du scratch : `cap_for` est le plus grand nombre de sommets dont les
-// tableaux tiennent dans les mots recus ( `Local::words_for`, la formule que `Cell_*.py` a
-// utilisee pour dimensionner ). Un scratch trop petit se signale sur `nb_words` -- ce que loom
-// sait faire grossir -- et la cellule n'ecrit rien.
+// THE CAPACITY is deduced from the scratch: `cap_for` is the largest number of vertices whose
+// arrays fit in the words received ( `Local::words_for`, the formula `Cell_*.py` used
+// for sizing ). A scratch that is too small is reported on `nb_words` -- which loom
+// knows how to grow -- and the cell writes nothing.
 // =====================================================================================
 
 #include <loom/support/common_macros.h>
@@ -21,11 +21,11 @@
 
 namespace sdot {
 
-/// le flottant du noyau, lu sur le scratch
+/// the kernel float, read from the scratch
 template<class Scr>
 using KernelType = std::conditional_t<DECAYED_TYPE_OF( std::declval<Scr>().kernel_fp_size )::value == 64, double, float>;
 
-/// le plus grand `cap` tel que `words( cap ) <= nb_words` ( `words` croissante )
+/// the largest `cap` such that `words( cap ) <= nb_words` ( `words` increasing )
 HD SI cap_for_words( SI nb_words, auto &&words ) {
     SI lo = 0, hi = 1;
     while ( words( hi ) <= nb_words )
@@ -38,13 +38,13 @@ HD SI cap_for_words( SI nb_words, auto &&words ) {
     return lo;
 }
 
-/// le plus grand `cap` tel que `Local::words_for( cap ) <= nb_words`
+/// the largest `cap` such that `Local::words_for( cap ) <= nb_words`
 template<class Local>
 HD SI cap_for( SI nb_words ) {
     return cap_for_words( nb_words, []( SI c ) { return Local::words_for( c ); } );
 }
 
-/// une cellule locale posee sur le scratch d'un item ( `Local` attache, `cap` deduit )
+/// a local cell laid on the scratch of an item ( `Local` attached, `cap` deduced )
 template<class Local,class Scr>
 HD Local local_on( Scr &sc, Carver &cv ) {
     Local c;
@@ -52,21 +52,21 @@ HD Local local_on( Scr &sc, Carver &cv ) {
     return c;
 }
 
-/// la ligne `row` du scratch ( `words` est `[ nb_threads, nb_words ]` : une ligne par work-item,
-/// ou une seule quand l'appel est batche sur les cellules )
+/// row `row` of the scratch ( `words` is `[ nb_threads, nb_words ]`: one row per work-item,
+/// or a single one when the call is batched over the cells )
 template<class Scr>
 HD Carver carver_of( Scr &sc, SI row = 0 ) {
     auto w = sc.words( row );
     return Carver{ w.data().raw, SI( w.shape( 0 ) ) };
 }
 
-/// le scratch n'a pas suffi : on le dit ( loom double et relance ), sans rien ecrire
+/// the scratch was not enough: we say so ( loom doubles it and retries ), writing nothing
 template<class Scr>
 HD void ask_more( Scr &sc, const Carver &cv ) {
     sc.nb_words.set( 2 * cv.nb_words + 64 );
 }
 
-// ---- les operations de `Cell_*.py`, une fois pour toutes -------------------------------------
+// ---- the operations of `Cell_*.py`, once and for all -------------------------------------
 
 namespace cell_ops {
 
@@ -87,8 +87,8 @@ HD void init_as_unbounded( auto &&cell, auto &&scratch ) {
     c.store( cell );
 }
 
-/// intersecte avec `direction . x <= offset`, le resultat allant dans `res` ( les entrees et
-/// les sorties d'un appel sont disjointes ). Un debordement est signale sur `res.nb_vertices`.
+/// intersects with `direction . x <= offset`, the result going into `res` ( the inputs and
+/// the outputs of a call are disjoint ). An overflow is reported on `res.nb_vertices`.
 template<class Local>
 HD void cut( const auto &cell, auto &&res, auto &&scratch, auto &&direction, auto &&offset, SI cut_id ) {
     using TK = typename Local::TKernel;
@@ -101,7 +101,7 @@ HD void cut( const auto &cell, auto &&res, auto &&scratch, auto &&direction, aut
         p.dir[ d ] = TK( direction( d ) );
     p.off = TK( offset );
     p.id  = int( cut_id );
-    if ( c.cut( p ) == CutStatus::OVERFLOW ) { ask_more( scratch, cv ); return; }
+    if ( c.cut( p ) == CutStatus::NO_ROOM ) { ask_more( scratch, cv ); return; }
     c.tidy();
     c.store( res );
 }
@@ -123,7 +123,7 @@ HD void measure_bwd( const auto &cell, auto &&res, auto &&grad_res, auto &&grad_
         Carver cv = carver_of( scratch );
         Local c = local_on<Local>( scratch, cv );
         if ( ! c.load( cell ) ) { ask_more( scratch, cv ); return; }
-        // la cotangente a une valeur partout ou sa primale en a une : tout le tampon, padding compris
+        // the cotangent has a value wherever its primal has one: the whole buffer, padding included
         const SI capv = SI( grad_vertex_positions.shape( 0 ) );
         for ( SI i = 0; i < capv; ++i )
             for ( int d = 0; d < D; ++d )

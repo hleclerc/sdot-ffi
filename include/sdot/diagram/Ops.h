@@ -1,31 +1,31 @@
 #pragma once
 
 // =====================================================================================
-// CE QU'UN DIAGRAMME DE PUISSANCE CALCULE, quelle que soit la facon dont il range ses germes.
+// WHAT A POWER DIAGRAM COMPUTES, whatever the way it stores its seeds.
 //
-// La cellule du germe `i` est la ou sa DISTANCE DE PUISSANCE gagne : `|x - d_i|^2 - w_i <=
-// |x - d_j|^2 - w_j` pour tout autre `j`. Developpee, l'inegalite perd son `|x|^2` et devient un
-// demi-espace : un diagramme de puissance coute exactement ce que coute un Voronoi, un plan par
-// rival, la meme coupe ( `cell/Plane.h::bisector` ).
+// The cell of seed `i` is where its POWER DISTANCE wins: `|x - d_i|^2 - w_i <=
+// |x - d_j|^2 - w_j` for every other `j`. Expanded, the inequality loses its `|x|^2` and becomes a
+// half-space: a power diagram costs exactly what a Voronoi costs, one plane per
+// rival, the same cut ( `cell/Plane.h::bisector` ).
 //
-// Il n'y a PAS de diagramme ici : pas un sommet, pas une facette. Tout est refait, cellule par
-// cellule, dans le scratch du work-item ( `Cell.py::CellScratch` ) : une cellule locale, une seconde
-// pour les morceaux d'une distribution, et les cotangentes de l'adjoint. C'est LA CELLULE QUI
-// DIRIGE ( `cell/Moteur.h` ) : elle demande ses plans a un fournisseur, et c'est le STOCKAGE du
-// diagramme qui dit lequel -- tous les germes dans l'ordre pour `PowerDiagram_Plain`, l'arbre BSP
-// retourne pour `PowerDiagram_Bsp`.
+// There is NO diagram here: not a vertex, not a facet. Everything is redone, cell by cell,
+// in the work-item's scratch ( `Cell.py::CellScratch` ): a local cell, a second one
+// for the pieces of a distribution, and the cotangents of the adjoint. THE CELL LEADS
+// ( `cell/Engine.h` ): it asks a provider for its planes, and it is the STORAGE of the
+// diagram that says which one -- all the seeds in order for `PowerDiagram_Plain`, the flipped BSP tree
+// for `PowerDiagram_Bsp`.
 //
-// = CE QU'UN STOCKAGE FOURNIT
+// = WHAT A STORAGE PROVIDES
 //
 //     ct_dim, TF, has_weights
-//     SI   nb_seeds() const                   les germes, DANS SON ORDRE
-//     auto point( SI k ) const                le germe `k` ( Vector<TF,ct_dim> ), poids `weight( k )`
-//     SI   user_id( SI k ) const              l'indice de ce germe pour l'UTILISATEUR
-//     auto fournisseur<TK>( SI k0 ) const     ce qui rend les plans de la cellule de `k0`
+//     SI   nb_seeds() const                   the seeds, IN ITS ORDER
+//     auto point( SI k ) const                seed `k` ( Vector<TF,ct_dim> ), weight `weight( k )`
+//     SI   user_id( SI k ) const              the index of this seed for the USER
+//     auto provider<TK>( SI k0 ) const     what yields the planes of the cell of `k0`
 //
-// Les cellules se construisent dans l'ORDRE DU STOCKAGE ( `k`, ce qu'un fournisseur met dans les
-// identifiants de coupe, et l'indice des gradients sur les germes ) ; ce qui sort vers l'utilisateur
-// -- une mesure, une cellule gardee et ses `cut_ids` -- est ecrit a l'indice `user_id( k )`.
+// Cells are built in STORAGE ORDER ( `k`, what a provider puts in the cut
+// identifiers, and the index of the gradients on the seeds ); what goes out to the user
+// -- a measure, a kept cell and its `cut_ids` -- is written at index `user_id( k )`.
 // =====================================================================================
 
 #include <loom/support/math.h>
@@ -33,8 +33,8 @@
 #include <loom/support/containers/Matrix.h>
 #include <loom/support/containers/Vector.h>
 #include <loom/support/atomic_add.h>
-#include "../cell/Fournisseurs.h"
-#include "../cell/Moteur.h"
+#include "../cell/Providers.h"
+#include "../cell/Engine.h"
 #include "../cell/Ops.h"
 #include "../PieceWorkspace.h"
 #include "../UnitDensity.h"
@@ -44,7 +44,7 @@
 namespace sdot {
 namespace diagram {
 
-/// une cotangente par sommet, dans le scratch
+/// one cotangent per vertex, in the scratch
 template<class TF>
 struct GradVp {
     TF *g;
@@ -53,16 +53,16 @@ struct GradVp {
     HD TF  operator()( int i, int d ) const { return g[ d * cap + i ]; }
 };
 
-/// une distribution qui DECOUPE demande une seconde cellule ; `UnitDensity` et les densites
-/// lisses n'en demandent pas
+/// a distribution that SPLITS asks for a second cell; `UnitDensity` and smooth
+/// densities do not
 template<class Dist>
 HD constexpr int nb_work_cells() {
     if constexpr ( requires { Dist::cuts_pieces; } ) return Dist::cuts_pieces ? 2 : 1;
     else return 1;
 }
 
-/// LE DECOUPAGE DU SCRATCH d'un work-item : `nb_cells` cellules locales de `cap` sommets, et ( pour
-/// l'adjoint ) une cotangente par sommet -- LA MEME FORMULE que `PowerDiagram._scratch_words`.
+/// HOW THE SCRATCH IS CARVED UP for a work-item: `nb_cells` local cells of `cap` vertices, and ( for
+/// the adjoint ) one cotangent per vertex -- THE SAME FORMULA as `PowerDiagram._scratch_words`.
 template<class Local,class TF>
 HD SI words_for( SI cap, int nb_cells, bool with_grad ) {
     return nb_cells * Local::words_for( cap ) + ( with_grad ? words_of<TF>( Local::ct_dim * cap ) : 0 );
@@ -73,19 +73,19 @@ HD SI cap_in( SI nb_words, int nb_cells, bool with_grad ) {
     return cap_for_words( nb_words, [&]( SI c ) { return words_for<Local,TF>( c, nb_cells, with_grad ); } );
 }
 
-/// La cellule de `k0`, construite dans `c` a partir du domaine `dom`. Rend `false` si le scratch
-/// n'a pas suffi -- la cellule est alors restee au dernier etat valide.
+/// The cell of `k0`, built in `c` from the domain `dom`. Returns `false` if the scratch
+/// was not enough -- the cell is then left in its last valid state.
 template<class PD,class Local>
 HD bool make_cell( const PD &pd, Local &c, SI k0, const auto &dom ) {
     using TK = typename Local::TKernel;
     if ( ! c.load( dom ) )
         return false;
-    auto f = pd.template fournisseur<TK>( k0 );
-    return run<PD::on_cpu>( c, f ) != CutStatus::OVERFLOW;
+    auto f = pd.template provider<TK>( k0 );
+    return run<PD::on_cpu>( c, f ) != CutStatus::NO_ROOM;
 }
 
-/// le plan de la coupe `k` de `cell`, dans le flottant des positions : la bissectrice REFAITE
-/// depuis les germes quand la coupe fait face a un germe, le plan relu sur la geometrie sinon
+/// the plane of cut `k` of `cell`, in the positions' float: the bisector REBUILT
+/// from the seeds when the cut faces a seed, the plane read back from the geometry otherwise
 template<class PD>
 HD void plane_of( const PD &pd, const auto &cell, SI k0, int k, auto &dir, typename PD::TF &off ) {
     using TF = typename PD::TF;
@@ -106,9 +106,9 @@ HD void plane_of( const PD &pd, const auto &cell, SI k0, int k, auto &dir, typen
     }
 }
 
-// ---- CONTRE QUOI on integre ----------------------------------------------------------------------
+// ---- WHAT we integrate against -------------------------------------------------------------------
 
-/// les `D + 1` sommets du simplexe `chain`, comme points -- ce qu'une densite recoit
+/// the `D + 1` vertices of simplex `chain`, as points -- what a density receives
 template<class TF,int D>
 HD auto simplex_points( const auto &cell, const auto &chain ) {
     return Vector<Vector<TF,D>,D+1>( Function(), [&]( PI k ) {
@@ -116,9 +116,9 @@ HD auto simplex_points( const auto &cell, const auto &chain ) {
     } );
 }
 
-/// `res` = l'integrale de `dist` sur `cell`. La distribution DECOUPE, on INTEGRE : sur un morceau a
-/// densite constante, `valeur * mesure` ; sinon le morceau part en simplexes et c'est la densite
-/// qui s'integre sur chacun. Rend `false` si un morceau n'a pas tenu.
+/// `res` = the integral of `dist` over `cell`. The distribution SPLITS, we INTEGRATE: on a piece of
+/// constant density, `value * measure`; otherwise the piece is split into simplices and it is the density
+/// that is integrated over each. Returns `false` if a piece did not fit.
 template<class TF,class Local>
 HD bool integrate_into( auto &&res, const Local &cell, Local &piece, const auto &dist ) {
     constexpr int D = Local::ct_dim;
@@ -128,7 +128,7 @@ HD bool integrate_into( auto &&res, const Local &cell, Local &piece, const auto 
         if constexpr ( DECAYED_TYPE_OF( dens )::is_constant ) {
             sum += dens.value * pc.template measure<TF>();
         } else {
-            // une cellule non bornee n'a pas de simplices qui veuillent dire quoi que ce soit
+            // an unbounded cell has no simplices that mean anything
             if ( ! pc.bounded() ) {
                 sum = std::numeric_limits<TF>::max();
                 return;
@@ -142,7 +142,7 @@ HD bool integrate_into( auto &&res, const Local &cell, Local &piece, const auto 
     return ! ws.overflow;
 }
 
-/// le volume du simplexe `pts` : `| det( p_i - p_0 ) | / D!`
+/// the volume of simplex `pts`: `| det( p_i - p_0 ) | / D!`
 template<class TF,int D>
 HD TF simplex_volume( const auto &pts ) {
     const auto M = Matrix<TF,D>::with_func( [&]( auto r, auto c ) { return pts[ int( c ) + 1 ][ int( r ) ] - pts[ 0 ][ int( r ) ]; } );
@@ -153,12 +153,12 @@ HD TF simplex_volume( const auto &pts ) {
     return det;
 }
 
-/// les MOMENTS de `dist` sur `cell` : `mass = int rho`, `first = int x rho`, `second = int |x|^2 rho`
-/// -- ce qu'il faut a un cout de transport ( `sum_i int_{cell_i} |x - p_i|^2 rho` ) et a ses
-/// barycentres. Chaque morceau part en simplexes : a densite CONSTANTE ( `Image`, Lebesgue ) leurs
-/// moments sont des formes fermees -- `int_T x = |T| g`, `g` le centre, et
-/// `int_T |x|^2 = |T| ( sum_i |v_i|^2 + |sum_i v_i|^2 ) / ( ( D + 1 )( D + 2 ) )` -- sinon c'est la
-/// quadrature de la densite qui les accumule ( `PointwiseDensity::integrate_moments_over_simplex` ).
+/// the MOMENTS of `dist` over `cell`: `mass = int rho`, `first = int x rho`, `second = int |x|^2 rho`
+/// -- what a transport cost needs ( `sum_i int_{cell_i} |x - p_i|^2 rho` ) and its
+/// barycenters. Each piece is split into simplices: with CONSTANT density ( `Image`, Lebesgue ) their
+/// moments are closed forms -- `int_T x = |T| g`, `g` the center, and
+/// `int_T |x|^2 = |T| ( sum_i |v_i|^2 + |sum_i v_i|^2 ) / ( ( D + 1 )( D + 2 ) )` -- otherwise it is the
+/// quadrature of the density that accumulates them ( `PointwiseDensity::integrate_moments_over_simplex` ).
 template<class TF,class Local>
 HD bool integrate_moments_into( auto &&mass, auto &&first, auto &&second, const Local &cell, Local &piece, const auto &dist ) {
     constexpr int D = Local::ct_dim;
@@ -200,24 +200,24 @@ HD bool integrate_moments_into( auto &&mass, auto &&first, auto &&second, const 
     return ! ws.overflow;
 }
 
-/// `res( k )` = la mesure de la cellule `k`, pour les germes de ce work-item -- une boucle striee :
-/// `nb_threads` work-items se partagent les cellules, dans l'ordre du stockage ( deux germes
-/// consecutifs y sont voisins dans l'espace ). `scratch` est le tenseur de travail du work-item --
-/// et ou l'on dit qu'il a manque.
-/// LA MEMOIRE d'une cellule ( `FournisseurBsp`, `MEMO` ) : ses voisins, en rangs tries, ecrits dans
-/// `memo_nbrs( k, . )` / `memo_counts( k )` -- ou rien ( `0` : compte nul ) s'ils depassent la
-/// capacite. `memo_*` valent `0` quand l'appel n'en veut pas.
+/// `res( k )` = the measure of cell `k`, for the seeds of this work-item -- a strided loop:
+/// `nb_threads` work-items share the cells, in storage order ( two consecutive
+/// seeds are neighbors in space there ). `scratch` is the work-item's working tensor --
+/// and where we say it was too small.
+/// THE MEMORY of a cell ( `ProviderBsp`, `MEMO` ): its neighbors, as sorted ranks, written into
+/// `memo_nbrs( k, . )` / `memo_counts( k )` -- or nothing ( `0`: zero count ) if they exceed the
+/// capacity. `memo_*` are `0` when the call does not want them.
 template<class Local>
-HD void memorise( Local &c, SI k, auto &&memo_nbrs, auto &&memo_counts ) {
+HD void memorize( Local &c, SI k, auto &&memo_nbrs, auto &&memo_counts ) {
     if constexpr ( requires { memo_nbrs( k, 0 ); } ) {
         c.tidy();
         const int nc = c.nb_cuts(), cap = int( memo_nbrs.shape( 1 ) );
         int m = 0;
         for ( int q = 0; q < nc && m <= cap; ++q ) {
             const int id = c.cid[ q ];
-            if ( id < 0 ) continue;                      // le domaine
-            if ( m == cap ) { m = cap + 1; break; }      // trop pour la capacite : pas de souvenir
-            int r = m++;                                 // insertion, trie croissant
+            if ( id < 0 ) continue;                      // the domain
+            if ( m == cap ) { m = cap + 1; break; }      // too many for the capacity: no memory
+            int r = m++;                                 // insertion, sorted ascending
             while ( r > 0 && int( memo_nbrs( k, r - 1 ) ) > id ) { memo_nbrs( k, r ) = memo_nbrs( k, r - 1 ); --r; }
             memo_nbrs( k, r ) = id;
         }
@@ -237,7 +237,7 @@ HD void measures( const PD &pd, auto &&res, const auto &dom, auto &&scratch, con
     Local c, piece;
     c.attach( cv, cap );
     if constexpr ( nbc > 1 ) piece.attach( cv, cap );
-    else                     piece = c;                  // jamais touchee : la densite ne decoupe pas
+    else                     piece = c;                  // never touched: the density does not split
 
     const SI n = pd.nb_seeds();
     for ( SI k = thread_index; k < n; k += nb_threads ) {
@@ -245,11 +245,11 @@ HD void measures( const PD &pd, auto &&res, const auto &dom, auto &&scratch, con
             ask_more( scratch, cv );
             return;
         }
-        memorise( c, k, memo_nbrs, memo_counts );
+        memorize( c, k, memo_nbrs, memo_counts );
     }
 }
 
-/// les moments de chaque cellule ( voir `integrate_moments_into` ), meme balayage que `measures`
+/// the moments of each cell ( see `integrate_moments_into` ), same sweep as `measures`
 template<class PD>
 HD void moments( const PD &pd, auto &&mass, auto &&first, auto &&second, const auto &dom, auto &&scratch, const auto &dist,
               SI thread_index, SI nb_threads ) {
@@ -274,16 +274,16 @@ HD void moments( const PD &pd, auto &&mass, auto &&first, auto &&second, const a
     }
 }
 
-// ---- l'adjoint -----------------------------------------------------------------------------------
-// La chaine est `m_k <- sommets <- plans <- germes`, et chaque fleche est une forme fermee :
-// `measure_bwd` repond a la premiere ; un sommet est le COIN de ses `D` coupes, donc il resout
-// `A x = b` avec les directions des coupes en lignes, et une petite resolution par sommet renvoie
-// sa cotangente sur ses plans ( `scatter_cell_grad` ) ; un plan est la bissectrice ponderee de
-// deux germes, qui se derive en deux lignes. Rien du forward n'est garde : la cellule est REFAITE.
+// ---- the adjoint ---------------------------------------------------------------------------------
+// The chain is `m_k <- vertices <- planes <- seeds`, and each arrow is a closed form:
+// `measure_bwd` answers the first; a vertex is the CORNER of its `D` cuts, so it solves
+// `A x = b` with the cut directions as rows, and a small solve per vertex sends
+// its cotangent back onto its planes ( `scatter_cell_grad` ); a plane is the weighted bisector of
+// two seeds, which differentiates in two lines. Nothing of the forward is kept: the cell is REBUILT.
 
-/// `grad_vp` ( une cotangente par sommet de `cell` ) -> les germes. Tout autre germe que la cellule
-/// touche recoit un ajout atomique ; la part de `k0`, a laquelle CHAQUE sommet contribue, est
-/// sommee en registre et ajoutee une fois.
+/// `grad_vp` ( one cotangent per vertex of `cell` ) -> the seeds. Every seed other than the cell
+/// touches receives an atomic add; the share of `k0`, to which EVERY vertex contributes, is
+/// summed in a register and added once.
 template<class PD>
 HD void scatter_cell_grad( const PD &pd, SI k0, const auto &cell, const auto &grad_vp, auto &&grad_positions, auto &&grad_weights ) {
     using TF = typename PD::TF;
@@ -308,10 +308,10 @@ HD void scatter_cell_grad( const PD &pd, SI k0, const auto &cell, const auto &gr
             const auto q = Vector<TF,D>::with_func( [&]( PI d ) { return grad_vp( v, int( d ) ); } );
             const auto x = Vector<TF,D>::with_func( [&]( PI d ) { return TF( cell.coord( v, int( d ) ) ); } );
 
-            // `A x = b`, lignes = les directions des coupes du sommet. Une cotangente `q` sur `x`
-            // atteint les plans par `u` avec `A^T u = q` : `d off_r -> u[ r ]`, `d dir_r -> - u[ r ] * x`.
-            // Les lignes qui ne font pas face a un germe sont relues sur la geometrie : leur echelle
-            // ne change rien aux `u` des lignes qui comptent.
+            // `A x = b`, rows = the directions of the vertex's cuts. A cotangent `q` on `x`
+            // reaches the planes through `u` with `A^T u = q`: `d off_r -> u[ r ]`, `d dir_r -> - u[ r ] * x`.
+            // Rows that do not face a seed are read back from the geometry: their scale
+            // changes nothing for the `u` of the rows that matter.
             Matrix<TF,D> At;
             int cuts[ D ];
             for ( int r = 0; r < D; ++r ) {
@@ -326,10 +326,10 @@ HD void scatter_cell_grad( const PD &pd, SI k0, const auto &cell, const auto &gr
 
             for ( int r = 0; r < D; ++r ) {
                 const int k1 = cell.cid[ cuts[ r ] ];
-                if ( k1 < 0 )                            // le domaine, un morceau, ou une paroi factice
+                if ( k1 < 0 )                            // the domain, a piece, or a fake wall
                     continue;
-                // le plan de la paire `( k0, k1 )` : `dir = p1 - p0`,
-                // `off = ( |p1|^2 - |p0|^2 ) / 2 + ( w0 - w1 ) / 2`. Les deux se derivent sur place.
+                // the plane of the pair `( k0, k1 )`: `dir = p1 - p0`,
+                // `off = ( |p1|^2 - |p0|^2 ) / 2 + ( w0 - w1 ) / 2`. Both differentiate in place.
                 const TF g_off = u[ r ];
                 const auto p1 = pd.point( k1 );
                 for ( int d = 0; d < D; ++d ) {
@@ -358,11 +358,11 @@ HD bool integrate_bwd_into( const PD &pd, SI k0, auto &&grad_res, const Local &c
     const TF g = grad_res;
     dist.for_each_piece( cell, ws, [&]( const auto &pc, const auto &dens ) {
         if constexpr ( DECAYED_TYPE_OF( dens )::is_constant ) {
-            // la part de la DENSITE : la masse est lineaire en elle, donc la derivee par rapport a
-            // la valeur portee par ce morceau EST son volume ( un morceau infini n'en a pas )
+            // the DENSITY's share: mass is linear in it, so the derivative with respect to
+            // the value carried by this piece IS its volume ( an infinite piece has none )
             if ( pc.bounded() )
                 dens.add_value_grad( grad_dist, g * pc.template measure<TF>() );
-            // ... et la part de la GEOMETRIE, par la chaine habituelle
+            // ... and the GEOMETRY's share, through the usual chain
             pc.template measure_bwd<TF>( g * dens.value, grad_vp );
             scatter_cell_grad( pd, k0, pc, grad_vp, grad_positions, grad_weights );
         } else {
@@ -410,9 +410,9 @@ HD void measures_bwd( const PD &pd, auto &&res, const auto &dom, auto &&grad_res
     }
 }
 
-/// La cellule du germe `k`, GARDEE : construite comme une autre, puis posee dans `res` -- avec ses
-/// identifiants de coupe traduits pour l'utilisateur. La seule requete dont la memoire est fonction
-/// du nombre de germes : ce qu'est un AFFICHAGE.
+/// The cell of seed `k`, KEPT: built like any other, then put into `res` -- with its cut
+/// identifiers translated for the user. The only query whose memory is a function
+/// of the number of seeds: which is what a DISPLAY is.
 template<class PD>
 HD void build_cell( const PD &pd, SI k, const auto &dom, auto &&res, auto &&scratch, SI thread_index ) {
     using TK    = KernelType<DECAYED_TYPE_OF( scratch )>;
@@ -430,16 +430,16 @@ HD void build_cell( const PD &pd, SI k, const auto &dom, auto &&res, auto &&scra
     c.store( res );
 }
 
-/// UNE LIGNE DE LA HESSIENNE du transport, `d m_k / d w_j` pour les voisins `j` de la cellule `k` :
-/// la bissectrice `( k, j )` glisse de `dw / ( 2 | p_k - p_j | )` quand `w_j` monte de `dw`, et ce
-/// qu'elle emporte est la densite integree sur la FACETTE commune. Donc
-/// `d m_k / d w_j = - int_{facette} rho / ( 2 | p_k - p_j | )`, et `d m_k / d w_k` en est l'oppose
-/// somme ( une ligne somme a zero -- ce que l'appelant recompose ). Le domaine ( ids negatifs ) ne
-/// bouge pas. `res` : `ids( r )` ( identifiants utilisateur ) et `vals( r )` ( les valeurs, POSITIVES ),
-/// `nb_nbrs` le compte -- une capacite que loom double si elle manque.
+/// ONE ROW OF THE transport HESSIAN, `d m_k / d w_j` for the neighbors `j` of cell `k`:
+/// the bisector `( k, j )` slides by `dw / ( 2 | p_k - p_j | )` when `w_j` goes up by `dw`, and what
+/// it sweeps is the density integrated over the common FACET. So
+/// `d m_k / d w_j = - int_{facet} rho / ( 2 | p_k - p_j | )`, and `d m_k / d w_k` is the summed
+/// opposite ( a row sums to zero -- which the caller recomposes ). The domain ( negative ids ) does not
+/// move. `res`: `ids( r )` ( user identifiers ) and `vals( r )` ( the values, POSITIVE ),
+/// `nb_nbrs` the count -- a capacity that loom doubles if it is missing.
 ///
-/// A densite constante par morceau seulement ( `Image`, Lebesgue ) : la facette d'un morceau est
-/// plate et la densite y est un nombre.
+/// For piecewise-constant density only ( `Image`, Lebesgue ): the facet of a piece is
+/// flat and the density is a number there.
 template<class PD>
 HD void hessian_row( const PD &pd, SI k, const auto &dom, auto &&res, auto &&scratch, SI thread_index, const auto &dist ) {
     using TF    = typename PD::TF;
@@ -459,11 +459,11 @@ HD void hessian_row( const PD &pd, SI k, const auto &dom, auto &&res, auto &&scr
     }
     c.tidy();
 
-    // les voisins de la cellule sont ses coupes vivantes : une case par coupe, accumulee morceau
-    // par morceau ( un morceau porte les memes identifiants, plus ceux de son pave )
+    // the neighbors of the cell are its live cuts: one slot per cut, accumulated piece
+    // by piece ( a piece carries the same identifiers, plus those of its tile )
     const int nc = c.nb_cuts();
     if ( ! res.nb_nbrs.set( nc ) )
-        return;                                          // trop de voisins : loom double et rappelle
+        return;                                          // too many neighbors: loom doubles and calls again
     for ( int q = 0; q < nc; ++q ) {
         res.ids( q ) = c.cid[ q ] >= 0 ? int( pd.user_id( c.cid[ q ] ) ) : int( c.cid[ q ] );
         res.vals( q ) = 0;
@@ -472,12 +472,12 @@ HD void hessian_row( const PD &pd, SI k, const auto &dom, auto &&res, auto &&scr
 
     PieceWorkspace<Local> ws{ piece };
     dist.for_each_piece( c, ws, [&]( const auto &pc, const auto &dens ) {
-        static_assert( DECAYED_TYPE_OF( dens )::is_constant, "hessian : densite constante par morceau seulement" );
+        static_assert( DECAYED_TYPE_OF( dens )::is_constant, "hessian: piecewise-constant density only" );
         const TF rho = TF( dens.value );
         pc.template for_each_facet<TF>( [&]( int cut, TF mes ) {
             const int id = pc.cid[ cut ];
             if ( id < 0 )
-                return;                                  // le domaine, ou un bord de pave : immobile
+                return;                                  // the domain, or a tile edge: immobile
             const auto pj = pd.point( id );
             TF d2 = 0;
             for ( int d = 0; d < D; ++d )

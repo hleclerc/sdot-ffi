@@ -1,19 +1,19 @@
-"""Un polytope convexe, et ce que tous les régimes de dimension ont en commun.
+"""A convex polytope, and what all the dimension regimes have in common.
 
-`Cell( nb_dims, ... )` construit la classe qui convient à la dimension -- `Cell_1` ( un segment ),
-`Cell_2` ( un polygone ), `Cell_N` ( un polytope simple en dimension >= 3 ) -- chacune dans son
-fichier, avec exactement ses tenseurs. Ce fichier ne contient que le CONTRAT et le tronc commun :
+`Cell( nb_dims, ... )` builds the class that suits the dimension -- `Cell_1` ( a segment ),
+`Cell_2` ( a polygon ), `Cell_N` ( a simple polytope in dimension >= 3 ) -- each in its own
+file, with exactly its tensors. This file only contains the CONTRACT and the common trunk :
 
-  * ce qui est stocké est le format PRATIQUE ( `vertex_positions [ nv, d ]` dans le flottant de
-    l'appelant, `cut_ids [ nc ]` ), transféré vers la forme du noyau à chaque appel
-    ( `cell/Local*.h`, dans le flottant du noyau -- `kernel_dtype`, `float32` par défaut ) ;
-  * les opérations sont des kernels sur un scratch dimensionné par l'hôte ( `CellScratch` ) ;
-  * les tenseurs « pratiques » qui ne sont pas stockés -- plans, arêtes, faces, bornage -- sont
-    DÉRIVÉS côté hôte, chaque régime disant comment les lire sur ses propres tenseurs.
+  * what is stored is the CONVENIENT format ( `vertex_positions [ nv, d ]` in the caller's
+    float, `cut_ids [ nc ]` ), transferred to the kernel's form at each call
+    ( `cell/Local*.h`, in the kernel's float -- `kernel_dtype`, `float32` by default ) ;
+  * the operations are kernels on a scratch sized by the host ( `CellScratch` ) ;
+  * the "convenient" tensors that are not stored -- planes, edges, faces, bounding -- are
+    DERIVED host side, each regime saying how to read them off its own tensors.
 
-`cut_ids` porte l'identité des coupes : l'indice du germe d'en face pour une bissectrice, un
-entier négatif sinon ( `cell/Ids.h` ). Une paroi `INFINITE` qui porte encore un sommet dit que la
-cellule n'est pas bornée.
+`cut_ids` carries the identity of the cuts : the index of the facing seed for a bisector, a
+negative integer otherwise ( `cell/Ids.h` ). An `INFINITE` wall that still carries a vertex says that the
+cell is not bounded.
 """
 
 import os
@@ -28,21 +28,21 @@ from loom.util import Aggregate
 from .CellScratch import CellScratch, fp_size
 from . import cell_viz
 
-# les identifiants de coupe qui ne désignent pas un germe -- voir `cell/Ids.h`, qui fait foi
-INFINITE = -2 ** 31          # une paroi du simplexe de remplacement d'une cellule non bornée
-PIECE    = -2 ** 31 + 1      # un plan de découpe ajouté par une distribution
-BOUNDARY = -1                # « pas un germe », sans plus de précision ( = `domain_id( 0 )` )
+# the cut identifiers that do not designate a seed -- see `cell/Ids.h`, which is authoritative
+INFINITE = -2 ** 31          # a wall of the replacement simplex of an unbounded cell
+PIECE    = -2 ** 31 + 1      # a cutting plane added by a distribution
+BOUNDARY = -1                # "not a seed", with no further precision ( = `domain_id( 0 )` )
 
-# LE FLOTTANT DU NOYAU. La géométrie se coupe en `float32` par défaut -- c'est ce qui tient huit
-# sommets dans un registre ( `cell/Moteur2Reg.h` ) -- et tout ce qu'on en tire ( une mesure, un
-# gradient ) se calcule dans le flottant de l'appelant. `SDOT_KTYPE=FP64` change le défaut ;
-# `kernel_dtype = ...` le change pour une cellule ( ou un diagramme ).
+# THE KERNEL FLOAT. The geometry is cut in `float32` by default -- this is what fits eight
+# vertices in a register ( `cell/Engine2Reg.h` ) -- and everything derived from it ( a measure, a
+# gradient ) is computed in the caller's float. `SDOT_KTYPE=FP64` changes the default ;
+# `kernel_dtype = ...` changes it for one cell ( or one diagram ).
 DEFAULT_KERNEL_DTYPE = os.environ.get( "SDOT_KTYPE", "FP32" )
 
 
 def set_kernel_dtype( dtype ):
-    """Le flottant du noyau pour les cellules ( et diagrammes ) construits DÉSORMAIS sans
-    `kernel_dtype` explicite : `"FP32"` ( le défaut ) ou `"FP64"`. Rend l'ancien réglage."""
+    """The kernel float for cells ( and diagrams ) built FROM NOW ON without an explicit
+    `kernel_dtype` : `"FP32"` ( the default ) or `"FP64"`. Returns the previous setting."""
     global DEFAULT_KERNEL_DTYPE
     previous = DEFAULT_KERNEL_DTYPE
     DEFAULT_KERNEL_DTYPE = dtype
@@ -61,8 +61,8 @@ def cell_class_for( nb_dims ):
 
 
 class Item:
-    """La géométrie d'UN item d'une cellule ( batchée ou non ), en numpy : `vp [ nv, d ]`,
-    `cid [ nc ]`, et ce que le régime y ajoute ( `vc` / `vn` pour `Cell_N` )."""
+    """The geometry of ONE item of a cell ( batched or not ), in numpy : `vp [ nv, d ]`,
+    `cid [ nc ]`, and what the regime adds to it ( `vc` / `vn` for `Cell_N` )."""
     def __init__( self, vp, cid, **extra ):
         self.vp = vp
         self.cid = cid
@@ -74,21 +74,21 @@ class Item:
 
 
 class Cell( Aggregate ):
-    # ---- ce qu'un régime doit fournir -------------------------------------------------------------
+    # ---- what a regime must provide ---------------------------------------------------------------
     #
-    #   default_nb_dims      la dimension quand la classe est construite sans en donner
-    #   _GEOMETRY            les tenseurs qu'une coupe réécrit
-    #   scratch_words( cap, fp_size )   la même formule que `Local*::words_for`
-    #   init_capacity()      la place d'un hypercube
-    #   _cut_capacities()    `( sommets, coupes )` : ce qu'une coupe peut produire au plus
-    #   _item( b )           la géométrie de l'item `b`, lue sur ses tenseurs
+    #   default_nb_dims      the dimension when the class is built without being given one
+    #   _GEOMETRY            the tensors that a cut rewrites
+    #   scratch_words( cap, fp_size )   the same formula as `Local*::words_for`
+    #   init_capacity()      the room of a hypercube
+    #   _cut_capacities()    `( vertices, cuts )` : at most what a cut can produce
+    #   _item( b )           the geometry of item `b`, read off its tensors
     #   _vertex_cut_indices_of( it ), _edges_of( it ), _edge_cuts_of( it ), _faces_of( it ),
-    #   _planes_of( it )     les tenseurs dérivés, lus sur un `Item`
+    #   _planes_of( it )     the derived tensors, read off an `Item`
 
     def __new__( cls, nb_dims = None, *args, **kwargs ):
         if cls is Cell:
             if nb_dims is None:
-                raise TypeError( "Cell( nb_dims, ... ) : la dimension décide de la classe" )
+                raise TypeError( "Cell( nb_dims, ... ) : the dimension decides the class" )
             cls = cell_class_for( nb_dims )
         return super().__new__( cls )
 
@@ -118,15 +118,15 @@ class Cell( Aggregate ):
         return cls( nb_dims, batch_axes = batch_axes, **kwargs )
 
     def _empty_like_me( self ):
-        """Une cellule de même régime, même batch, même noyau, sans géométrie."""
+        """A cell of the same regime, same batch, same kernel, without geometry."""
         return type( self )( self.dim, init_as_unbounded = False, batch_axes = self.batch_axes or None,
                              kernel_dtype = self._kernel_dtype )
 
-    # ---- les capacités, et le scratch d'un appel -----------------------------------------------
+    # ---- the capacities, and the scratch of a call ---------------------------------------------
 
     def _cap_v( self ):
-        """La capacité en sommets dont on part : le compte quand l'hôte le connaît, la capacité
-        allouée sinon ( un compte écrit par un kernel est une valeur device sous un tracé )."""
+        """The capacity in vertices we start from : the count when the host knows it, the allocated
+        capacity otherwise ( a count written by a kernel is a device value under a trace )."""
         n = self.nb_vertices.static_count()
         if n is not None:
             return max( int( n ), 1 )
@@ -139,20 +139,20 @@ class Cell( Aggregate ):
         return int( self.nb_cuts.allocated_capacity() or self.init_capacity() )
 
     def _call_scratch( self, cap ):
-        """le scratch d'un appel sur CETTE cellule : une ligne par item, `cap` sommets.
-        Déjà marqué `loom.scratch`, donc il se passe sous son nom et rien d'autre."""
+        """the scratch of a call on THIS cell : one row per item, `cap` vertices.
+        Already marked `loom.scratch`, so it is passed under its name and nothing else."""
         return CellScratch.for_call( self.scratch_words( cap, fp_size( self._kernel_dtype ) ),
                                      self._kernel_dtype, batch_axes = self.batch_axes or None )
 
-    # ---- les kernels ------------------------------------------------------------------------------
+    # ---- the kernels ------------------------------------------------------------------------------
 
     def init_as_unbounded( self, batch_axes = None ):
-        """« Tout l'espace », représenté par un SIMPLEXE dont les parois sont marquées `INFINITE`.
+        """"All of space", represented by a SIMPLEX whose walls are marked `INFINITE`.
 
-        Ces plans-là ne sont pas de vraies coupes : ce sont des bouche-trous, et leurs offsets sont
-        inventés. C'est `cut` qui les repousse au fur et à mesure, jusqu'à ce qu'ils ne changent
-        plus rien à la coupe en cours ( `Local2::grow_for` ) ; la cellule redevient bornée le jour
-        où plus aucun sommet n'en porte.
+        These planes are not real cuts : they are stopgaps, and their offsets are
+        made up. It is `cut` that pushes them back as it goes, until they no longer change
+        anything about the current cut ( `Local2::grow_for` ) ; the cell becomes bounded again the day
+        no vertex carries one any more.
         """
         if batch_axes is not None:
             self.apply_batch_axes( batch_axes )
@@ -165,8 +165,8 @@ class Cell( Aggregate ):
         )
 
     def init_as_hypercube( self, origin = None, axes = None, cut_id = BOUNDARY, batch_axes = None ):
-        """le parallélotope `origin + sum_j t_j axes[ j ]`, `t` dans `[ 0, 1 ]^d` -- le cube unité
-        par défaut. Toutes les coupes portent `cut_id`."""
+        """the parallelotope `origin + sum_j t_j axes[ j ]`, `t` in `[ 0, 1 ]^d` -- the unit cube
+        by default. All the cuts carry `cut_id`."""
         if batch_axes is not None:
             self.apply_batch_axes( batch_axes )
 
@@ -186,12 +186,12 @@ class Cell( Aggregate ):
         )
 
     def cut( self, direction, offset, cut_id = BOUNDARY ):
-        """Intersecte la cellule avec le demi-espace `direction . x <= offset`, EN PLACE.
+        """Intersects the cell with the half-space `direction . x <= offset`, IN PLACE.
 
-        `direction` n'a pas à être normalisée : `offset` est le produit scalaire auquel elle est
-        comparée telle quelle. Les entrées et les sorties d'un `driver.call` étant disjointes, le
-        kernel écrit dans une cellule NEUVE et la mise à jour en place n'est qu'un rebinding. La
-        place que la coupe demande est BORNÉE d'avance ( `_cut_capacities` ) : pas de second tour.
+        `direction` need not be normalized : `offset` is the dot product it is
+        compared against as is. Since the inputs and outputs of a `driver.call` are disjoint, the
+        kernel writes into a NEW cell and the in-place update is only a rebinding. The
+        room the cut requires is BOUNDED in advance ( `_cut_capacities` ) : no second pass.
         """
         direction = RealTensor[ self.dim_axis ]( direction )
         offset = RealTensor[ () ]( offset )
@@ -213,19 +213,19 @@ class Cell( Aggregate ):
         return self
 
     def _adopt_geometry( self, other ):
-        """Reprend sur `self` ce que le kernel vient d'écrire dans `other` : les VALEURS ( le
-        stockage des tenseurs, les comptes ), pas les objets `Attribute`, dont l'identité doit
-        survivre à la coupe."""
+        """Takes over on `self` what the kernel has just written into `other` : the VALUES ( the
+        tensor storage, the counts ), not the `Attribute` objects, whose identity must
+        survive the cut."""
         for name in self._GEOMETRY:
             getattr( self, name ).set( getattr( other, name ) )
-        # un compte écrit par un kernel est une valeur DEVICE : `set_count`, pas `set`
+        # a count written by a kernel is a DEVICE value : `set_count`, not `set`
         for name in ( "nb_vertices", "nb_cuts" ):
             getattr( self, name ).set_count( getattr( other, name ).raw )
 
     @property
     def measure( self ) -> Tensor:
-        """La mesure de la cellule : longueur, aire, volume -- dans le flottant de l'appelant, quel
-        que soit celui du noyau. `TF::max` pour une cellule non bornée. Dérivable par rapport à
+        """The measure of the cell : length, area, volume -- in the caller's float, whatever
+        the kernel's is. `TF::max` for an unbounded cell. Differentiable with respect to
         `vertex_positions`."""
         res = RealTensor[ tuple( self.batch_axes ) ]()
         loom.ffi_call(
@@ -239,23 +239,23 @@ class Cell( Aggregate ):
         )
         return res
 
-    # ---- lire un item ------------------------------------------------------------------------------
+    # ---- reading an item ---------------------------------------------------------------------------
 
     @property
     def nb_items( self ):
         return int( np.prod( [ int( ax.max ) for ax in self.batch_axes ] ) ) if self.batch_axes else 1
 
     def _count( self, shape_var, b ):
-        """le compte de l'item `b` -- un compte écrit par un kernel en a un par item, un compte
-        connu de l'hôte est le même pour tous"""
+        """the count of item `b` -- a count written by a kernel has one per item, a count
+        known to the host is the same for all"""
         v = np.atleast_1d( np.asarray( shape_var.value ) ).reshape( -1 ).astype( int )
         return int( v[ b ] if v.size == self.nb_items else v[ 0 ] )
 
     def _rows( self, tensor, b, count ):
-        """les `count` premières lignes de l'item `b` du tenseur `tensor` ( `[ items..., cap, ... ]` ).
-        Les axes de batch sont aplatis, et RIEN d'autre : sur un GPU le batch est rembourré à
-        l'alignement du device (`Device.batch_alignment`), l'item `b` est à la ligne `b` d'un
-        tampon qui en a plus que `nb_items`."""
+        """the first `count` rows of item `b` of tensor `tensor` ( `[ items..., cap, ... ]` ).
+        The batch axes are flattened, and NOTHING else : on a GPU the batch is padded to
+        the device alignment (`Device.batch_alignment`), item `b` is at row `b` of a
+        buffer that has more than `nb_items`."""
         raw = np.asarray( tensor.raw )
         return raw.reshape( ( -1, ) + raw.shape[ len( self.batch_axes ) : ] )[ b ][ : count ]
 
@@ -263,20 +263,20 @@ class Cell( Aggregate ):
         return [ self._item( b ) for b in range( self.nb_items ) ]
 
     def _per_item( self, of_item ):
-        """`of_item( item )` pour chaque item ; la valeur elle-même si la cellule n'est pas batchée."""
+        """`of_item( item )` for each item ; the value itself if the cell is not batched."""
         if not self.batch_axes:
             return of_item( self._item( 0 ) )
         return [ of_item( it ) for it in self._items() ]
 
     def vertices( self, item = 0 ):
-        """`vertex_positions` de l'item `item`, en numpy `[ nb_vertices, d ]` -- sans le padding
-        d'un batch."""
+        """`vertex_positions` of item `item`, in numpy `[ nb_vertices, d ]` -- without the padding
+        of a batch."""
         return self._item( item ).vp
 
-    # ---- les tenseurs « pratiques », dérivés ------------------------------------------------------
+    # ---- the "convenient" tensors, derived --------------------------------------------------------
 
     def _infinite_cuts_of( self, it ):
-        """le masque des coupes `INFINITE` qui portent encore un sommet"""
+        """the mask of the `INFINITE` cuts that still carry a vertex"""
         alive = np.zeros( len( it.cid ), bool )
         vc = self._vertex_cut_indices_of( it )
         if len( vc ):
@@ -285,28 +285,28 @@ class Cell( Aggregate ):
 
     @property
     def is_bounded( self ):
-        """Vrai si aucune paroi `INFINITE` ne porte plus de sommet."""
+        """True if no `INFINITE` wall carries a vertex any more."""
         return self._per_item( lambda it: not self._infinite_cuts_of( it ).any() )
 
     @property
     def vertex_cut_indices( self ):
-        """`[ nb_vertices, d ]` : les `d` coupes ( indices dans `cut_ids` ) dont chaque sommet est le coin."""
+        """`[ nb_vertices, d ]` : the `d` cuts ( indices into `cut_ids` ) of which each vertex is the corner."""
         return self._per_item( self._vertex_cut_indices_of )
 
     @property
     def edges( self ):
-        """`[ nb_edges, 2 ]` : les arêtes, en indices de sommets."""
+        """`[ nb_edges, 2 ]` : the edges, as vertex indices."""
         return self._per_item( self._edges_of )
 
     @property
     def faces( self ):
-        """Une liste de cycles d'indices de sommets, une face par coupe qui en porte ( 2D et 3D )."""
+        """A list of cycles of vertex indices, one face per cut that carries one ( 2D and 3D )."""
         return self._per_item( self._faces_of )
 
     @property
     def cut_planes( self ):
-        """`( directions[ nb_cuts, d ], offsets[ nb_cuts ] )`, relus sur la géométrie -- la normale
-        sortante UNITAIRE de chaque face et son offset. Une coupe sans sommet a une direction nulle."""
+        """`( directions[ nb_cuts, d ], offsets[ nb_cuts ] )`, re-read off the geometry -- the UNIT
+        outward normal of each face and its offset. A cut without a vertex has a zero direction."""
         return self._per_item( self._planes_of )
 
     @property
@@ -317,10 +317,10 @@ class Cell( Aggregate ):
     def cut_offsets( self ):
         return self._per_item( lambda it: self._planes_of( it )[ 1 ] )
 
-    # ---- l'affichage ------------------------------------------------------------------------------
+    # ---- display ----------------------------------------------------------------------------------
 
     def add_to_viz( self, viz, color = None, opacity = 1.0, faces = True, edges = True, points = False ):
-        """Se dessine dans un `Visualizer` ( voir `sdot.viz.Visualizer`, et `cell_viz` pour ce qu'une
-        cellule non bornée laisse tomber ). Chaque item prend sa couleur à son RANG DANS LE BATCH,
-        sur un bloc réservé d'avance : la couleur d'une cellule d'un diagramme dit QUEL germe."""
+        """Draws itself into a `Visualizer` ( see `sdot.viz.Visualizer`, and `cell_viz` for what an
+        unbounded cell drops ). Each item takes its color from its RANK IN THE BATCH,
+        on a block reserved in advance : the color of a cell of a diagram says WHICH seed."""
         return cell_viz.add_to_viz( self, viz, color, opacity, faces, edges, points )

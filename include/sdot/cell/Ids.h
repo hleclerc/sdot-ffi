@@ -7,23 +7,23 @@
 namespace sdot {
 
 // =====================================================================================
-// L'IDENTITE D'UNE COUPE, telle qu'elle est rangee dans `cut_ids`.
+// THE IDENTITY OF A CUT, as stored in `cut_ids`.
 //
-// C'est la seule chose que la geometrie garde d'un plan une fois la coupe faite : le plan lui-meme
-// se refabrique quand on en a besoin -- depuis les germes pour une bissectrice, depuis les sommets
-// qui le portent pour tout le reste (voir `Local2::planes_from_vertices`).
+// This is the only thing the geometry keeps of a plane once the cut is made: the plane itself
+// is rebuilt when needed -- from the seeds for a bisector, from the vertices that carry it
+// for everything else (see `Local2::planes_from_vertices`).
 //
-//   id >= 0              la bissectrice avec le germe `id` (un `cut_id` de `PowerDiagram`)
-//   -1 - k               le k-ieme plan du DOMAINE ; `BOUNDARY == domain_id( 0 )` est ce que porte
-//                        une coupe qui ne fait face a aucun germe quand on n'a rien de plus precis
-//                        a dire -- un `Cell.cut` fait depuis Python, une paroi de pave
-//   PIECE                un plan de DECOUPE ajoute par une distribution (`Image::for_each_piece`)
-//   INFINITE             une paroi du simplexe de remplacement d'une cellule NON BORNEE : elle
-//                        n'existe pas, ses offsets sont inventes et repousses au fil des coupes
-//                        (voir `Local2::grow_for`), et elle disparait le jour ou plus aucun sommet
-//                        ne la porte
+//   id >= 0              the bisector with seed `id` (a `cut_id` of `PowerDiagram`)
+//   -1 - k               the k-th plane of the DOMAIN; `BOUNDARY == domain_id( 0 )` is what is carried
+//                        by a cut that faces no seed when there is nothing more precise
+//                        to say -- a `Cell.cut` made from Python, a wall of a box
+//   PIECE                a SPLITTING plane added by a distribution (`Image::for_each_piece`)
+//   INFINITE             a wall of the replacement simplex of an UNBOUNDED cell: it
+//                        does not exist, its offsets are made up and pushed back as cuts come in
+//                        (see `Local2::grow_for`), and it disappears the day no vertex
+//                        carries it any more
 //
-// Tout ce qui est `< 0` est « pas un germe » : l'adjoint de la mesure n'y envoie rien.
+// Everything `< 0` is "not a seed": the adjoint of the measure sends nothing there.
 // =====================================================================================
 namespace cell_ids {
     enum : int {
@@ -38,13 +38,13 @@ namespace cell_ids {
     HD constexpr int  domain_num( int id ) { return -1 - id; }
 }
 
-/// ce qu'une coupe a fait de la cellule
+/// what a cut did to the cell
 namespace CutStatus {
     enum : int {
-        UNCHANGED = 0,   ///< le demi-espace contenait deja toute la cellule : rien n'a bouge
-        CUT       = 1,   ///< la cellule a ete coupee, en place
-        EMPTY     = 2,   ///< le demi-espace a tout emporte : `nb == 0`
-        OVERFLOW  = 3,   ///< la sortie ne tient pas dans la capacite ; la cellule est restee INTACTE
+        UNCHANGED = 0,   ///< the half-space already contained the whole cell: nothing moved
+        CUT       = 1,   ///< the cell was cut, in place
+        EMPTY     = 2,   ///< the half-space removed everything: `nb == 0`
+        NO_ROOM  = 3,   ///< the output does not fit in the capacity; the cell was left INTACT
     };
 }
 

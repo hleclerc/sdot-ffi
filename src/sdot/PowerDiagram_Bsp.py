@@ -1,25 +1,25 @@
-"""Les germes dans l'ORDRE D'UN ARBRE BSP : `sorted_positions` / `sorted_weights` sont les germes
-permutés comme `tree.seed_indices` les range, de sorte qu'une feuille se lit d'un seul tenant, et
-chaque cellule n'est coupée que par les germes que l'arbre n'a pas su écarter ( `AaBsp.py`,
-`cell/Fournisseurs.h::FournisseurBsp` ).
+"""The seeds in BSP TREE ORDER: `sorted_positions` / `sorted_weights` are the seeds
+permuted the way `tree.seed_indices` arranges them, so that a leaf reads in one piece, and
+each cell is cut only by the seeds the tree could not rule out ( `AaBsp.py`,
+`cell/Providers.h::ProviderBsp` ).
 
-Tout ce que le kernel manipule est dans cet ordre-là -- les rangs, les identifiants de coupe, les
-gradients sur les germes -- et c'est ici qu'on traduit : `positions` / `weights` rendent les germes
-dans l'ordre de l'utilisateur, les mesures et les cellules sortent du kernel déjà à leur indice
-( `user_id( k )` ), et le rassemblement `sorted = positions[ seed_indices ]` est une opération du
-backend, DÉRIVABLE : une dérivée par rapport à `sorted_positions` revient sur `positions` toute seule.
+Everything the kernel handles is in that order -- ranks, cut identifiers,
+gradients on the seeds -- and this is where we translate: `positions` / `weights` give the seeds back
+in the user's order, measures and cells leave the kernel already at their index
+( `user_id( k )` ), and the gathering `sorted = positions[ seed_indices ]` is an operation of the
+backend, DIFFERENTIABLE: a derivative with respect to `sorted_positions` comes back to `positions` on its own.
 
-Changer les POIDS ne change pas l'arbre, seulement le majorant affine que chaque nœud porte
-( `refresh_weight_majorants` ) : c'est ce qui rend un diagramme réutilisable d'un pas à l'autre
-d'un ajustement ( `SdotPlanNd` ). Changer les POSITIONS le rebâtit.
+Changing the WEIGHTS does not change the tree, only the affine majorant each node carries
+( `refresh_weight_majorants` ): this is what makes a diagram reusable from one step to the next
+of a fit ( `SdotPlanNd` ). Changing the POSITIONS rebuilds it.
 
-LA MÉMOIRE ( `memo_nbrs [ n, K ]`, `memo_counts [ n ]`, en rangs de l'arbre ) : les voisins de
-chaque cellule au dernier `measures`, que le fournisseur propose en premier au suivant
-( `cell/Fournisseurs.h`, `MEMO` ). Écrite par le kernel de `measures` dans deux tenseurs neufs,
-repris ici après l'appel ( les entrées et les sorties d'un appel sont disjointes ) -- sauf sous une
-trace, où ce qui sort est un traceur : la mémoire d'avant reste, elle vaut toujours. Effacée avec
-l'arbre, quand les positions changent. `memory = 0` ne la nomme pas : `NoneTensor` côté C++, et le
-chemin ordinaire à la compilation.
+THE MEMORY ( `memo_nbrs [ n, K ]`, `memo_counts [ n ]`, in tree ranks ): the neighbors of
+each cell at the last `measures`, which the provider proposes first to the next one
+( `cell/Providers.h`, `MEMO` ). Written by the `measures` kernel into two fresh tensors,
+taken back here after the call ( the inputs and outputs of a call are disjoint ) -- except under a
+trace, where what comes out is a tracer: the previous memory stays, it is always valid. Erased
+with the tree, when the positions change. `memory = 0` does not name it: `NoneTensor` on the C++ side, and the
+ordinary path at compile time.
 """
 
 import numpy as np
@@ -53,11 +53,11 @@ class PowerDiagram_Bsp( PowerDiagram ):
         res = { "tree": tree, "sorted_positions": self._gather( positions ) }
         if weights is not None:
             res[ "sorted_weights" ] = self._gather( weights )
-            # un arbre venu de l'extérieur a pu être bâti sur d'autres poids, ou sans : son majorant
-            # est refait sur CEUX-CI ( bâti ici, il les a déjà )
+            # a tree coming from outside may have been built on other weights, or none: its majorant
+            # is redone on THESE ( built here, it already has them )
             if tree is accelerator:
                 tree.refresh_weight_majorants( res[ "sorted_positions" ], res[ "sorted_weights" ] )
-        # la mémoire part vide ( aucun souvenir : le chemin ordinaire, en attendant le premier `measures` )
+        # the memory starts empty ( no memories: the ordinary path, until the first `measures` )
         K = int( getattr( self, "_memory", 0 ) )
         res[ "nb_memo" ] = K
         if K > 0:
@@ -70,8 +70,8 @@ class PowerDiagram_Bsp( PowerDiagram ):
             return "0, 0", {}, None
         nbrs = IntTensor[ self.num_point, self.num_memo, dict( size = 32 ) ]()
         counts = IntTensor[ self.num_point, dict( size = 32 ) ]()
-        # le role est porte par la valeur, donc il n'y a plus de liste de chemins a fondre dans
-        # celles de l'appel : ce sont des arguments comme les autres, marques.
+        # the role is carried by the value, so there is no list of paths to merge into
+        # those of the call any more: they are arguments like the others, marked.
         return "outputs.memo_nbrs_out, outputs.memo_counts_out", dict(
             memo_nbrs_out = loom.out( nbrs ), memo_counts_out = loom.out( counts ) ), ( nbrs, counts )
 
@@ -79,31 +79,31 @@ class PowerDiagram_Bsp( PowerDiagram ):
         if produced is None:
             return
         nbrs, counts = produced
-        if driver.is_traced( counts.raw ):          # sous une trace : on garde les souvenirs d'avant
+        if driver.is_traced( counts.raw ):          # under a trace: keep the previous memories
             return
         self.memo_nbrs = nbrs.raw
         self.memo_counts = counts.raw
 
     def _gather( self, seeds ):
-        """`seeds[ seed_indices ]`, par le backend : un traceur y reste un traceur, et la dérivée
-        par rapport à ce qu'on rassemble repasse par ici toute seule"""
+        """`seeds[ seed_indices ]`, through the backend: a tracer stays a tracer, and the derivative
+        with respect to what we gather comes back through here on its own"""
         raw = getattr( seeds, "raw", seeds )
         return raw[ self._order ]
 
     def _scatter( self, sorted_values ):
-        """l'inverse : ce qui est rangé dans l'ordre de l'arbre, remis dans celui de l'utilisateur"""
+        """the inverse: what is stored in tree order, put back in the user's order"""
         return sorted_values[ self._rank_of ]
 
-    # ---- ce que l'utilisateur lit et écrit ---------------------------------------------------------
+    # ---- what the user reads and writes ------------------------------------------------------------
 
     @property
     def positions( self ):
-        """`[ n, d ]`, dans l'ordre de l'utilisateur -- un tenseur NEUF, rassemblé depuis le stockage"""
+        """`[ n, d ]`, in the user's order -- a NEW tensor, gathered from the storage"""
         return RealTensor[ self.num_point, self.dim ]( self._scatter( self.sorted_positions.raw ) )
 
     @positions.setter
     def positions( self, positions ):
-        """de nouvelles positions : l'arbre est rebâti dessus ( il faut donc des valeurs concrètes )"""
+        """new positions: the tree is rebuilt on them ( so concrete values are needed )"""
         pos = positions if hasattr( positions, "shape" ) else np.asarray( positions, dtype = float )
         w = self.sorted_weights.raw[ self._rank_of ] if self.sorted_weights.is_defined else None
         for name, value in self._init_seeds( pos, w, None ).items():
@@ -112,8 +112,8 @@ class PowerDiagram_Bsp( PowerDiagram ):
 
     @property
     def weights( self ):
-        """`[ n ]` dans l'ordre de l'utilisateur, ou un tenseur `Unbound` ( `is_defined == False` )
-        quand le diagramme n'en porte pas -- la même chose que ce que `PowerDiagram_Plain` stocke"""
+        """`[ n ]` in the user's order, or an `Unbound` tensor ( `is_defined == False` )
+        when the diagram carries none -- the same thing `PowerDiagram_Plain` stores"""
         res = RealTensor[ self.num_point ]()
         if self.sorted_weights.is_defined:
             res.set( self._scatter( self.sorted_weights.raw ) )
@@ -121,34 +121,34 @@ class PowerDiagram_Bsp( PowerDiagram ):
 
     @weights.setter
     def weights( self, weights ):
-        """de nouveaux poids : les germes ne bougent pas, l'arbre non plus -- seul le majorant affine
-        des poids de chaque nœud est refait, en un kernel sur les nœuds"""
+        """new weights: the seeds do not move, nor does the tree -- only the affine majorant
+        of the weights of each node is redone, in one kernel over the nodes"""
         self.sorted_weights = self._gather( weights )
         self.tree.refresh_weight_majorants( self.sorted_positions, self.sorted_weights )
 
     def _ranks_of_items( self ):
         return self._rank_of
 
-    # ---- ce que le solveur de `SdotPlanNd` ecrit ---------------------------------------------------------
+    # ---- what the `SdotPlanNd` solver writes -------------------------------------------------------------
 
     def _solver_weights_call( self ):
-        """`( expression C++ du diagramme aux poids INSCRIPTIBLES, kwargs de l'appel, ce qu'il faut
-        reprendre après )` : les poids triés et les majorants de l'arbre sont des SORTIES de l'appel
-        ( `PowerDiagram_Bsp.h::with_weights` ), que `_solver_weights_after` adopte"""
+        """`( C++ expression of the diagram with WRITABLE weights, kwargs of the call, what has to be
+        taken back afterwards )`: the sorted weights and the tree majorants are OUTPUTS of the call
+        ( `PowerDiagram_Bsp.h::with_weights` ), which `_solver_weights_after` adopts"""
         sw = RealTensor[ self.num_point ]()
         wa = RealTensor[ self.tree.num_bsp_node, self.tree.dim ]()
         wb = RealTensor[ self.tree.num_bsp_node ]()
         args = dict( sorted_weights_out = sw, node_wa_out = wa, node_wb_out = wb )
         expr = ( "inputs.power_diagram.with_weights( outputs.sorted_weights_out, outputs.node_wa_out, "
                  "outputs.node_wb_out" )
-        # la memoire aussi ( `memory > 0` ) : le solveur la refait a chaque balayage, dans deux sorties
-        # neuves qu'il initialise depuis les souvenirs d'avant
+        # the memory too ( `memory > 0` ): the solver redoes it at each sweep, in two fresh
+        # outputs that it initializes from the previous memories
         if self.memo_counts.is_defined:
             nbrs = IntTensor[ self.num_point, self.num_memo, dict( size = 32 ) ]()
             counts = IntTensor[ self.num_point, dict( size = 32 ) ]()
             args.update( memo_nbrs_out = nbrs, memo_counts_out = counts )
             expr += ", outputs.memo_nbrs_out, outputs.memo_counts_out"
-        # les marqueurs portent le role : il n'y a plus de liste de chemins a cote.
+        # the markers carry the role: there is no side list of paths any more.
         return ( expr + " )", { n: loom.out( t ) for n, t in args.items() }, args )
 
     def _solver_weights_after( self, produced ):

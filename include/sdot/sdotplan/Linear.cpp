@@ -1,10 +1,10 @@
-// L'UNITE DE DOMAINE des solveurs lineaires ( voir `Lineaire.h` ) : compilee une fois par
-// compilateur, liee par les noyaux qui nomment `sdot/sdotplan/Lineaire.cpp` dans leurs `sources`.
-// Eigen et AMGCL sont ceux que loom telecharge ( `sdot/__init__.py` -> `loom/compilation/externals.py`,
-// sur le chemin d'inclusion ), ou a defaut ceux du systeme ( `<eigen3/...>` ) ; ce qui manque n'est
-// simplement pas propose.
+// THE DOMAIN UNIT of the linear solvers ( see `Linear.h` ): compiled once per
+// compiler, linked by the kernels that name `sdot/sdotplan/Linear.cpp` in their `sources`.
+// Eigen and AMGCL are those that loom downloads ( `sdot/__init__.py` -> `loom/compilation/externals.py`,
+// on the include path ), or failing that those of the system ( `<eigen3/...>` ); what is missing is
+// simply not offered.
 
-#include "Lineaire.h"
+#include "Linear.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -44,23 +44,23 @@ static double now() {
     return duration<double>( steady_clock::now().time_since_epoch() ).count();
 }
 
-// ---- le gradient conjugue, toujours la ------------------------------------------------------------
+// ---- the conjugate gradient, always there ---------------------------------------------------------
 
-/// CG preconditionne par Jacobi sur le systeme complet, la jauge tenue en projetant `d_0 = 0` :
-/// on resout sur les inconnues `1 .. n-1` en lisant la matrice complete et en ignorant la colonne 0.
-struct Cg : SolveurLineaire {
+/// Jacobi-preconditioned CG on the full system, the gauge held by projecting `d_0 = 0`:
+/// we solve on the unknowns `1 .. n-1`, reading the full matrix and ignoring column 0.
+struct Cg : LinearSolver {
     double tol = 1e-12;
     int    maxit = 20000;
 
-    const char *nom() const override { return "gradient conjugue ( Jacobi )"; }
+    const char *name() const override { return "conjugate gradient ( Jacobi )"; }
 
-    bool resout( const Laplacien &L, const std::vector<double> &b, std::vector<double> &d ) override {
+    bool solves( const Laplacian &L, const std::vector<double> &b, std::vector<double> &d ) override {
         const SI n = L.n;
         const double t0 = now();
         std::vector<double> r( n ), z( n ), p( n ), q( n );
         d.assign( n, 0.0 );
-        auto produit = [&]( const std::vector<double> &x, std::vector<double> &y ) {
-            L.produit( x.data(), y.data() );
+        auto product = [&]( const std::vector<double> &x, std::vector<double> &y ) {
+            L.product( x.data(), y.data() );
             y[ 0 ] = 0;
         };
         double nb = 0;
@@ -73,7 +73,7 @@ struct Cg : SolveurLineaire {
         double err = 1;
         int it = 0;
         for ( ; it < maxit; ++it ) {
-            produit( p, q );
+            product( p, q );
             double pq = 0;
             for ( SI i = 1; i < n; ++i ) pq += p[ i ] * q[ i ];
             if ( ! ( pq > 0 ) ) break;
@@ -89,7 +89,7 @@ struct Cg : SolveurLineaire {
             for ( SI i = 1; i < n; ++i ) p[ i ] = z[ i ] + beta * p[ i ];
         }
         st.nb_iter += it;
-        st.pire = std::max( st.pire, err );
+        st.worst = std::max( st.worst, err );
         st.t_res += now() - t0;
         return err < 1;
     }
@@ -98,57 +98,57 @@ struct Cg : SolveurLineaire {
 // ---- AMGCL ----------------------------------------------------------------------------------------
 
 #ifdef SDOT_AMGCL
-struct Amg : SolveurLineaire {
-    enum Variante : int { SA_SPAI0 = 0, SA_GS = 1, RS_GS = 2 };
-    int    variante = RS_GS;
-    double tol      = 1e-10;       ///< residu RELATIF
+struct Amg : LinearSolver {
+    enum Variant : int { SA_SPAI0 = 0, SA_GS = 1, RS_GS = 2 };
+    int    variant = RS_GS;
+    double tol      = 1e-10;       ///< RELATIVE residual
     int    maxit    = 20000;
 
-    const char *nom() const override {
-        return variante == RS_GS ? "AMGCL Ruge-Stuben+GS"
-             : variante == SA_GS ? "AMGCL agregation+GS" : "AMGCL agregation+spai0";
+    const char *name() const override {
+        return variant == RS_GS ? "AMGCL Ruge-Stuben+GS"
+             : variant == SA_GS ? "AMGCL aggregation+GS" : "AMGCL aggregation+spai0";
     }
 
-    bool resout( const Laplacien &L, const std::vector<double> &b, std::vector<double> &d ) override {
+    bool solves( const Laplacian &L, const std::vector<double> &b, std::vector<double> &d ) override {
         const SI n = L.n, m = n - 1;
         const double t0 = now();
         std::vector<int> ptr, col;
         std::vector<double> val;
-        L.crs_reduit( ptr, col, val );
+        L.reduced_crs( ptr, col, val );
         std::vector<double> rb( m ), sol( m, 0.0 );
         for ( SI i = 1; i < n; ++i )
             rb[ i - 1 ] = b[ i ];
         const double t1 = now();
-        st.t_forme += t1 - t0;
+        st.t_build += t1 - t0;
 
         using Back = amgcl::backend::builtin<double>;
         int it = 0;
         double err = 0;
-        auto lance = [&]( auto tag ) {
+        auto launch = [&]( auto tag ) {
             using Solv = typename decltype( tag )::type;
             typename Solv::params prm;
             prm.solver.tol = tol;
             prm.solver.maxiter = maxit;
             Solv so( std::tie( m, ptr, col, val ), prm );
             const double ta = now();
-            st.t_hier += ta - t1;
-            ++st.nb_hier;
+            st.t_hierarchy += ta - t1;
+            ++st.nb_hierarchies;
             std::tie( it, err ) = so( rb, sol );
             st.t_res += now() - ta;
         };
         using SaSpai = amgcl::make_solver<amgcl::amg<Back, amgcl::coarsening::smoothed_aggregation, amgcl::relaxation::spai0>, amgcl::solver::cg<Back>>;
         using SaGs   = amgcl::make_solver<amgcl::amg<Back, amgcl::coarsening::smoothed_aggregation, amgcl::relaxation::gauss_seidel>, amgcl::solver::cg<Back>>;
         using RsGs   = amgcl::make_solver<amgcl::amg<Back, amgcl::coarsening::ruge_stuben, amgcl::relaxation::gauss_seidel>, amgcl::solver::cg<Back>>;
-        if      ( variante == SA_GS ) lance( std::type_identity<SaGs>{} );
-        else if ( variante == RS_GS ) lance( std::type_identity<RsGs>{} );
-        else                          lance( std::type_identity<SaSpai>{} );
+        if      ( variant == SA_GS ) launch( std::type_identity<SaGs>{} );
+        else if ( variant == RS_GS ) launch( std::type_identity<RsGs>{} );
+        else                          launch( std::type_identity<SaSpai>{} );
         st.nb_iter += it;
-        st.pire = std::max( st.pire, err );
+        st.worst = std::max( st.worst, err );
 
         d.assign( n, 0.0 );
         for ( SI i = 1; i < n; ++i )
             d[ i ] = sol[ i - 1 ];
-        return err < 1;                                  // `1` : le solveur n'a rien fait du tout
+        return err < 1;                                  // `1`: the solver did nothing at all
     }
 };
 #endif
@@ -156,17 +156,17 @@ struct Amg : SolveurLineaire {
 // ---- Eigen ----------------------------------------------------------------------------------------
 
 #ifdef SDOT_EIGEN
-struct Cholesky : SolveurLineaire {
+struct Cholesky : LinearSolver {
     using SpM = Eigen::SparseMatrix<double>;
     Eigen::SimplicialLDLT<SpM, Eigen::Lower, Eigen::AMDOrdering<int>> so;
-    std::vector<SI> motif;         ///< le motif de la derniere analyse symbolique
+    std::vector<SI> pattern;         ///< the pattern of the last symbolic analysis
 
-    const char *nom() const override { return "Cholesky creux ( Eigen LDLT, AMD )"; }
+    const char *name() const override { return "sparse Cholesky ( Eigen LDLT, AMD )"; }
 
-    /// LE MOTIF NE BOUGE PRESQUE PAS : quelques aretes par iteration au debut, zero a la fin, alors
-    /// que la renumerotation et l'analyse symbolique coutent le tiers de la factorisation. On les
-    /// refait SEULEMENT quand le motif a change -- compare tel quel, une passe lineaire.
-    bool resout( const Laplacien &L, const std::vector<double> &b, std::vector<double> &d ) override {
+    /// THE PATTERN BARELY MOVES: a few edges per iteration at the start, zero at the end, whereas
+    /// the renumbering and the symbolic analysis cost a third of the factorization. They are
+    /// redone ONLY when the pattern has changed -- compared as is, one linear pass.
+    bool solves( const Laplacian &L, const std::vector<double> &b, std::vector<double> &d ) override {
         const SI n = L.n, m = n - 1;
         const double t0 = now();
         std::vector<Eigen::Triplet<double>> tri;
@@ -175,24 +175,24 @@ struct Cholesky : SolveurLineaire {
             tri.emplace_back( int( i - 1 ), int( i - 1 ), L.dia[ i ] );
             for ( SI k = L.row[ i ]; k < L.row[ i + 1 ]; ++k ) {
                 const SI j = L.col[ k ];
-                if ( j >= 1 && j < i )                   // le triangle INFERIEUR seul
+                if ( j >= 1 && j < i )                   // the LOWER triangle only
                     tri.emplace_back( int( i - 1 ), int( j - 1 ), -L.c[ k ] );
             }
         }
         SpM A( m, m );
         A.setFromTriplets( tri.begin(), tri.end() );
         const double t1 = now();
-        st.t_forme += t1 - t0;
+        st.t_build += t1 - t0;
 
-        std::vector<SI> mot( A.outerIndexPtr(), A.outerIndexPtr() + m + 1 );
-        mot.insert( mot.end(), A.innerIndexPtr(), A.innerIndexPtr() + A.nonZeros() );
-        if ( mot != motif ) {
+        std::vector<SI> new_pattern( A.outerIndexPtr(), A.outerIndexPtr() + m + 1 );
+        new_pattern.insert( new_pattern.end(), A.innerIndexPtr(), A.innerIndexPtr() + A.nonZeros() );
+        if ( new_pattern != pattern ) {
             so.analyzePattern( A );
-            motif.swap( mot );
-            ++st.nb_hier;
+            pattern.swap( new_pattern );
+            ++st.nb_hierarchies;
         }
         const double t2 = now();
-        st.t_hier += t2 - t1;
+        st.t_hierarchy += t2 - t1;
 
         so.factorize( A );
         if ( so.info() != Eigen::Success ) { st.t_res += now() - t2; return false; }
@@ -212,9 +212,9 @@ struct Cholesky : SolveurLineaire {
 };
 #endif
 
-// ---- le choix -------------------------------------------------------------------------------------
+// ---- the choice -----------------------------------------------------------------------------------
 
-int methodes_lineaires_disponibles() {
+int available_linear_methods() {
     int res = 1 << int( Lin::CG );
 #ifdef SDOT_EIGEN
     res |= 1 << int( Lin::CHOLESKY );
@@ -225,18 +225,18 @@ int methodes_lineaires_disponibles() {
     return res;
 }
 
-std::unique_ptr<SolveurLineaire> solveur_lineaire( Lin methode, SI n, int dim ) {
-    const int dispo = methodes_lineaires_disponibles();
-    if ( methode == Lin::AUTO )
-        methode = dim <= 2 && n <= 300000 ? Lin::CHOLESKY : Lin::AMG;
-    if ( methode == Lin::CHOLESKY && ! ( dispo & ( 1 << int( Lin::CHOLESKY ) ) ) ) methode = Lin::AMG;
-    if ( methode == Lin::AMG      && ! ( dispo & ( 1 << int( Lin::AMG      ) ) ) ) methode = Lin::CHOLESKY;
-    if ( ! ( dispo & ( 1 << int( methode ) ) ) )                                   methode = Lin::CG;
+std::unique_ptr<LinearSolver> linear_solver( Lin method, SI n, int dim ) {
+    const int available = available_linear_methods();
+    if ( method == Lin::AUTO )
+        method = dim <= 2 && n <= 300000 ? Lin::CHOLESKY : Lin::AMG;
+    if ( method == Lin::CHOLESKY && ! ( available & ( 1 << int( Lin::CHOLESKY ) ) ) ) method = Lin::AMG;
+    if ( method == Lin::AMG      && ! ( available & ( 1 << int( Lin::AMG      ) ) ) ) method = Lin::CHOLESKY;
+    if ( ! ( available & ( 1 << int( method ) ) ) )                                   method = Lin::CG;
 #ifdef SDOT_EIGEN
-    if ( methode == Lin::CHOLESKY ) return std::make_unique<Cholesky>();
+    if ( method == Lin::CHOLESKY ) return std::make_unique<Cholesky>();
 #endif
 #ifdef SDOT_AMGCL
-    if ( methode == Lin::AMG ) return std::make_unique<Amg>();
+    if ( method == Lin::AMG ) return std::make_unique<Amg>();
 #endif
     return std::make_unique<Cg>();
 }

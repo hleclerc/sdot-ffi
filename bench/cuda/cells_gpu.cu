@@ -1,82 +1,82 @@
-// LE PLANCHER GEOMETRIQUE SUR GPU, en FP32.
+// THE GEOMETRIC FLOOR ON GPU, in FP32.
 //
-// = Ce que ce banc mesure, et ce qu'il ne mesure pas
+// = What this bench measures, and what it does not
 //
-// Exactement le meme protocole que `--cells` du banc CGAL, et pour pouvoir etre compare a lui :
-// la LISTE FINALE des voisins est donnee, et on ne chronometre que la COUPE et la MESURE. C'est le
-// temps d'une cellule si un oracle donnait la connectivite sans jamais se tromper. Il n'y a donc
-// ici ni arbre, ni recherche, ni germe rejete -- rien de ce qui fait la moitie de notre temps CPU.
-// Le chiffre a comparer est `coupe + mesure` du banc CPU : 7078 ns/germe en 3D, 216 en 2D, mesures
-// a un fil sur cette machine.
+// Exactly the same protocol as `--cells` of the CGAL bench, so as to be comparable with it:
+// the FINAL LIST of neighbors is given, and only the CUT and the MEASURE are timed. This is the
+// time of a cell if an oracle gave the connectivity without ever being wrong. So there is
+// no tree here, no search, no rejected seed -- nothing of what makes up half of our CPU time.
+// The figure to compare with is `cut + measure` of the CPU bench: 7078 ns/seed in 3D, 216 in 2D, measured
+// on one thread on this machine.
 //
-// La liste vient du fichier ecrit par `power_{2,3}d_light --dump`, qui porte aussi le volume de
-// REFERENCE calcule en FP64 par `Cell3T<128>`. Ce banc-ci ne parle donc pas a CGAL : il rejoue, et
-// il se fait juger cellule par cellule.
+// The list comes from the file written by `power_{2,3}d_light --dump`, which also carries the
+// REFERENCE volume computed in FP64 by `Cell3T<128>`. This bench therefore does not talk to CGAL: it replays, and
+// it is judged cell by cell.
 //
-// = Les deux placements, et pourquoi il faut les deux
+// = The two placements, and why both are needed
 //
-//   --map thread   une cellule par THREAD, la cellule en memoire locale.
-//   --map warp     une cellule par WARP, la cellule en SHARED, les 32 voies balayant ses sommets.
+//   --map thread   one cell per THREAD, the cell in local memory.
+//   --map warp     one cell per WARP, the cell in SHARED, the 32 lanes sweeping its vertices.
 //
-// Le premier est le portage direct du code CPU, et c'est la forme naive. Son probleme n'est pas la
-// VRAM -- une `Cell3` en FP32 fait ~2.3 Ko, donc 160 Mo pour les 70 000 threads residents d'une
-// 2080 Ti, sur 11 Go -- mais le CACHE : l'empreinte chaude d'une cellule 3D moyenne est ~1 Ko, et
-// 1024 threads par SM en demandent 1 Mo la ou le L1 en fait 64 Ko. On thrashe d'un facteur seize.
+// The first is the direct port of the CPU code, and it is the naive form. Its problem is not
+// VRAM -- a `Cell3` in FP32 is ~2.3 KB, hence 160 MB for the 70 000 resident threads of a
+// 2080 Ti, out of 11 GB -- but the CACHE: the hot footprint of an average 3D cell is ~1 KB, and
+// 1024 threads per SM ask for 1 MB where the L1 is 64 KB. We thrash by a factor of sixteen.
 //
-// Le second existe pour ca. Il coute une reecriture (les prefixes deviennent des `__ballot` et des
-// `__popc`) mais il place la cellule la ou elle tient, et il rend les lectures de sommets
-// contigues -- c'est precisement la forme SoA de `Cell3T` qui le permet, `vx/vy/vz` separes : les
-// 32 voies lisent 32 flottants consecutifs.
+// The second exists for that. It costs a rewrite (the prefixes become `__ballot`s and
+// `__popc`s) but it places the cell where it fits, and it makes the vertex reads
+// contiguous -- it is precisely the SoA form of `Cell3T` that allows it, `vx/vy/vz` separate: the
+// 32 lanes read 32 consecutive floats.
 //
-// = Le FP32, et ce qu'il fallait changer pour qu'il tienne
+// = FP32, and what had to change for it to hold
 //
-// Notre predicat est `d . v - off`, de DEGRE 1 en les coordonnees du sommet. C'est toute la
-// difference avec `insphere`, de degre 5, qui oblige CGAL a son filtre par intervalles : ici il n'y
-// a pas de filtre a doubler ni de repli exact, donc pas de divergence arithmetique dans le warp.
+// Our predicate is `d . v - off`, of DEGREE 1 in the vertex coordinates. This is the whole
+// difference with `insphere`, of degree 5, which forces CGAL into its interval filter: here there
+// is no filter to double nor exact fallback, hence no arithmetic divergence in the warp.
 //
-// Mais la forme naive de `off` ne passe pas en FP32. Ecrite
+// But the naive form of `off` does not work in FP32. Written
 //
 //     off = ( w0 - w1 ) / 2 + d . ( p0 + p1 ) / 2
 //
-// elle additionne des termes en `O(1)` pour rendre un `O(|d|)` -- avec `|d| ~ 0.017` sur 2e5 germes,
-// c'est une annulation de deux decimales, et l'erreur absolue de 1e-7 sur `off` deplace le plan de
-// `1e-7 / |d| = 6e-6`, soit 3e-4 de la taille de la cellule. On travaille donc dans le repere DU
-// GERME : en posant `x' = x - p0`, la meme quantite devient
+// it adds up terms of `O(1)` to return an `O(|d|)` -- with `|d| ~ 0.017` on 2e5 seeds,
+// that is a cancellation of two decimals, and the absolute error of 1e-7 on `off` moves the plane by
+// `1e-7 / |d| = 6e-6`, i.e. 3e-4 of the cell size. So we work in the SEED's frame: setting
+// `x' = x - p0`, the same quantity becomes
 //
 //     off' = ( w0 - w1 ) / 2 + |d|^2 / 2
 //
-// qui n'a plus aucune annulation. Le cout est nul (c'est la meme translation pour toute la cellule,
-// et le volume ne la voit pas), le gain est deux decimales rendues. C'est le genre de chose qui ne
-// se voit pas en FP64 et qui decide tout en FP32.
+// which has no cancellation left. The cost is nil (it is the same translation for the whole cell,
+// and the volume does not see it), the gain is two decimals given back. This is the kind of thing that is not
+// visible in FP64 and that decides everything in FP32.
 //
-// = La mesure : une formulation SANS FACES
+// = The measure: a FACE-FREE formulation
 //
-// `Cell3T::measure` retrouve les faces par une table de hachage, puis les eventaille. Sur GPU c'est
-// le mauvais calcul : la table est 1 Ko de memoire locale a remettre a -1 par cellule, et l'insertion
-// est une boucle a sortie imprevisible. Or on peut s'en passer entierement.
+// `Cell3T::measure` recovers the faces through a hash table, then fans them. On GPU this is
+// the wrong computation: the table is 1 KB of local memory to reset to -1 per cell, and insertion
+// is a loop with unpredictable exit. Yet we can do without it entirely.
 //
-// Par le theoreme de la divergence, `V = (1/3) sum_f x_f . A_f`, ou `x_f` est UN point du plan de la
-// face et `A_f` son vecteur-aire sortant. Et le vecteur-aire d'un polygone plan ferme vaut
-// `(1/2) sum_aretes p x q`, les aretes prises dans le sens direct vu de l'exterieur. Donc
+// By the divergence theorem, `V = (1/3) sum_f x_f . A_f`, where `x_f` is ONE point of the plane of the
+// face and `A_f` its outward area vector. And the area vector of a closed planar polygon is
+// `(1/2) sum_edges p x q`, the edges taken in the direct sense seen from outside. Hence
 //
-//     V = (1/6) sum_faces sum_{aretes de la face} x_f . ( p x q )
+//     V = (1/6) sum_faces sum_{edges of the face} x_f . ( p x q )
 //
-// -- et il n'y a plus de face a former : chaque incidence ( arete, face ) contribue toute seule. Une
-// arete est sur exactement DEUX faces, celles de ses deux coupes communes `c0` et `c1`, et le sens
-// direct autour de `c0` est celui de `n0 x n1` (verifie sur le cube : les faces +x et +y donnent
-// +z, qui est bien le sens direct vu de +x). Les deux contributions de l'arete se rassemblent :
+// -- and there is no face left to form: each incidence ( edge, face ) contributes on its own. An
+// edge is on exactly TWO faces, those of its two common cuts `c0` and `c1`, and the direct sense around `c0` is
+// that of `n0 x n1` (checked on the cube: the +x and +y faces give
+// +z, which is indeed the direct sense seen from +x). The edge's two contributions combine:
 //
-//     V = (1/6) sum_aretes  s_e  ( x_{c0} - x_{c1} ) . ( a x b ),   s_e = signe( (b-a) . (n0 x n1) )
+//     V = (1/6) sum_edges  s_e  ( x_{c0} - x_{c1} ) . ( a x b ),   s_e = sign( (b-a) . (n0 x n1) )
 //
-// Un produit vectoriel et un produit scalaire par arete, sans table, sans branche, sans groupement,
-// `O(E)` au lieu de `O(F(V+E))`. `--measure faces` garde l'autre chemin pour que la comparaison
-// existe, et pour que les deux se controlent l'un l'autre.
+// One cross product and one dot product per edge, no table, no branch, no grouping,
+// `O(E)` instead of `O(F(V+E))`. `--measure faces` keeps the other path so that the comparison
+// exists, and so that the two check each other.
 //
-// = Ce qu'il faut lire dans la sortie
+// = What to read in the output
 //
-// `ecart max` est le pire ecart RELATIF a la reference FP64, cellule par cellule -- le seul chiffre
-// qui dise si le FP32 rend la geometrie. La somme des volumes ne suffit pas : des cellules fausses
-// se compensent, ce banc l'a deja montre une fois.
+// `max deviation` is the worst RELATIVE deviation from the FP64 reference, cell by cell -- the only figure
+// that says whether FP32 gets the geometry right. The sum of the volumes is not enough: wrong cells
+// compensate each other, this bench has already shown it once.
 
 #include <cstdio>
 #include <cstdlib>
@@ -91,41 +91,41 @@
         std::fprintf( stderr, "CUDA %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString( e_ ) ); \
         std::exit( 1 ); } } while ( 0 )
 
-// ------------------------------------------------------------------ le fichier de connectivite
+// ------------------------------------------------------------------ the connectivity file
 
 struct Csr {
     int dim = 0;
     long long n = 0, nv = 0;
-    std::vector<double> moi, vois, ref;         ///< AoS sur le disque : x,y[,z],w
+    std::vector<double> own, nbrs, ref;         ///< AoS on disk: x,y[,z],w
     std::vector<long long> off;
 };
 
 static bool read_csr( const char *path, Csr &c ) {
     std::FILE *f = std::fopen( path, "rb" );
-    if ( ! f ) { std::fprintf( stderr, "illisible : %s\n", path ); return false; }
+    if ( ! f ) { std::fprintf( stderr, "unreadable: %s\n", path ); return false; }
     std::int32_t magic = 0, d = 0;
     if ( std::fread( &magic, 4, 1, f ) != 1 || magic != 0x31434450 ) {
-        std::fprintf( stderr, "pas un dump PDC1 : %s\n", path ); std::fclose( f ); return false;
+        std::fprintf( stderr, "not a PDC1 dump: %s\n", path ); std::fclose( f ); return false;
     }
-    auto rd = [ & ]( void *p, std::size_t sz, std::size_t k ) { if ( std::fread( p, sz, k, f ) != k ) std::fprintf( stderr, "dump tronque\n" ); };
+    auto rd = [ & ]( void *p, std::size_t sz, std::size_t k ) { if ( std::fread( p, sz, k, f ) != k ) std::fprintf( stderr, "truncated dump\n" ); };
     rd( &d, 4, 1 );
     std::int64_t n = 0, nv = 0;
     rd( &n, 8, 1 );
     rd( &nv, 8, 1 );
     c.dim = d; c.n = n; c.nv = nv;
-    c.moi.resize( std::size_t( n ) * ( d + 1 ) );
+    c.own.resize( std::size_t( n ) * ( d + 1 ) );
     c.off.resize( std::size_t( n ) + 1 );
-    c.vois.resize( std::size_t( nv ) * ( d + 1 ) );
+    c.nbrs.resize( std::size_t( nv ) * ( d + 1 ) );
     c.ref.resize( std::size_t( n ) );
-    rd( c.moi.data(), 8, c.moi.size() );
+    rd( c.own.data(), 8, c.own.size() );
     rd( c.off.data(), 8, c.off.size() );
-    rd( c.vois.data(), 8, c.vois.size() );
+    rd( c.nbrs.data(), 8, c.nbrs.size() );
     rd( c.ref.data(), 8, c.ref.size() );
     std::fclose( f );
     return true;
 }
 
-// ------------------------------------------------------------------ petits outils de warp
+// ------------------------------------------------------------------ small warp tools
 
 __device__ __forceinline__ unsigned lt_mask() { return ( 1u << ( threadIdx.x & 31 ) ) - 1u; }
 
@@ -142,8 +142,8 @@ __device__ __forceinline__ void sort3i( int *a ) {
     if ( a[ 0 ] > a[ 1 ] ) { t = a[ 0 ]; a[ 0 ] = a[ 1 ]; a[ 1 ] = t; }
 }
 
-/// les deux coupes communes a deux sommets voisins : une arete d'un polytope simple est
-/// l'intersection de deux plans, donc il y en a exactement deux.
+/// the two cuts common to two neighboring vertices: an edge of a simple polytope is
+/// the intersection of two planes, so there are exactly two.
 __device__ __forceinline__ void shared2( const int *a, const int *b, int &c0, int &c1 ) {
     c0 = c1 = 0;
     int k = 0;
@@ -167,9 +167,9 @@ __device__ __forceinline__ bool share_one_but( const int *a, const int *b, int s
 
 enum { CUT_UNCHANGED = 0, CUT_EMPTY = 1, CUT_OVERFLOW = 2, CUT_DONE = 3 };
 
-/// LE PLAN d'une coupe, DANS LE REPERE DU GERME. Voir l'entete : c'est ici que le FP32 se joue.
-/// `c >= 0` designe le `c`-ieme voisin de la cellule ; `c < 0` une face du cube, translatee elle
-/// aussi (`x >= 0` devient `-x' <= x0`).
+/// THE PLANE of a cut, IN THE SEED'S FRAME. See the header: this is where FP32 is won or lost.
+/// `c >= 0` designates the `c`-th neighbor of the cell; `c < 0` a face of the cube, translated
+/// too (`x >= 0` becomes `-x' <= x0`).
 template<class TF>
 __device__ __forceinline__ void plane3( int c, const TF *px, const TF *py, const TF *pz, const TF *pw,
                                         long long base, TF x0, TF y0, TF z0, TF w0,
@@ -192,10 +192,10 @@ __device__ __forceinline__ void plane3( int c, const TF *px, const TF *py, const
     }
 }
 
-// ================================================================== 3D, une cellule par THREAD
+// ================================================================== 3D, one cell per THREAD
 
-/// Le portage direct de `pd::Cell3T`, en tampons locaux. Meme algorithme, meme ordre, memes
-/// garde-fous : sur debordement la cellule reste INTACTE et l'appelant compte.
+/// The direct port of `pd::Cell3T`, in local buffers. Same algorithm, same order, same
+/// safeguards: on overflow the cell stays INTACT and the caller counts.
 template<class TF, int MaxNv>
 struct Cell3G {
     static constexpr int MaxNe = 3 * MaxNv / 2 + 2;
@@ -206,7 +206,7 @@ struct Cell3G {
     int vc[ MaxNv ][ 3 ];
     int ea[ MaxNe ], eb[ MaxNe ];
 
-    /// le cube unite VU DU GERME. Les six faces gardent les indices `-1 .. -6`.
+    /// the unit cube SEEN FROM THE SEED. The six faces keep the indices `-1 .. -6`.
     __device__ void init_as_box( TF x0, TF y0, TF z0 ) {
         nb = 8; ne = 12;
         const TF lo[ 3 ] = { -x0, -y0, -z0 }, hi[ 3 ] = { TF( 1 ) - x0, TF( 1 ) - y0, TF( 1 ) - z0 };
@@ -250,8 +250,8 @@ struct Cell3G {
             if ( oa == ob ) continue;
             if ( nn + nm >= MaxNv ) return CUT_OVERFLOW;
             const int in = oa ? b : a, out = oa ? a : b;
-            // ancre sur le sommet DEDANS : avec `s_in == 0` la forme symetrique ne rend pas `v_in`
-            // en flottant, et le sommet passe DE L'AUTRE COTE du plan.
+            // anchor on the vertex that is INSIDE: with `s_in == 0` the symmetric form does not return `v_in`
+            // in floating point, and the vertex ends up ON THE OTHER SIDE of the plane.
             const TF t = s[ in ] / ( s[ in ] - s[ out ] );
             nx[ nm ] = vx[ in ] + ( vx[ out ] - vx[ in ] ) * t;
             ny[ nm ] = vy[ in ] + ( vy[ out ] - vy[ in ] ) * t;
@@ -275,8 +275,8 @@ struct Cell3G {
             if ( na < MaxNe ) { ta[ na ] = A; tb[ na ] = B; }
             ++na;
         }
-        // les cotes de la FACE NEUVE : deux sommets neufs sont voisins exactement quand ils sont sur
-        // une meme ANCIENNE coupe.
+        // the sides of the NEW FACE: two new vertices are neighbors exactly when they are on
+        // a same OLD cut.
         for ( int i = 0; i < nm; ++i )
             for ( int j = i + 1; j < nm; ++j )
                 if ( share_one_but( ncut[ i ], ncut[ j ], cut_id ) ) {
@@ -285,7 +285,7 @@ struct Cell3G {
                 }
         if ( na > MaxNe ) return CUT_OVERFLOW;
 
-        // ---- COMMIT. EN MONTANT : `map[ i ] <= i`, donc l'ecriture reste derriere la lecture.
+        // ---- COMMIT. GOING UP: `map[ i ] <= i`, so the write stays behind the read.
         for ( int i = 0; i < nb; ++i ) {
             const int m = map[ i ];
             if ( m < 0 ) continue;
@@ -302,7 +302,7 @@ struct Cell3G {
         return CUT_DONE;
     }
 
-    /// LA MESURE PAR LES ARETES : la formulation sans faces de l'entete.
+    /// THE MEASURE BY EDGES: the face-free formulation of the header.
     __device__ TF measure_edges( const TF *px, const TF *py, const TF *pz, const TF *pw,
                                  long long base, TF x0, TF y0, TF z0, TF w0 ) const {
         if ( nb == 0 ) return 0;
@@ -318,8 +318,8 @@ struct Cell3G {
             TF n0x, n0y, n0z, o0, n1x, n1y, n1z, o1;
             plane3( c0, px, py, pz, pw, base, x0, y0, z0, w0, n0x, n0y, n0z, o0 );
             plane3( c1, px, py, pz, pw, base, x0, y0, z0, w0, n1x, n1y, n1z, o1 );
-            // le pied de la perpendiculaire ISSUE DE g : le point du plan le plus proche du centre
-            // de la cellule, donc celui qui conditionne le mieux le produit scalaire final.
+            // the foot of the perpendicular DROPPED FROM g: the point of the plane closest to the center
+            // of the cell, hence the one that best conditions the final dot product.
             const TF k0 = ( o0 - ( n0x * gx + n0y * gy + n0z * gz ) )
                         / ( n0x * n0x + n0y * n0y + n0z * n0z );
             const TF k1 = ( o1 - ( n1x * gx + n1y * gy + n1z * gz ) )
@@ -335,9 +335,9 @@ struct Cell3G {
         return vol * TF( 1.0 / 6.0 );
     }
 
-    /// LA MESURE PAR LES FACES : le portage fidele de `gather_faces`, gardee pour la comparaison.
-    /// La table est ramenee de 256 a 64 cases -- `MaxNf` vaut 34, et 1 Ko de memoire locale a
-    /// remettre a -1 par cellule ne se paie pas de la meme facon ici que sur pile L1.
+    /// THE MEASURE BY FACES: the faithful port of `gather_faces`, kept for the comparison.
+    /// The table is brought down from 256 to 64 slots -- `MaxNf` is 34, and 1 KB of local memory to
+    /// reset to -1 per cell is not paid for the same way here as on an L1 stack.
     __device__ TF measure_faces() const {
         if ( nb == 0 ) return 0;
         constexpr unsigned HT = 64;
@@ -411,12 +411,12 @@ __global__ void k3_thread( long long n, const long long *off,
     atomicAdd( ovf + 1, nu );
 }
 
-// ================================================================== 3D, une cellule par WARP
+// ================================================================== 3D, one cell per WARP
 
-/// CE QUI EST EN SHARED, et rien de plus. Tout ce qui peut vivre en registres y vit : les
-/// temporaires de `cut` (les nouveaux sommets, les aretes de sortie) sont repartis sur les voies,
-/// une poignee par voie, et ne coutent pas un octet de shared. C'est ce qui fait passer la cellule
-/// de ~6 Ko a ~2.9 Ko, donc l'occupation de 10 a 22 warps par SM.
+/// WHAT IS IN SHARED, and nothing more. Everything that can live in registers does: the
+/// temporaries of `cut` (the new vertices, the outgoing edges) are spread over the lanes,
+/// a handful per lane, and do not cost a byte of shared. This is what brings the cell
+/// from ~6 KB down to ~2.9 KB, hence the occupancy from 10 to 22 warps per SM.
 template<class TF, int MaxNv>
 struct WCell {
     static constexpr int MaxNe = 3 * MaxNv / 2 + 2;
@@ -431,8 +431,8 @@ template<class TF, int MaxNv>
 __device__ int warp_cut( WCell<TF, MaxNv> &C, int &nb, int &ne,
                          TF dx, TF dy, TF dz, TF off, int cut_id ) {
     constexpr int MaxNe = WCell<TF, MaxNv>::MaxNe;
-    constexpr int RV = ( MaxNv + 31 ) / 32;             // tours sur les sommets
-    constexpr int RE = ( MaxNe + 31 ) / 32;             // tours sur les aretes
+    constexpr int RV = ( MaxNv + 31 ) / 32;             // rounds over the vertices
+    constexpr int RE = ( MaxNe + 31 ) / 32;             // rounds over the edges
     const int lane = threadIdx.x & 31;
     const unsigned full = 0xffffffffu, lt = ( 1u << lane ) - 1u;
 
@@ -447,8 +447,8 @@ __device__ int warp_cut( WCell<TF, MaxNv> &C, int &nb, int &ne,
     if ( nb_out == 0 ) return CUT_UNCHANGED;
     if ( nb_out == nb ) { nb = 0; ne = 0; return CUT_EMPTY; }
 
-    // ---- `map`, prefixe exclusif des sommets GARDES. `nn` reste identique sur les 32 voies : les
-    // `__ballot` sont uniformes, donc les `__popc` aussi.
+    // ---- `map`, exclusive prefix of the KEPT vertices. `nn` stays identical on the 32 lanes: the
+    // `__ballot`s are uniform, so are the `__popc`s.
     int nn = 0;
     for ( int base = 0; base < nb; base += 32 ) {
         const int i = base + lane;
@@ -459,8 +459,8 @@ __device__ int warp_cut( WCell<TF, MaxNv> &C, int &nb, int &ne,
     }
     __syncwarp();
 
-    // ---- les aretes, LUES EN REGISTRES avant que quoi que ce soit ne bouge. C'est ce qui permet
-    // d'ecrire `ea/eb` en place plus bas sans qu'une voie n'ecrase ce qu'une autre n'a pas lu.
+    // ---- the edges, READ INTO REGISTERS before anything moves. This is what allows
+    // writing `ea/eb` in place below without one lane overwriting what another has not read.
     int ra[ RE ], rb[ RE ], rw[ RE ], rf[ RE ], rc0[ RE ], rc1[ RE ];
     TF rx[ RE ], ry[ RE ], rz[ RE ];
     int nm = 0;
@@ -484,10 +484,10 @@ __device__ int warp_cut( WCell<TF, MaxNv> &C, int &nb, int &ne,
             rf[ r ] = in; rw[ r ] = idx;
         }
     }
-    if ( nn + nm > MaxNv ) return CUT_OVERFLOW;         // uniforme : la cellule reste intacte
+    if ( nn + nm > MaxNv ) return CUT_OVERFLOW;         // uniform: the cell stays intact
     __syncwarp();
 
-    // ---- COMPACTION. Meme precaution : on lit tout, on se synchronise, puis on ecrit.
+    // ---- COMPACTION. Same precaution: we read everything, synchronize, then write.
     TF cx[ RV ], cy[ RV ], cz[ RV ];
     int c0_[ RV ], c1_[ RV ], c2_[ RV ], cm[ RV ];
     for ( int r = 0; r < RV; ++r ) {
@@ -506,7 +506,7 @@ __device__ int warp_cut( WCell<TF, MaxNv> &C, int &nb, int &ne,
             C.vx[ m ] = cx[ r ]; C.vy[ m ] = cy[ r ]; C.vz[ m ] = cz[ r ];
             C.vc[ m ][ 0 ] = c0_[ r ]; C.vc[ m ][ 1 ] = c1_[ r ]; C.vc[ m ][ 2 ] = c2_[ r ];
         }
-    // les sommets NEUFS vont en `>= nn`, la compaction en `< nn` : les deux ne se croisent pas.
+    // the NEW vertices go to `>= nn`, the compaction to `< nn`: the two do not cross.
     for ( int r = 0; r < RE; ++r )
         if ( rw[ r ] >= 0 ) {
             const int k = nn + rw[ r ];
@@ -517,7 +517,7 @@ __device__ int warp_cut( WCell<TF, MaxNv> &C, int &nb, int &ne,
         }
     __syncwarp();
 
-    // ---- LES ARETES DE SORTIE. `map` n'a pas ete touche, et `ea/eb` a ete lu en entier.
+    // ---- THE OUTGOING EDGES. `map` has not been touched, and `ea/eb` has been read in full.
     int na = 0;
     for ( int r = 0; r < RE; ++r ) {
         const int e = r * 32 + lane;
@@ -533,8 +533,8 @@ __device__ int warp_cut( WCell<TF, MaxNv> &C, int &nb, int &ne,
         if ( push && idx < MaxNe ) { C.ea[ idx ] = A; C.eb[ idx ] = B; }
     }
     __syncwarp();
-    // les cotes de la FACE NEUVE. La boucle externe est uniforme (`nm` l'est), donc les `__ballot`
-    // internes voient bien les 32 voies.
+    // the sides of the NEW FACE. The outer loop is uniform (`nm` is), so the inner `__ballot`s
+    // do see all 32 lanes.
     for ( int i = 0; i < nm; ++i )
         for ( int jb = i + 1; jb < nm; jb += 32 ) {
             const int j = jb + lane;
@@ -545,7 +545,7 @@ __device__ int warp_cut( WCell<TF, MaxNv> &C, int &nb, int &ne,
             if ( push && idx < MaxNe ) { C.ea[ idx ] = nn + i; C.eb[ idx ] = nn + j; }
         }
     __syncwarp();
-    if ( na > MaxNe ) return CUT_OVERFLOW;              // impossible si les sommets tiennent (Euler)
+    if ( na > MaxNe ) return CUT_OVERFLOW;              // impossible if the vertices fit (Euler)
     nb = nn + nm; ne = na;
     return CUT_DONE;
 }
@@ -597,7 +597,7 @@ __global__ void k3_warp( long long n, const long long *off,
     WCell<TF, MaxNv> &C = cells[ w ];
 
     const TF x0 = mx[ i ], y0 = my[ i ], z0 = mz[ i ], w0 = mw[ i ];
-    // le cube, ecrit par les voies concernees. Douze aretes, huit sommets : une seule passe.
+    // the cube, written by the lanes concerned. Twelve edges, eight vertices: a single pass.
     if ( lane < 8 ) {
         const int lo = lane, ix = lo & 1, iy = ( lo >> 1 ) & 1, iz = ( lo >> 2 ) & 1;
         C.vx[ lo ] = ix ? TF( 1 ) - x0 : -x0;
@@ -628,11 +628,11 @@ __global__ void k3_warp( long long n, const long long *off,
     if ( lane == 0 ) { out[ i ] = v; if ( bad ) atomicAdd( ovf, 1 ); }
 }
 
-// ================================================================== 2D, une cellule par THREAD
+// ================================================================== 2D, one cell per THREAD
 
-/// Le portage direct de `pd::CellSoAT`. Pas de version warp : une cellule 2D a six sommets en
-/// moyenne, un warp de 32 voies en gacherait cinq sur six. Le bon grain y serait un QUART de warp,
-/// et ce n'est pas ce qu'on cherche a savoir ici.
+/// The direct port of `pd::CellSoAT`. No warp version: a 2D cell has six vertices on
+/// average, a 32-lane warp would waste five out of six. The right grain there would be a QUARTER warp,
+/// and that is not what we are trying to find out here.
 template<class TF, int MaxNv>
 struct Cell2G {
     int nb;
@@ -652,10 +652,10 @@ struct Cell2G {
         for ( int i = 0; i < 4; ++i ) { cdx[ i ] = dx[ i ]; cdy[ i ] = dy[ i ]; co[ i ] = of[ i ]; cid[ i ] = -1; }
     }
 
-    /// `nrun` rend le nombre de PLAGES exterieures. Tout le reste du code suppose qu'il vaut UN --
-    /// l'exterieur d'un convexe coupe par un demi-espace est d'un seul tenant -- et c'est cette
-    /// hypothese-la qui decide du sens des decalages. Si un signe est faux, la plage se casse en
-    /// deux et la cellule est reecrite n'importe comment : ce compteur dit si c'est ce qui arrive.
+    /// `nrun` returns the number of outer RUNS. All the rest of the code assumes it is ONE --
+    /// the outside of a convex set cut by a half-space is in one piece -- and it is that
+    /// hypothesis that decides the direction of the shifts. If a sign is wrong, the run breaks into
+    /// two and the cell is rewritten any which way: this counter says whether that is what happens.
     __device__ int cut( TF dx, TF dy, TF off, int cut_id, int &nrun ) {
         TF s[ MaxNv ];
         for ( int i = 0; i < nb; ++i ) s[ i ] = dx * vx[ i ] + dy * vy[ i ] - off;
@@ -714,11 +714,11 @@ struct Cell2G {
         return TF( 0.5 ) * ( a < 0 ? -a : a );
     }
 
-    /// LE MEME LACET, accumule en FP64 sur des sommets restes en FP32. Il ne sert qu'a trancher une
-    /// question : quand le FP32 rate la geometrie, est-ce la COUPE qui a place les sommets de
-    /// travers, ou seulement le lacet qui s'annule ? Sur une cellule tres allongee les termes
-    /// `vx * vy` valent `L^2` pour une aire `L * w` -- l'annulation est en `L / w`, et c'est
-    /// exactement ce que ce chemin-ci enleve, sans rien changer aux sommets.
+    /// THE SAME SHOELACE, accumulated in FP64 over vertices that remain in FP32. It serves only to settle one
+    /// question: when FP32 misses the geometry, is it the CUT that placed the vertices
+    /// wrong, or only the shoelace that cancels? On a very elongated cell the terms
+    /// `vx * vy` are `L^2` for an area `L * w` -- the cancellation is `L / w`, and this is
+    /// exactly what this path removes, without changing the vertices.
     __device__ double measure_hi() const {
         double a = 0;
         for ( int i = 0, j = nb - 1; i < nb; j = i++ )
@@ -752,7 +752,7 @@ __global__ void k2_thread( long long n, const long long *off,
     atomicAdd( ovf + 1, broken );
 }
 
-// ------------------------------------------------------------------ le pilote
+// ------------------------------------------------------------------ the driver
 
 template<class TF>
 struct Dev {
@@ -763,8 +763,8 @@ struct Dev {
     int *ovf = nullptr;
 };
 
-/// De l'AoS du disque vers le SoA du GPU : `mx[i], my[i], ...` separes, parce que c'est ce que la
-/// coalescence demande -- 32 threads voisins lisent 32 flottants consecutifs.
+/// From the AoS on disk to the SoA on the GPU: separate `mx[i], my[i], ...`, because that is what
+/// coalescing asks for -- 32 neighboring threads read 32 consecutive floats.
 template<class TF>
 static void upload( const Csr &c, Dev<TF> &d, double &ms_h2d ) {
     const int dim = c.dim, k = dim + 1;
@@ -777,12 +777,12 @@ static void upload( const Csr &c, Dev<TF> &d, double &ms_h2d ) {
     };
     cudaEvent_t a, b; CK( cudaEventCreate( &a ) ); CK( cudaEventCreate( &b ) );
     CK( cudaEventRecord( a ) );
-    put( &d.mx, c.moi, n, 0 ); put( &d.my, c.moi, n, 1 );
-    if ( dim == 3 ) put( &d.mz, c.moi, n, 2 );
-    put( &d.mw, c.moi, n, dim );
-    put( &d.px, c.vois, nv, 0 ); put( &d.py, c.vois, nv, 1 );
-    if ( dim == 3 ) put( &d.pz, c.vois, nv, 2 );
-    put( &d.pw, c.vois, nv, dim );
+    put( &d.mx, c.own, n, 0 ); put( &d.my, c.own, n, 1 );
+    if ( dim == 3 ) put( &d.mz, c.own, n, 2 );
+    put( &d.mw, c.own, n, dim );
+    put( &d.px, c.nbrs, nv, 0 ); put( &d.py, c.nbrs, nv, 1 );
+    if ( dim == 3 ) put( &d.pz, c.nbrs, nv, 2 );
+    put( &d.pw, c.nbrs, nv, dim );
     CK( cudaMalloc( &d.off, ( n + 1 ) * sizeof( long long ) ) );
     CK( cudaMemcpy( d.off, c.off.data(), ( n + 1 ) * sizeof( long long ), cudaMemcpyHostToDevice ) );
     CK( cudaMalloc( &d.out, n * sizeof( TF ) ) );
@@ -835,7 +835,7 @@ static void run( const Csr &c, const Opt &o ) {
         }
     };
 
-    launch();                                           // chauffe : JIT, caches, horloges
+    launch();                                            // warm-up: JIT, hidden, clocks
     CK( cudaDeviceSynchronize() );
     CK( cudaGetLastError() );
 
@@ -857,11 +857,11 @@ static void run( const Csr &c, const Opt &o ) {
     CK( cudaMemcpy( ovf2, d.ovf, 2 * sizeof( int ), cudaMemcpyDeviceToHost ) );
     const int ovf = ovf2[ 0 ], broken = ovf2[ 1 ];
 
-    // LE JUGE : la somme ne suffit pas, on veut le pire ecart RELATIF cellule par cellule.
-    double somme = 0, emax = 0;
+    // THE JUDGE: the sum is not enough, we want the worst RELATIVE deviation cell by cell.
+    double sum = 0, emax = 0;
     long long iworst = -1, n6 = 0, n3 = 0;
     for ( long long i = 0; i < n; ++i ) {
-        somme += double( out[ i ] );
+        sum += double( out[ i ] );
         const double r = c.ref[ i ];
         if ( r > 0 ) {
             const double e = std::fabs( double( out[ i ] ) - r ) / r;
@@ -875,11 +875,11 @@ static void run( const Csr &c, const Opt &o ) {
     char occ[ 32 ];
     if ( warp ) std::snprintf( occ, sizeof occ, "wpb %-3d", o.wpb );
     else        std::snprintf( occ, sizeof occ, "tpb %-3d", o.tpb );
-    std::printf( "   %-6s %-3s %-5s maxnv %-3d %s : %8.3f ms  %8.1f ns/germe  %7.1f Mcell/s"
-                 "   somme %.9f  ecart max %.2e  >1e-6 %lld  >1e-3 %lld  debord %d   [H2D %.1f ms]\n",
+    std::printf( " %-6s %-3s %-5s maxnv %-3d %s : %8.3f ms %8.1f ns/seed %7.1f Mcell/s"
+                 " sum %.9f max dev %.2e >1e-6 %lld >1e-3 %lld overflow %d [H2D %.1f ms]\n",
                  warp ? "warp" : "thread", o.prec.c_str(), o.measure.c_str(),
                  warp ? o.maxnv : 64, occ,
-                 best, ns, double( n ) / best / 1e3, somme, emax, n6, n3, ovf, ms_h2d );
+                 best, ns, double( n ) / best / 1e3, sum, emax, n6, n3, ovf, ms_h2d );
     ( void ) iworst; ( void ) broken;
 
     cudaFree( d.mx ); cudaFree( d.my ); cudaFree( d.mz ); cudaFree( d.mw );
@@ -905,13 +905,13 @@ int main( int argc, char **argv ) {
             return 0;
         } else o.file = s;
     }
-    if ( o.file.empty() ) { std::fprintf( stderr, "il faut un fichier --dump\n" ); return 1; }
+    if ( o.file.empty() ) { std::fprintf( stderr, "a --dump file is required\n" ); return 1; }
 
     Csr c;
     if ( ! read_csr( o.file.c_str(), c ) ) return 1;
     double refs = 0;
     for ( double v : c.ref ) refs += v;
-    std::printf( "%s   dim %d  n %lld  voisins %.2f   somme de reference %.9f\n",
+    std::printf( "%s dim %d n %lld neighbors %.2f reference sum %.9f\n",
                  o.file.c_str(), c.dim, c.n, double( c.nv ) / double( c.n ), refs );
 
     if ( o.prec == "f64" ) run<double>( c, o );

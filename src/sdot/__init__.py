@@ -10,8 +10,8 @@ _compilation.register_include_root( _here / "_include" if ( _here / "_include" )
 # the catalogue of precompiled kernels, when there is one: a wheel's `sdot/_catalogue`, built with
 # these very headers -- or, for a checkout, the directory `SDOT_CATALOGUE_DIR` names EXPLICITLY (a
 # checkout's headers move, a catalogue registered by default would silently serve stale binaries)
-# les solveurs lineaires du transport (`sdot/sdotplan/Lineaire.cpp`) : Eigen et AMGCL, en-tetes seuls,
-# que loom telecharge une fois dans son cache au premier noyau compile (`loom/compilation/externals.py`)
+# the transport's linear solvers (`sdot/sdotplan/Linear.cpp`): Eigen and AMGCL, header-only,
+# which loom downloads once into its cache at the first compiled kernel (`loom/compilation/externals.py`)
 _compilation.register_external( "eigen", "3.4.0", "https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz",
                                 "8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72" )
 _compilation.register_external( "amgcl", "1.4.4", "https://github.com/ddemidov/amgcl/archive/refs/tags/1.4.4.tar.gz",
@@ -28,8 +28,8 @@ from .Cell_N import Cell_N as Cell_N
 from .CellScratch import CellScratch as CellScratch
 from .Cell import set_kernel_dtype as set_kernel_dtype
 from .Cell import kernel_dtype as kernel_dtype
-# LE TRANSPORT : un probleme se POSE ( `OtProblem` ), puis on lui demande une solution -- directe
-# en 1D ( `SdotPlan1d` ), iterative au-dela ( `SdotPlanNd` ). Voir la docstring d'`OtProblem`.
+# THE TRANSPORT: a problem is POSED ( `OtProblem` ), then asked for a solution -- direct
+# in 1D ( `SdotPlan1d` ), iterative beyond ( `SdotPlanNd` ). See the docstring of `OtProblem`.
 from .OtProblem import OtProblem as OtProblem
 from .OtProblem import Direct as Direct
 from .OtProblem import Iterative as Iterative
@@ -54,15 +54,15 @@ from .viz.Visualizer import Visualizer as Visualizer
 from .viz.convergence import write_convergence_html as write_convergence_html
 
 
-# les anciens noms, le temps que les appelants passent a `OtProblem` ( voir
-# `notes/2026-10-02-sdotplan.md` : `OtPlan1d` ne disait pas qu'il etait semi-discret, et `OtPlan` ne
-# disait ni sa dimension ni son regime )
+# the old names, until callers move to `OtProblem` ( see
+# `notes/2026-10-02-sdotplan.md`: `OtPlan1d` did not say it was semi-discrete, and `OtPlan` said
+# neither its dimension nor its regime )
 def __getattr__( name ):
     import warnings
     deprecated = { "OtPlan": "SdotPlanNd", "OtPlan1d": "SdotPlan1d" }
     if name in deprecated:
-        warnings.warn( f"sdot.{ name } est deprecie : c'est `sdot.{ deprecated[ name ] }`, et on "
-                       "l'obtient par `OtProblem( source, target ).solve( ... )`.",
+        warnings.warn( f"sdot.{ name } is deprecated: use `sdot.{ deprecated[ name ] }`, which "
+                       "is obtained through `OtProblem( source, target ).solve( ... )`.",
                        DeprecationWarning, stacklevel = 2 )
         return globals()[ deprecated[ name ] ]
     raise AttributeError( f"module { __name__ !r } has no attribute { name !r}" )

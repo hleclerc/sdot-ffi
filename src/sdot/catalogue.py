@@ -1,16 +1,16 @@
-"""Ce qui PROVOQUE les compilations du catalogue : l'usage standard de sdot, exercé une fois.
+"""What TRIGGERS the catalogue's compilations: the standard usage of sdot, exercised once.
 
     SDOT_CATALOGUE_RECORD=dir python -m sdot.catalogue [--device cpu|cuda]
 
-Chaque appel ci-dessous passe par `compile_and_register`, qui dépose le source généré dans `dir`
-(voir `loom.compilation.catalogue`) ; `scripts/build_catalogue.py` compile ensuite ce relevé par
-variante. Un noyau qui n'est pas provoqué ici n'est pas dans le catalogue -- il se compilera sur
-la machine de l'utilisateur (mode `auto`), ou manquera (`SDOT_KERNELS=catalogue`). La liste est
-donc une DÉCISION : ce qu'un usage standard fait, en 2D et 3D, en Voronoi et en Laguerre, avec
-les deux flottants du noyau, la densité uniforme et une image, ses dérivées.
+Each call below goes through `compile_and_register`, which drops the generated source into `dir`
+(see `loom.compilation.catalogue`); `scripts/build_catalogue.py` then compiles this record per
+variant. A kernel that is not triggered here is not in the catalogue -- it will be compiled on
+the user's machine (`auto` mode), or will be missing (`SDOT_KERNELS=catalogue`). The list is
+therefore a DECISION: what a standard usage does, in 2D and 3D, in Voronoi and Laguerre, with
+both kernel floats, the uniform density and an image, and their derivatives.
 
-Petit et rapide (quelques secondes hors compilation) : ce sont les SOURCES qui comptent, pas les
-tailles.
+Small and fast (a few seconds excluding compilation): it is the SOURCES that matter, not the
+sizes.
 """
 import argparse
 
@@ -37,11 +37,11 @@ def provoke( device = None ):
                     pd.moments
                     pd.hessian_rows()
                     pd.cells
-                    # les dérivées des mesures : par rapport aux positions, puis aux poids
+                    # derivatives of the measures: with respect to the positions, then the weights
                     _vjp( lambda p: PowerDiagram( p, weights = weights, boundaries = box, accelerator = acc, kernel_dtype = kernel ).measures, pos )
                     if weights is not None:
                         _vjp( lambda q: PowerDiagram( pos, weights = q, boundaries = box, accelerator = acc, kernel_dtype = kernel ).measures, w )
-        # une densité image, et une somme de gaussiennes
+        # an image density, and a sum of Gaussians
         img = Image( values = rng.uniform( 0.5, 1.5, size = ( 16, ) * d ) )
         pd = PowerDiagram( pos * 16, boundaries = box_half_spaces( [ 0 ] * d, [ 16 ] * d ), distribution = img )
         np.asarray( pd.measures.value )
@@ -52,8 +52,8 @@ def provoke( device = None ):
             np.asarray( pd.measures.value )
             _vjp( lambda p: PowerDiagram( p, boundaries = box, distribution = sog ).measures, pos )
 
-    # LE TRANSPORT ( `OtProblem.solve` ) : un noyau par ( dimension, stockage, densité ) -- sur CPU seulement,
-    # le solveur y vit ( `sdot/sdotplan/` ) ; une image et des gaussiennes en 2D, une image en 3D
+    # THE TRANSPORT ( `OtProblem.solve` ): one kernel per ( dimension, storage, density ) -- on CPU only,
+    # where the solver lives ( `sdot/sdotplan/` ); an image and Gaussians in 2D, an image in 3D
     from sdot import Iterative, OtProblem, SumOfDiracs, Tuning
     if driver.device.is_cpu:
         for d in ( 2, 3 ):
@@ -66,7 +66,7 @@ def provoke( device = None ):
                 sog = SumOfGaussians( positions = pos[ :4 ], sigmas = [ 0.1 ] * 4, weights = [ 1.0 ] * 4 )
                 OtProblem( SumOfDiracs( pos ), sog ).solve( Iterative( max_iter = 20 ) )
 
-    # la cellule seule, ce que `Cell` expose
+    # the cell alone, what `Cell` exposes
     for d in ( 2, 3 ):
         c = Cell.make_hypercube( d, [ 0 ] * d, np.eye( d ).tolist() )
         c.cut( [ 1.0 ] * d, 1.0 )
@@ -74,7 +74,7 @@ def provoke( device = None ):
 
 
 def _vjp( f, x ):
-    """Une passe arrière, pour provoquer le noyau `bwd` de `f` (même chemin que `check_grad`)."""
+    """A backward pass, to trigger the `bwd` kernel of `f` (same path as `check_grad`)."""
     from loom import driver
     probe = f( x )
     dense_shape = tuple( probe.shape )
@@ -88,7 +88,7 @@ def main( argv = None ):
     p.add_argument( "--device", default = None )
     a = p.parse_args( argv )
     provoke( a.device )
-    print( "catalogue: provoqué" )
+    print( "catalogue: triggered" )
 
 
 if __name__ == "__main__":

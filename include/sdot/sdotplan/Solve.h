@@ -1,78 +1,78 @@
 #pragma once
 
 // =====================================================================================
-// L'ENTREE DU SOLVEUR ( ce que `SdotPlanNd.py` appelle, en UN `driver.call` ) : le point de depart, la
-// continuation en largeur s'il en faut une, Newton a chaque etape, et ce qui en sort.
+// THE SOLVER'S ENTRY POINT ( what `SdotPlanNd.py` calls, in ONE `driver.call` ): the starting point, the
+// width continuation if one is needed, Newton at each step, and what comes out.
 //
-// = Le point de depart
+// = The starting point
 //
-// Newton ( KMT ) demande un depart ADMISSIBLE : aucune cellule vide. On part des poids donnes
-// ( `w0` : les poids d'un ajustement voisin, ce dont vit une reconstruction ) ou de zero -- le
-// Voronoi, dont aucune cellule n'est vide tant que chaque germe est dans le domaine. Un depart
-// chaud qui VIDE une cellule ( des poids herites d'autres positions ) est pire que le Voronoi : la
-// theorie part d'un plancher strictement positif, et une cellule vide y revient en rampant ( son
-// gradient est constant, sa ligne de hessienne nulle ). On repart alors de zero si c'est mieux.
-// ( essaye, et rejete, deux facons de faire mieux que le Voronoi : ne « ranimer » que les cellules
-// vides, et un depart multi-echelle -- les deux cascadent, voir `solvers_des_familles` README § 8. )
+// Newton ( KMT ) requires an ADMISSIBLE start: no empty cell. We start from the given weights
+// ( `w0`: the weights of a neighboring fit, which a reconstruction lives on ) or from zero -- the
+// Voronoi, none of whose cells is empty as long as every seed is in the domain. A warm start
+// that EMPTIES a cell ( weights inherited from other positions ) is worse than the Voronoi: the
+// theory starts from a strictly positive floor, and an empty cell crawls back to it ( its
+// gradient is constant, its hessian row zero ). We then restart from zero if that is better.
+// ( two ways of doing better than the Voronoi were tried, and rejected: only "reviving" the empty
+// cells, and a multiscale start -- both cascade, see `solvers_des_familles` README § 8. )
 //
-// Et le Voronoi lui-meme peut laisser des cellules vides ( des germes HORS du domaine ) : alors les
-// poids d'une SIMILITUDE qui ramene le nuage dans le domaine -- le Voronoi du nuage translate et
-// contracte s'ecrit comme un diagramme de puissance du nuage d'origine, `w_i = |p_i|^2 - |a p_i +
-// b|^2 / a`, et ses cellules sont toutes nourries.
+// And the Voronoi itself can leave empty cells ( seeds OUTSIDE the domain ): then the
+// weights of a SIMILITUDE that brings the cloud back into the domain -- the Voronoi of the translated and
+// contracted cloud is written as a power diagram of the original cloud, `w_i = |p_i|^2 - |a p_i +
+// b|^2 / a`, and its cells are all fed.
 //
-// = La continuation en largeur ( `Continuation.h` )
+// = The width continuation ( `Continuation.h` )
 //
-// Reste le cas ou des cellules n'ont pas de masse parce que la DENSITE n'en a pas la ou elles sont
-// ( des bosses etroites, des deserts ) : ni un depart geometrique ni l'amortissement n'y peuvent
-// rien, et Newton direct stagne ( README § 9.1 ). On resout alors d'abord pour la densite convolee
-// par une gaussienne large ( positive partout ), puis de plus en plus etroite, chaque etape partant
-// des poids de la precedente. `AUTO` la declenche quand le meilleur depart laisse encore une
-// cellule sous `seuil_continuation` fois la plus petite masse cible.
+// There remains the case where cells have no mass because the DENSITY has none where they are
+// ( narrow bumps, deserts ): neither a geometric start nor the damping can do anything about it,
+// and direct Newton stagnates ( README § 9.1 ). We then first solve for the density convolved
+// by a wide gaussian ( positive everywhere ), then narrower and narrower, each step starting from
+// the weights of the previous one. `AUTO` triggers it when the best start still leaves a
+// cell under `continuation_threshold` times the smallest target mass.
 //
-// = La masse cible
+// = The target mass
 //
-// Les cellules PARTITIONNENT le domaine : leurs masses somment a la masse de la densite dans le
-// domaine, quels que soient les poids. Une densite que le domaine tronque ( des gaussiennes dans
-// une boite ) n'y pese pas 1 : les masses cibles `nu` sont remises a cette echelle, a chaque etape,
-// sans quoi le residu ne peut jamais s'annuler. Ce qui sort est le transport vers la densite
-// RESTREINTE au domaine, normalisee -- ce qu'on veut dire quand on donne un domaine.
+// The cells PARTITION the domain: their masses sum to the mass of the density in the
+// domain, whatever the weights. A density that the domain truncates ( gaussians in
+// a box ) does not weigh 1 there: the target masses `nu` are rescaled to it, at each step,
+// without which the residual can never vanish. What comes out is the transport towards the density
+// RESTRICTED to the domain, normalized -- which is what is meant when a domain is given.
 // =====================================================================================
 
 #include "Continuation.h"
-#include "Limites.h"
+#include "Bounds.h"
 #include "Newton.h"
 
 namespace sdot {
 namespace sdotplan {
 
-/// ce que l'appelant lit dans `stats( . )` -- meme liste cote python ( `SdotPlanNd._STATS` )
+/// what the caller reads in `stats( . )` -- same list on the python side ( `SdotPlanNd._STATS` )
 enum Stat : int {
-    FIN = 0, RESTE, RESTE0, NB_ITER, NB_DIAG, NB_RECUL, T_MAJ, T_DIAG, T_ASM, T_LIN, T_LIM, EPS,
-    MASSE_DOMAINE, NB_DEBORDE, NB_CELL_LIM, NB_TOURS_ESSAI, LIN_NB_HIER, LIN_NB_ITER, LIN_PIRE, DEPART, T_TOTAL,
-    NB_ETAPES, MIN_MASSE_DEPART,
+    STATUS = 0, RESIDUAL, RESIDUAL0, NB_ITER, NB_DIAG, NB_BACKTRACKS, T_MAJORANT, T_DIAG, T_ASM, T_LIN, T_LIM, EPS,
+    DOMAIN_MASS, NB_OVERFLOWED, NB_CELL_LIM, NB_LIMIT_ROUNDS, LIN_NB_HIERARCHIES, LIN_NB_ITER, LIN_WORST, START, T_TOTAL,
+    NB_CONTINUATION_STEPS, MIN_START_MASS,
     NB_STATS
 };
-enum Depart : int { DEPART_DONNE = 0, DEPART_VORONOI = 1, DEPART_SIMILITUDE = 2 };
+enum Start : int { START_GIVEN = 0, START_VORONOI = 1, START_SIMILARITY = 2 };
 
-/// ce que chaque ligne de l'historique porte -- meme liste cote python ( `SdotPlanNd._HISTORY` )
-enum Hist : int { H_STEP = 0, H_T, H_RESIDU_L2, H_MIN_MASSE, H_MAX_RESIDU, H_NB_DIAG, H_NB_EVALS, H_S, NB_HIST };
+/// what each row of the history carries -- same list on the python side ( `SdotPlanNd._HISTORY` )
+enum Hist : int { H_STEP = 0, H_T, H_RESIDUAL_L2, H_MIN_MASS, H_MAX_RESIDUAL, H_NB_DIAG, H_NB_EVALS, H_S, NB_HIST };
 
-struct OptionsSolveur {
+struct SolverOptions {
     NewtonOptions newton;
     Lin    lin = Lin::AUTO;
-    SI     cap0 = 64;                ///< sommets par cellule locale, au depart
-    enum Continuation : int { JAMAIS = 0, AUTO = 1, TOUJOURS = 2 };
+    SI     cap0 = 64;                ///< vertices per local cell, at the start
+    enum Continuation : int { NEVER = 0, AUTO = 1, ALWAYS = 2 };
     int    continuation = AUTO;
-    double seuil_continuation = 1e-2; ///< AUTO : une cellule sous ce facteur de la plus petite cible la declenche
-    double conv_s0 = 0;              ///< la premiere largeur ( 0 : la moitie du diametre du domaine )
+    double continuation_threshold = 1e-2; ///< AUTO: a cell under this factor of the smallest target triggers it
+    double conv_s0 = 0;              ///< the first width ( 0: half the diameter of the domain )
     double conv_ratio = 1.4142135623730951;
-    double conv_min = 0;             ///< la derniere largeur avant 0 ( 0 : l'echelle de la distribution )
+    double conv_min = 0;             ///< the last width before 0 ( 0: the scale of the distribution )
 };
 
-/// les poids du Voronoi d'une SIMILITUDE du nuage qui le loge dans le pave `[ lo, hi ]` : la boite
-/// du nuage est contractee ( jamais dilatee ) et translatee dans le pave reduit d'une marge
+/// the weights of the Voronoi of a SIMILITUDE of the cloud that fits it in the box `[ lo, hi ]`: the box
+/// of the cloud is contracted ( never dilated ) and translated into the box reduced by a margin
 template<int D>
-void similitude( const auto &pd, const double *lo, const double *hi, std::vector<double> &w, double marge = 0.1 ) {
+void similarity( const auto &pd, const double *lo, const double *hi, std::vector<double> &w, double margin = 0.1 ) {
     const SI n = pd.nb_seeds();
     double p_lo[ D ], p_hi[ D ];
     for ( int d = 0; d < D; ++d ) { p_lo[ d ] = 1e300; p_hi[ d ] = -1e300; }
@@ -82,12 +82,12 @@ void similitude( const auto &pd, const double *lo, const double *hi, std::vector
     }
     double a = 1;
     for ( int d = 0; d < D; ++d ) {
-        const double span_dom = ( hi[ d ] - lo[ d ] ) * ( 1 - 2 * marge );
+        const double span_dom = ( hi[ d ] - lo[ d ] ) * ( 1 - 2 * margin );
         const double span_pts = std::max( p_hi[ d ] - p_lo[ d ], 1e-300 );
         a = std::min( a, span_dom / span_pts );
     }
     double b[ D ];
-    for ( int d = 0; d < D; ++d )                        // le centre du nuage contracte sur le centre du domaine
+    for ( int d = 0; d < D; ++d )                        // the center of the contracted cloud on the center of the domain
         b[ d ] = ( lo[ d ] + hi[ d ] ) / 2 - a * ( p_lo[ d ] + p_hi[ d ] ) / 2;
     w.assign( n, 0.0 );
     for ( SI k = 0; k < n; ++k ) {
@@ -108,30 +108,30 @@ inline double minimum( const std::vector<double> &v ) {
     return m;
 }
 
-/// LE SOLVEUR. `pd` porte des poids et des majorants INSCRIPTIBLES ( `with_weights` ) ; `nu` et `w0`
-/// sont dans l'ordre utilisateur. `weights` ( ordre utilisateur ), `hist` ( `nb_steps`, `rows [ step,
-/// NB_HIST ]`, `weights [ step, n ]` facultatif ), `stats`, `masses [ n ]`, `bary [ n, D ]` et
-/// `cout` sont les sorties.
+/// THE SOLVER. `pd` carries WRITABLE weights and majorants ( `with_weights` ); `nu` and `w0`
+/// are in user order. `weights` ( user order ), `hist` ( `nb_steps`, `rows [ step,
+/// NB_HIST ]`, `weights [ step, n ]` optional ), `stats`, `masses [ n ]`, `bary [ n, D ]` and
+/// `cost` ( cost ) are the outputs.
 template<class TK>
-void resoudre( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom, const auto &dist, const auto &nu_in, const auto &w0_in,
-               const OptionsSolveur &o, auto &&weights, auto &&hist, auto &&stats, auto &&masses, auto &&bary, auto &&cout ) {
+void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom, const auto &dist, const auto &nu_in, const auto &w0_in,
+               const SolverOptions &o, auto &&weights, auto &&hist, auto &&stats, auto &&masses, auto &&bary, auto &&cost ) {
     using PD = DECAYED_TYPE_OF( pd );
     using Dist = DECAYED_TYPE_OF( dist );
     constexpr int D = PD::ct_dim;
     const SI n = pd.nb_seeds();
-    const double t_debut = now();
+    const double t_begin = now();
 
-    Convolee<Dist> conv( dist );
-    Balayage<PD,DECAYED_TYPE_OF( dom ),Dist,TK> bal( queue, pd, pd_in, dom, dist, o.cap0 );
-    auto lin = solveur_lineaire( o.lin, n, D );
+    Convolved<Dist> conv( dist );
+    Sweep<PD,DECAYED_TYPE_OF( dom ),Dist,TK> bal( queue, pd, pd_in, dom, dist, o.cap0 );
+    auto lin = linear_solver( o.lin, n, D );
     Newton<decltype( bal )> newton( bal, *lin, o.newton );
 
-    // ---- l'historique, une ligne par pas accepte
+    // ---- the history, one row per accepted step
     SI nb_steps = 0;
-    int nb_steps_avant = 0;                              // les pas des etapes precedentes
-    double s_courant = 0;
+    int nb_steps_before = 0;                              // the steps of the previous stages
+    double s_current = 0;
     const SI cap_steps = SI( hist.rows.shape( 0 ) );
-    newton.o.apres_pas = [&]( int it, double t, int nb_evals ) {
+    newton.o.after_step = [&]( int it, double t, int nb_evals ) {
         if ( nb_steps >= cap_steps ) return;
         const auto &A = newton.a;
         double mn = A.empty() ? 0 : A[ 0 ], mx = 0, l2 = 0;
@@ -140,37 +140,37 @@ void resoudre( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &d
             mx = std::max( mx, std::fabs( A[ i ] - newton.nu[ i ] ) );
             l2 += ( A[ i ] - newton.nu[ i ] ) * ( A[ i ] - newton.nu[ i ] );
         }
-        hist.rows( nb_steps, int( H_STEP ) ) = double( nb_steps_avant + it );
+        hist.rows( nb_steps, int( H_STEP ) ) = double( nb_steps_before + it );
         hist.rows( nb_steps, int( H_T ) ) = t;
-        hist.rows( nb_steps, int( H_RESIDU_L2 ) ) = std::sqrt( l2 );
-        hist.rows( nb_steps, int( H_MIN_MASSE ) ) = mn;
-        hist.rows( nb_steps, int( H_MAX_RESIDU ) ) = mx;
+        hist.rows( nb_steps, int( H_RESIDUAL_L2 ) ) = std::sqrt( l2 );
+        hist.rows( nb_steps, int( H_MIN_MASS ) ) = mn;
+        hist.rows( nb_steps, int( H_MAX_RESIDUAL ) ) = mx;
         hist.rows( nb_steps, int( H_NB_DIAG ) ) = double( bal.nb_diag );
         hist.rows( nb_steps, int( H_NB_EVALS ) ) = double( nb_evals );
-        hist.rows( nb_steps, int( H_S ) ) = s_courant;
-        if constexpr ( hist.weights.is_valid )
+        hist.rows( nb_steps, int( H_S ) ) = s_current;
+        if constexpr ( DECAYED_TYPE_OF( hist.weights )::is_valid )
             for ( SI i = 0; i < n; ++i )
                 hist.weights( nb_steps, i ) = newton.w[ i ];
         ++nb_steps;
     };
 
-    // ---- la cible, et le depart ( sur la densite la plus large si la continuation est imposee )
+    // ---- the target, and the start ( on the widest density if the continuation is forced )
     std::vector<double> nu( n ), w( n, 0.0 );
     for ( SI i = 0; i < n; ++i ) nu[ i ] = double( nu_in( i ) );
-    bool donne = false;
-    if constexpr ( w0_in.is_valid ) {
-        for ( SI i = 0; i < n; ++i ) { w[ i ] = double( w0_in( i ) ); donne |= w[ i ] != 0; }
+    bool given = false;
+    if constexpr ( DECAYED_TYPE_OF( w0_in )::is_valid ) {
+        for ( SI i = 0; i < n; ++i ) { w[ i ] = double( w0_in( i ) ); given |= w[ i ] != 0; }
     }
-    int depart = donne ? DEPART_DONNE : DEPART_VORONOI;
-    const double jauge = w[ 0 ];
-    for ( SI i = 0; i < n; ++i ) w[ i ] -= jauge;
+    int start = given ? START_GIVEN : START_VORONOI;
+    const double gauge = w[ 0 ];
+    for ( SI i = 0; i < n; ++i ) w[ i ] -= gauge;
 
-    // les etapes de la continuation : la liste des largeurs, `0` en dernier
+    // the stages of the continuation: the list of widths, `0` last
     double s0 = o.conv_s0;
-    if ( s0 <= 0 ) {                                     // la moitie du diametre du domaine, ou du nuage
+    if ( s0 <= 0 ) {                                     // half the diameter of the domain, or of the cloud
         double lo[ D ], hi[ D ];
         for ( int d = 0; d < D; ++d ) { lo[ d ] = 1e300; hi[ d ] = -1e300; }
-        if constexpr ( pd.box_min.is_valid ) {
+        if constexpr ( DECAYED_TYPE_OF( pd.box_min )::is_valid ) {
             for ( int d = 0; d < D; ++d ) { lo[ d ] = double( pd.box_min( d ) ); hi[ d ] = double( pd.box_max( d ) ); }
         } else {
             for ( SI k = 0; k < n; ++k ) {
@@ -182,98 +182,98 @@ void resoudre( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &d
         for ( int d = 0; d < D; ++d ) diam2 += ( hi[ d ] - lo[ d ] ) * ( hi[ d ] - lo[ d ] );
         s0 = 0.5 * std::sqrt( diam2 );
     }
-    const double s_min = o.conv_min > 0 ? o.conv_min : conv.echelle_min( s0 );
-    std::vector<double> liste = ( o.continuation == OptionsSolveur::TOUJOURS && Convolee<Dist>::possible ) ? etapes( s0, o.conv_ratio, s_min )
+    const double s_min = o.conv_min > 0 ? o.conv_min : conv.min_scale( s0 );
+    std::vector<double> scales = ( o.continuation == SolverOptions::ALWAYS && Convolved<Dist>::possible ) ? continuation_steps( s0, o.conv_ratio, s_min )
                                                                                                           : std::vector<double>{ 0.0 };
 
     std::vector<double> a;
-    std::vector<Facette> fa;
-    s_courant = liste[ 0 ];
-    bal.dist = &conv.at( s_courant );
-    newton.mesures_et_facettes( w, a, fa );
+    std::vector<Facet> fa;
+    s_current = scales[ 0 ];
+    bal.dist = &conv.at( s_current );
+    newton.measures_and_facets( w, a, fa );
     const double nu_min = minimum( nu );
-    if ( donne && minimum( a ) < 1e-3 * nu_min ) {       // un depart chaud qui vide une cellule : le Voronoi, s'il fait mieux
+    if ( given && minimum( a ) < 1e-3 * nu_min ) {       // a warm start that empties a cell: the Voronoi, if it does better
         std::vector<double> w0( n, 0.0 ), a0;
-        std::vector<Facette> fa0;
-        newton.mesures_et_facettes( w0, a0, fa0 );
-        if ( minimum( a0 ) > minimum( a ) ) { w.swap( w0 ); a.swap( a0 ); fa.swap( fa0 ); depart = DEPART_VORONOI; }
+        std::vector<Facet> fa0;
+        newton.measures_and_facets( w0, a0, fa0 );
+        if ( minimum( a0 ) > minimum( a ) ) { w.swap( w0 ); a.swap( a0 ); fa.swap( fa0 ); start = START_VORONOI; }
         else newton.bal.set_weights( w );
     }
-    if constexpr ( pd.box_min.is_valid ) {
-        if ( minimum( a ) <= 0 ) {                       // des germes hors du domaine : la similitude
+    if constexpr ( DECAYED_TYPE_OF( pd.box_min )::is_valid ) {
+        if ( minimum( a ) <= 0 ) {                       // seeds outside the domain: the similarity
             double lo[ D ], hi[ D ];
             for ( int d = 0; d < D; ++d ) { lo[ d ] = double( pd.box_min( d ) ); hi[ d ] = double( pd.box_max( d ) ); }
             std::vector<double> w1, a1;
-            std::vector<Facette> fa1;
-            similitude<D>( pd, lo, hi, w1 );
-            newton.mesures_et_facettes( w1, a1, fa1 );
-            if ( minimum( a1 ) > minimum( a ) ) { w.swap( w1 ); a.swap( a1 ); fa.swap( fa1 ); depart = DEPART_SIMILITUDE; }
+            std::vector<Facet> fa1;
+            similarity<D>( pd, lo, hi, w1 );
+            newton.measures_and_facets( w1, a1, fa1 );
+            if ( minimum( a1 ) > minimum( a ) ) { w.swap( w1 ); a.swap( a1 ); fa.swap( fa1 ); start = START_SIMILARITY; }
             else newton.bal.set_weights( w );
         }
     }
-    const double min_masse_depart = minimum( a );
-    // AUTO : la densite manque la ou sont des cellules -> la continuation, depuis le meme depart
-    if ( o.continuation == OptionsSolveur::AUTO && Convolee<Dist>::possible && liste.size() == 1
-      && ( min_masse_depart < o.seuil_continuation * nu_min ) ) {
-        liste = etapes( s0, o.conv_ratio, s_min );
-        s_courant = liste[ 0 ];
-        bal.dist = &conv.at( s_courant );
-        newton.mesures_et_facettes( w, a, fa );
+    const double min_start_mass = minimum( a );
+    // AUTO: the density is missing where cells are -> the continuation, from the same start
+    if ( o.continuation == SolverOptions::AUTO && Convolved<Dist>::possible && scales.size() == 1
+      && ( min_start_mass < o.continuation_threshold * nu_min ) ) {
+        scales = continuation_steps( s0, o.conv_ratio, s_min );
+        s_current = scales[ 0 ];
+        bal.dist = &conv.at( s_current );
+        newton.measures_and_facets( w, a, fa );
     }
 
-    // ---- les etapes
+    // ---- the stages
     NewtonStats total;
-    double masse_dom = 0;
-    for ( PI etape = 0; etape < liste.size(); ++etape ) {
-        s_courant = liste[ etape ];
-        if ( etape > 0 ) {                               // la densite suivante : les mesures du depart sont a refaire
-            bal.dist = &conv.at( s_courant );
-            newton.mesures_et_facettes( w, a, fa );
+    double domain_mass = 0;
+    for ( PI step = 0; step < scales.size(); ++step ) {
+        s_current = scales[ step ];
+        if ( step > 0 ) {                               // the next density: the measures of the start have to be redone
+            bal.dist = &conv.at( s_current );
+            newton.measures_and_facets( w, a, fa );
         }
-        // la masse cible, a l'echelle de ce que le domaine contient de CETTE densite
+        // the target mass, at the scale of what the domain contains of THIS density
         std::vector<double> nu_s = nu;
-        double masse_nu = 0;
-        masse_dom = 0;
-        for ( SI i = 0; i < n; ++i ) { masse_dom += a[ i ]; masse_nu += nu[ i ]; }
-        if ( masse_dom > 0 && masse_nu > 0 && masse_dom != masse_nu )
-            for ( SI i = 0; i < n; ++i ) nu_s[ i ] *= masse_dom / masse_nu;
+        double nu_mass = 0;
+        domain_mass = 0;
+        for ( SI i = 0; i < n; ++i ) { domain_mass += a[ i ]; nu_mass += nu[ i ]; }
+        if ( domain_mass > 0 && nu_mass > 0 && domain_mass != nu_mass )
+            for ( SI i = 0; i < n; ++i ) nu_s[ i ] *= domain_mass / nu_mass;
         newton.nu = nu_s;
         newton.a = a;
         newton.fa = fa;
         if ( o.newton.trace )
-            std::printf( "  etape %d / %d : s = %.4e, masse du domaine %.6f, plus petite masse %.3e\n",
-                         int( etape + 1 ), int( liste.size() ), s_courant, masse_dom, minimum( a ) );
+            std::printf( "  stage %d / %d : s = %.4e, domain mass %.6f, smallest mass %.3e\n",
+                         int( step + 1 ), int( scales.size() ), s_current, domain_mass, minimum( a ) );
 
-        // le pas par les limites ( 2D ) : la passe est branchee sur Newton quand elle est demandee
+        // the step by the limits ( 2D ): the pass is plugged into Newton when it is requested
         if constexpr ( D == 2 ) {
-            Limites2D<decltype( bal )> lim( bal );
-            LimitesLocales ll;
-            ll.alpha_min = [&]( const std::vector<double> &W, const std::vector<double> &Dd, const std::vector<SI> &mauvaises,
-                                double horizon, double eps, const Laplacien &L, SI &nb_cellules ) {
-                return lim.alpha_min( W, Dd, mauvaises, horizon, eps, L, nb_cellules );
+            Bounds2D<decltype( bal )> lim( bal );
+            LocalBounds ll;
+            ll.alpha_min = [&]( const std::vector<double> &W, const std::vector<double> &Dd, const std::vector<SI> &bad_cells,
+                                double horizon, double eps, const Laplacian &L, SI &nb_cells ) {
+                return lim.alpha_min( W, Dd, bad_cells, horizon, eps, L, nb_cells );
             };
-            if ( o.newton.pas == NewtonOptions::ESSAI_LIMITES )
-                newton.limites = &ll;
-            newton.resout( w, true );
-            newton.limites = nullptr;
+            if ( o.newton.step == NewtonOptions::LIMITS )
+                newton.bounds = &ll;
+            newton.solves( w, true );
+            newton.bounds = nullptr;
         } else
-            newton.resout( w, true );
+            newton.solves( w, true );
 
-        // ce que l'etape laisse : ses poids, ses mesures ( pour l'etape suivante ), ses compteurs
+        // what the stage leaves: its weights, its measures ( for the next stage ), its counters
         w = newton.w;
         a = newton.a;
         fa = newton.fa;
-        nb_steps_avant = nb_steps > 0 ? int( double( hist.rows( nb_steps - 1, int( H_STEP ) ) ) ) + 1 : 0;
+        nb_steps_before = nb_steps > 0 ? int( double( hist.rows( nb_steps - 1, int( H_STEP ) ) ) ) + 1 : 0;
         total.nb_iter += newton.st.nb_iter;
-        total.nb_recul += newton.st.nb_recul;
+        total.nb_backtracks += newton.st.nb_backtracks;
         total.nb_cell_lim += newton.st.nb_cell_lim;
-        total.nb_tours_essai += newton.st.nb_tours_essai;
+        total.nb_limit_rounds += newton.st.nb_limit_rounds;
         total.t_asm += newton.st.t_asm;
         total.t_lim += newton.st.t_lim;
-        if ( etape == 0 ) { total.reste0 = newton.st.reste0; total.eps = newton.st.eps; }
-        total.fin = newton.st.fin;
-        total.reste = newton.st.reste;
-        if ( newton.st.fin == NewtonStats::ECHEC_LINEAIRE )
+        if ( step == 0 ) { total.residual0 = newton.st.residual0; total.eps = newton.st.eps; }
+        total.status = newton.st.status;
+        total.residual = newton.st.residual;
+        if ( newton.st.status == NewtonStats::LINEAR_FAILURE )
             break;
         newton.st = NewtonStats{};
     }
@@ -282,18 +282,18 @@ void resoudre( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &d
     for ( SI i = 0; i < n; ++i )
         weights( i ) = w[ i ];
 
-    // le balayage des moments ci-dessous n'est pas une EVALUATION DU RESIDU : le compte de
-    // diagrammes que l'appelant lit doit rester celui de la descente, sinon deux versions du code
-    // ne se comparent plus
-    const int nb_diag_descente = bal.nb_diag;
+    // the moments sweep below is not a RESIDUAL EVALUATION: the diagram count
+    // the caller reads must remain that of the descent, otherwise two versions of the code
+    // can no longer be compared
+    const int nb_diag_descent = bal.nb_diag;
 
-    // ---- LES MOMENTS, sur la VRAIE densite et aux poids ajustes
-    // Un balayage de plus, et c'est tout ce que le cout de transport, les barycentres et les masses
-    // de cellule demandent : Python n'a plus a rebatir un diagramme pour les obtenir. Sur `conv.at(
-    // 0 )` explicitement -- un solve qui s'est arrete en cours de continuation laisserait sinon des
-    // moments d'une densite CONVOLEE, qui ne sont pas ceux qu'on a demandes.
-    // la MASSE d'une cellule est celle que Newton a mesuree -- pas celle du balayage des moments,
-    // qui quadrature la ou la mesure a une forme close ( voir `Balayage::moments` ).
+    // ---- THE MOMENTS, on the TRUE density and at the fitted weights
+    // One more sweep, and that is all that the transport cost, the barycenters and the cell
+    // masses require: Python no longer has to rebuild a diagram to get them. On `conv.at(
+    // 0 )` explicitly -- a solve that stopped midway through the continuation would otherwise leave
+    // moments of a CONVOLVED density, which are not the ones that were asked for.
+    // the MASS of a cell is the one Newton measured -- not that of the moments sweep,
+    // which uses quadrature where the measure has a closed form ( see `Sweep::moments` ).
     for ( SI i = 0; i < n; ++i )
         masses( i ) = a[ i ];
     {
@@ -305,33 +305,33 @@ void resoudre( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &d
         for ( SI i = 0; i < n; ++i )
             for ( int d = 0; d < D; ++d )
                 bary( i, d ) = bc[ size_t( i ) * D + d ];
-        cout = c;
+        cost = c;
     }
 
     auto put = [&]( int i, double v ) { stats( i ) = v; };
-    put( FIN, double( total.fin ) );
-    put( RESTE, total.reste );
-    put( RESTE0, total.reste0 );
+    put( STATUS, double( total.status ) );
+    put( RESIDUAL, total.residual );
+    put( RESIDUAL0, total.residual0 );
     put( NB_ITER, double( total.nb_iter ) );
-    put( NB_DIAG, double( nb_diag_descente ) );
-    put( NB_RECUL, double( total.nb_recul ) );
-    put( T_MAJ, bal.t_maj );
+    put( NB_DIAG, double( nb_diag_descent ) );
+    put( NB_BACKTRACKS, double( total.nb_backtracks ) );
+    put( T_MAJORANT, bal.t_majorant );
     put( T_DIAG, bal.t_diag );
     put( T_ASM, total.t_asm );
     put( T_LIN, lin->st.total() );
     put( T_LIM, total.t_lim );
     put( EPS, total.eps );
-    put( MASSE_DOMAINE, masse_dom );
-    put( NB_DEBORDE, double( bal.nb_deborde ) );
+    put( DOMAIN_MASS, domain_mass );
+    put( NB_OVERFLOWED, double( bal.nb_overflowed ) );
     put( NB_CELL_LIM, double( total.nb_cell_lim ) );
-    put( NB_TOURS_ESSAI, double( total.nb_tours_essai ) );
-    put( LIN_NB_HIER, double( lin->st.nb_hier ) );
+    put( NB_LIMIT_ROUNDS, double( total.nb_limit_rounds ) );
+    put( LIN_NB_HIERARCHIES, double( lin->st.nb_hierarchies ) );
     put( LIN_NB_ITER, double( lin->st.nb_iter ) );
-    put( LIN_PIRE, lin->st.pire );
-    put( DEPART, double( depart ) );
-    put( T_TOTAL, now() - t_debut );
-    put( NB_ETAPES, double( liste.size() ) );
-    put( MIN_MASSE_DEPART, min_masse_depart );
+    put( LIN_WORST, lin->st.worst );
+    put( START, double( start ) );
+    put( T_TOTAL, now() - t_begin );
+    put( NB_CONTINUATION_STEPS, double( scales.size() ) );
+    put( MIN_START_MASS, min_start_mass );
 }
 
 } // namespace sdotplan

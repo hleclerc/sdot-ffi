@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Valide le wheel `sdot` de bout en bout : build -> venv PROPRE -> install -> smoke test.
+"""Validates the `sdot` wheel end to end: build -> CLEAN venv -> install -> smoke test.
 
-  python scripts/validate_wheel.py                 # build le wheel puis le teste
-  python scripts/validate_wheel.py --wheel a.whl   # teste un wheel existant
-  python scripts/validate_wheel.py --keep          # garde le venv/cache pour autopsie
+  python scripts/validate_wheel.py                 # builds the wheel then tests it
+  python scripts/validate_wheel.py --wheel a.whl   # tests an existing wheel
+  python scripts/validate_wheel.py --keep          # keeps the venv/cache for a post-mortem
 
-Le but est de prouver que le wheel est self-contained : on l'installe dans un venv NEUF (pas de
-PYTHONPATH vers le repo, pas de `build/` local réutilisé) et on exécute make_hypercube(2D) +
-measure -- tout le cycle génération -> compilation (compilateur hôte) -> enregistrement (Jax FFI) -> exécution.
+The goal is to prove that the wheel is self-contained: we install it in a FRESH venv (no
+PYTHONPATH to the repo, no local `build/` reused) and we run make_hypercube(2D) +
+measure -- the whole cycle generation -> compilation (host compiler) -> registration (Jax FFI) -> execution.
 
-La preuve clé est que la compilation utilise les en-têtes C++ EMBARQUÉES DANS LES WHEELS
-(`.../site-packages/loom/_include`, `sdot/_include`), pas celles du checkout : `include_roots()`
-ne doit nommer que des chemins du venv, et le noyau doit compiler avec.
+The key proof is that the compilation uses the C++ headers SHIPPED IN THE WHEELS
+(`.../site-packages/loom/_include`, `sdot/_include`), not those of the checkout: `include_roots()`
+must only name paths of the venv, and the kernel must compile with them.
 
-Contrairement à `run_tests.py`, ce script n'insère JAMAIS `src/python` dans sys.path : ce serait
-justement l'erreur qui masquerait un wheel cassé en important `sdot` depuis le checkout.
+Unlike `run_tests.py`, this script NEVER inserts `src/python` into sys.path: that would be
+precisely the mistake that would mask a broken wheel by importing `sdot` from the checkout.
 """
 from pathlib import Path
 import subprocess
@@ -28,8 +28,8 @@ import os
 
 ROOT = Path( __file__ ).resolve().parents[ 1 ]
 
-# Reproduit tests/python/test_Cell.py :: test( "basic" ), plus une assertion chiffrée (le bloc
-# original ne fait qu'afficher, utile à l'oeil mais pas exploitable comme signal pass/fail).
+# Reproduces tests/python/test_Cell.py :: test( "basic" ), plus a numeric assertion (the original
+# block only prints, useful to the eye but not usable as a pass/fail signal).
 SMOKE = """
 import numpy as np
 from sdot import Cell
@@ -58,23 +58,23 @@ def _run( cmd, **kw ):
     return subprocess.run( [ str( c ) for c in cmd ], **kw )
 
 
-# OU VIT CHAQUE PAQUET, depuis que les quatre sont des depots separes : `sdot` EST ce depot, et
-# `loom` est pose a cote ( par la CI, ou par `scripts/bootstrap.sh` du plan de travail ).
+# WHERE EACH PACKAGE LIVES, now that the four are separate repositories: `sdot` IS this repository, and
+# `loom` is placed next to it ( by the CI, or by the work plan's `scripts/bootstrap.sh` ).
 SOURCES = { "loom": ROOT / "loom", "sdot": ROOT }
 
 
 def build_wheels() -> list:
-    """Les deux wheels, `loom` puis `sdot` (le second dépend du premier), sous `dist/`."""
+    """The two wheels, `loom` then `sdot` (the second depends on the first), under `dist/`."""
     wheels = []
     for pkg in ( "loom", "sdot" ):
         src = SOURCES[ pkg ]
         if not ( src / "pyproject.toml" ).is_file():
-            raise RuntimeError( f"{ pkg } introuvable sous { src } -- `loom` doit etre clone a cote "
-                                f"de ce depot ( voir le workflow, ou `bootstrap.sh` )" )
+            raise RuntimeError( f"{ pkg } not found under { src } -- `loom` must be cloned next to "
+                                f"this repository ( see the workflow, or `bootstrap.sh` )" )
         _run( [ sys.executable, "-m", "pip", "wheel", "--quiet", "--no-deps", "-w", ROOT / "dist", src ], check = True )
         found = sorted( glob.glob( str( ROOT / "dist" / f"{ pkg }-*.whl" ) ), key = os.path.getmtime )
         if not found:
-            raise RuntimeError( f"aucun wheel { pkg } produit sous dist/" )
+            raise RuntimeError( f"no { pkg } wheel produced under dist/" )
         wheels.append( Path( found[ -1 ] ) )
     return wheels
 
@@ -82,33 +82,33 @@ def build_wheels() -> list:
 def validate( wheels: list, keep: bool ) -> int:
     scratch = Path( tempfile.mkdtemp( prefix = "sdot-validate-" ) )
     venv_dir  = scratch / "venv"
-    cache_dir = scratch / "sdot-cache"   # vide -> aucun binaire réutilisé
-    work_dir  = scratch / "run"          # cwd du smoke test, jamais la racine du repo
+    cache_dir = scratch / "sdot-cache"   # empty -> no binary reused
+    work_dir  = scratch / "run"          # cwd of the smoke test, never the repo root
     work_dir.mkdir( parents = True )
     print( f"scratch: { scratch }", flush = True )
 
     try:
         _run( [ sys.executable, "-m", "venv", venv_dir ], check = True )
         py = _venv_python( venv_dir )
-        # `ninja` et `jax` viennent de PyPI ; loom et sdot des wheels fraîchement bâties
+        # `ninja` and `jax` come from PyPI; loom and sdot from the freshly built wheels
         _run( [ py, "-m", "pip", "install", "--quiet", *( f"{ w }[jax]" if w.name.startswith( "loom" ) else str( w ) for w in wheels ) ], check = True )
 
-        # Pré-check rapide : échouer vite si l'install est mal packagée, AVANT de compiler.
+        # Quick pre-check: fail fast if the install is badly packaged, BEFORE compiling.
         r = _run( [ py, "-c", PRECHECK ], cwd = work_dir, capture_output = True, text = True )
         if r.returncode:
             print( r.stdout + r.stderr, flush = True )
-            raise RuntimeError( "pré-check import a échoué" )
-        # .resolve() des deux côtés : sur macOS /var est un symlink vers /private/var, et
-        # __file__ n'est pas canonicalisé alors que include_roots() l'est.
+            raise RuntimeError( "import pre-check failed" )
+        # .resolve() on both sides: on macOS /var is a symlink to /private/var, and
+        # __file__ is not canonicalized whereas include_roots() is.
         venv_real = str( venv_dir.resolve() )
         for line in re.findall( r"/[^\s'\]\[,]+", r.stdout ):
             if not str( Path( line ).resolve() ).startswith( venv_real ):
                 raise RuntimeError(
-                    f"chemin hors du venv (import depuis le checkout ?) : { line }\n{ r.stdout }"
+                    f"path outside the venv (import from the checkout?): { line }\n{ r.stdout }"
                 )
         print( r.stdout, flush = True )
 
-        # Smoke test complet, dans un env isolé : pas de PYTHONPATH, cache neuf, build par défaut.
+        # Full smoke test, in an isolated env: no PYTHONPATH, fresh cache, default build.
         env = dict( os.environ )
         env.pop( "PYTHONPATH", None )
         env.pop( "SDOT_BUILD_DIR", None )
@@ -118,24 +118,24 @@ def validate( wheels: list, keep: bool ) -> int:
         out = r.stdout + r.stderr
         print( out, flush = True )
         if r.returncode or "SMOKE-OK" not in r.stdout:
-            raise RuntimeError( "smoke test a échoué" )
+            raise RuntimeError( "smoke test failed" )
 
-        # La preuve que la compilation a utilisé les en-têtes du wheel est le pré-check ci-dessus :
-        # `include_roots()` ne nomme que des chemins du venv, et le noyau a compilé avec.
+        # The proof that the compilation used the wheel's headers is the pre-check above:
+        # `include_roots()` only names paths of the venv, and the kernel compiled with them.
 
         print( "\nVALIDATION OK", flush = True )
         return 0
     finally:
         if keep:
-            print( f"\n--keep : scratch conservé -> { scratch }", flush = True )
+            print( f"\n--keep: scratch kept -> { scratch }", flush = True )
         else:
             shutil.rmtree( scratch, ignore_errors = True )
 
 
 def main() -> int:
-    p = argparse.ArgumentParser( description = "valide le wheel sdot dans un venv propre" )
-    p.add_argument( "--wheel", type = Path, nargs = "*", help = "wheels existants à tester (loom et sdot ; sinon on les bâtit)" )
-    p.add_argument( "--keep", action = "store_true", help = "garder le venv/cache scratch" )
+    p = argparse.ArgumentParser( description = "validates the sdot wheel in a clean venv" )
+    p.add_argument( "--wheel", type = Path, nargs = "*", help = "existing wheels to test (loom and sdot; otherwise we build them)" )
+    p.add_argument( "--keep", action = "store_true", help = "keep the scratch venv/cache" )
     args = p.parse_args()
 
     wheels = [ w.resolve() for w in args.wheel ] if args.wheel else build_wheels()

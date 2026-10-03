@@ -1,24 +1,24 @@
-"""Changement de représentation d'un polytope convexe : des demi-espaces vers des sommets.
+"""Change of representation of a convex polytope: from half-spaces to vertices.
 
-`{ x : dir_i . x <= off_i }` (H-représentation) est ce qu'une cellule sait toujours donner, mais
-c'est inaffichable tel quel : il faut des SOMMETS, des ARÊTES et des FACES. La page HTML fait ce
-travail dans le navigateur, à chaque coupe ; ici c'est la version Python, dont les sorties fichier
-(VTK) ont besoin.
+`{ x : dir_i . x <= off_i }` (H-representation) is what a cell can always give, but
+it cannot be displayed as is: one needs VERTICES, EDGES and FACES. The HTML page does this
+work in the browser, at every cut; here is the Python version, which the file outputs
+(VTK) need.
 
-Écrit en dimension QUELCONQUE, pas seulement en 3D :
-- un SOMMET est l'intersection de `d` plans, admissible pour tous les autres ;
-- une ARÊTE joint deux sommets qui partagent `d-1` plans actifs ;
-- une FACE (au sens d'un polygone, ce que VTK sait tracer) est portée par `d-2` plans communs.
-  En 3D cela redonne « une face par coupe » ; en 4D ce sont les carrés d'un tesseract ; en 2D il
-  ne reste qu'un seul polygone, tout le polytope.
+Written in ANY dimension, not only in 3D:
+- a VERTEX is the intersection of `d` planes, feasible for all the others;
+- an EDGE joins two vertices that share `d-1` active planes;
+- a FACE (in the sense of a polygon, what VTK can draw) is carried by `d-2` common planes.
+  In 3D this gives back "one face per cut"; in 4D these are the squares of a tesseract; in 2D only
+  a single polygon remains, the whole polytope.
 
-C'est exact pour un polytope SIMPLE (aucun sommet ne portant plus de `d` plans), ce que sont les
-cellules en position générique. Un sommet dégénéré (plus de `d` plans concourants) peut faire
-apparaître des arêtes en trop.
+This is exact for a SIMPLE polytope (no vertex carrying more than `d` planes), which is what cells
+in generic position are. A degenerate vertex (more than `d` concurrent planes) can make
+extra edges appear.
 
-Le coût est en C(nb_plans, d) petits systèmes -- négligeable pour une cellule (quelques centaines
-en 3D, quelques milliers en 4D), mais c'est bien un calcul HÔTE : le jour où ça devient le goulot,
-c'est un noyau qu'il faut, pas une optimisation d'ici.
+The cost is C(nb_planes, d) small systems -- negligible for a cell (a few hundred
+in 3D, a few thousand in 4D), but this is indeed a HOST computation: the day it becomes the bottleneck,
+a kernel is what is needed, not an optimization from here.
 """
 from itertools import combinations
 
@@ -26,10 +26,10 @@ import numpy as np
 
 
 def clip_planes( bounds ):
-    """Les 2d demi-espaces d'une boîte `[ [lo, hi], ... ]`.
+    """The 2d half-spaces of a box `[ [lo, hi], ... ]`.
 
-    À ajouter à un polytope NON BORNÉ : sans ça il n'a aucun sommet, donc rien à montrer.
-    Sur un polytope borné qui tient dans la boîte, ces plans restent inactifs et ne changent rien.
+    To be added to an UNBOUNDED polytope: without it, it has no vertex, hence nothing to show.
+    On a bounded polytope that fits in the box, these planes stay inactive and change nothing.
     """
     d = len( bounds )
     dirs, offs = [], []
@@ -41,29 +41,29 @@ def clip_planes( bounds ):
 
 
 def vertices_of( dirs, offs, tol = 1e-9 ):
-    """Les sommets du polytope, et pour chacun l'ensemble des plans qui le portent.
+    """The vertices of the polytope, and for each the set of planes that carry it.
 
-    Rend `( verts [n, d], active [n] )`, `active[ i ]` étant un `frozenset` d'indices de plans.
+    Returns `( verts [n, d], active [n] )`, `active[ i ]` being a `frozenset` of plane indices.
     """
     A = np.asarray( dirs, np.float64 )
     b = np.asarray( offs, np.float64 ).reshape( -1 )
     nrm = np.linalg.norm( A, axis = 1 )
-    keep = nrm > 1e-12                       # un plan dégénéré ne porte aucun sommet
+    keep = nrm > 1e-12                       # a degenerate plane carries no vertex
     A, b = A[ keep ] / nrm[ keep, None ], b[ keep ] / nrm[ keep ]
     n, d = A.shape
     if n < d:
         return np.zeros( ( 0, d ) ), []
 
-    # tous les d-uplets de plans d'un coup : `det` écarte les systèmes liés, puis un seul
-    # `solve` groupé. C'est ce qui rend l'énumération tenable en Python.
+    # all the d-tuples of planes at once: `det` discards the dependent systems, then a single
+    # grouped `solve`. This is what makes the enumeration tractable in Python.
     combos = np.array( list( combinations( range( n ), d ) ), dtype = np.int64 )
     M = A[ combos ]                                        # [ k, d, d ]
     rhs = b[ combos ]                                      # [ k, d ]
     ok = np.abs( np.linalg.det( M ) ) > 1e-10
     if not ok.any():
         return np.zeros( ( 0, d ) ), []
-    # `rhs[ ..., None ]` : depuis numpy 2, un second membre de rang 2 est lu comme UNE
-    # matrice, pas comme une pile de vecteurs -- il faut donc l'axe explicite.
+    # `rhs[ ..., None ]`: since numpy 2, a rank-2 right-hand side is read as ONE
+    # matrix, not as a stack of vectors -- hence the explicit axis.
     X = np.linalg.solve( M[ ok ], rhs[ ok ][ ..., None ] )[ ..., 0 ]     # [ k', d ]
 
     scale = max( 1.0, float( np.abs( b ).max() ) )
@@ -73,8 +73,8 @@ def vertices_of( dirs, offs, tol = 1e-9 ):
     if len( X ) == 0:
         return np.zeros( ( 0, d ) ), []
 
-    # sommets confondus fusionnés : deux d-uplets différents désignent le même coin dès que plus
-    # de d plans y concourent.
+    # coincident vertices merged: two different d-tuples designate the same corner as soon as more
+    # than d planes meet there.
     keys = np.round( X / ( 10 * eps ) ).astype( np.int64 )
     _, first = np.unique( keys, axis = 0, return_index = True )
     X = X[ np.sort( first ) ]
@@ -85,11 +85,11 @@ def vertices_of( dirs, offs, tol = 1e-9 ):
 
 
 def edges_of( active, nb_dims, nb_real = None ):
-    """Les arêtes : deux sommets qui partagent au moins `d-1` plans actifs.
+    """The edges: two vertices that share at least `d-1` active planes.
 
-    `nb_real` marque la frontière entre les plans du polytope (les premiers) et ceux de la BOÎTE
-    DE ROGNAGE (voir `clip_planes`) : une arête posée sur la boîte n'est pas une arête du
-    polytope, c'est le bord du champ, et la tracer revient à dessiner la boîte.
+    `nb_real` marks the boundary between the planes of the polytope (the first ones) and those of the CLIPPING
+    BOX (see `clip_planes`): an edge lying on the box is not an edge of the
+    polytope, it is the border of the field, and drawing it amounts to drawing the box.
     """
     res = []
     for i in range( len( active ) ):
@@ -104,11 +104,11 @@ def edges_of( active, nb_dims, nb_real = None ):
 
 
 def faces_of( verts, active, edges, nb_dims ):
-    """Les faces POLYGONALES, en ordre cyclique -- ce que VTK (ou un rendu) sait tracer.
+    """The POLYGONAL faces, in cyclic order -- what VTK (or a renderer) can draw.
 
-    Une face est portée par `d-2` plans communs. On ne les cherche pas parmi tous les sous-
-    ensembles possibles : chaque ARÊTE en porte déjà `d-1`, donc les faces qui la contiennent
-    s'obtiennent en lui en retirant un. Ce qui évite une combinatoire inutile.
+    A face is carried by `d-2` common planes. We do not look for them among all the sub-
+    sets: each EDGE already carries `d-1` of them, so the faces that contain it
+    are obtained by removing one from it. This avoids useless combinatorics.
     """
     groups = {}
     for i, j in edges:
@@ -128,11 +128,11 @@ def faces_of( verts, active, edges, nb_dims ):
 
 
 def _cyclic_order( pts, tol = 1e-12 ):
-    """Range des points COPLANAIRES en tournant autour de leur centre.
+    """Sorts COPLANAR points by rotating around their center.
 
-    Le plan de la face est trouvé sur place (deux directions indépendantes prises parmi les écarts
-    au centre, orthonormalisées) : ça vaut en dimension quelconque, il n'y a pas de « normale » à
-    invoquer au-delà de la 3D.
+    The plane of the face is found in place (two independent directions taken among the offsets
+    from the center, orthonormalized): this holds in any dimension, there is no "normal"
+    to invoke beyond 3D.
     """
     ctr = pts.mean( axis = 0 )
     rel = pts - ctr
@@ -145,22 +145,22 @@ def _cyclic_order( pts, tol = 1e-12 ):
     perp = rel - np.outer( rel @ u, u )
     k = int( np.argmax( np.linalg.norm( perp, axis = 1 ) ) )
     if np.linalg.norm( perp[ k ] ) < tol * scale:
-        return None                                        # points alignés : pas un polygone
+        return None                                        # aligned points: not a polygon
     w = perp[ k ] / np.linalg.norm( perp[ k ] )
     return list( np.argsort( np.arctan2( rel @ w, rel @ u ) ) )
 
 
 def polytope_mesh( dirs, offs, bounds = None ):
-    """`( verts [n, d], edges [m, 2], faces )` d'un polytope donné en demi-espaces.
+    """`( verts [n, d], edges [m, 2], faces )` of a polytope given as half-spaces.
 
-    `bounds` ajoute une boîte de rognage (voir `clip_planes`) : indispensable si le polytope peut
-    être non borné, sans effet sinon.
+    `bounds` adds a clipping box (see `clip_planes`): indispensable if the polytope can
+    be unbounded, without effect otherwise.
     """
     dirs = np.asarray( dirs, np.float64 )
     offs = np.asarray( offs, np.float64 ).reshape( -1 )
 
-    # les plans dégénérés sont écartés ICI et non dans `vertices_of` : celui-ci renumérote ce
-    # qu'il garde, et la frontière `nb_real` ne s'y retrouverait plus.
+    # degenerate planes are discarded HERE and not in `vertices_of`: the latter renumbers what
+    # it keeps, and the `nb_real` boundary would no longer line up.
     nrm = np.linalg.norm( dirs, axis = 1 )
     dirs, offs = dirs[ nrm > 1e-12 ], offs[ nrm > 1e-12 ]
     nb_real = len( dirs )
@@ -174,8 +174,8 @@ def polytope_mesh( dirs, offs, bounds = None ):
         return verts, np.zeros( ( 0, 2 ), np.int64 ), []
     d = dirs.shape[ 1 ]
 
-    # deux listes d'arêtes, et ce n'est pas une inélégance : les FACES ont besoin de toutes (une
-    # face de rognage est faite d'arêtes de rognage, et sans elle on verrait l'intérieur du
-    # polytope), le TRACÉ n'a besoin que de celles du polytope.
+    # two edge lists, and this is not an inelegance: the FACES need all of them (a
+    # clipping face is made of clipping edges, and without it we would see the inside of the
+    # polytope), the DRAWING only needs those of the polytope.
     edges = edges_of( active, d )
     return verts, edges_of( active, d, nb_real ), faces_of( verts, active, edges, d )

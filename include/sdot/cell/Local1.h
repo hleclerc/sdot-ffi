@@ -3,23 +3,23 @@
 #include <loom/support/common_macros.h> // HD
 
 // =====================================================================================
-// LA CELLULE 1D : un SEGMENT, ou une demi-droite, ou la droite entiere.
+// THE 1D CELL: a SEGMENT, or a half-line, or the whole line.
 //
-// Deux sommets au plus, `vx[ 0 ] <= vx[ 1 ]`, et une coupe par bout : `cid[ 0 ]` porte le bout
-// gauche, `cid[ 1 ]` le droit. Le non borne suit la meme convention que les autres dimensions --
-// un bout marque `INFINITE` est pose a une distance inventee ( `+-1` de l'autre bout ) et repousse
-// avant chaque coupe qui pourrait le classer ; ici « repousser » est immediat : un bout infini est
-// toujours du bon cote, il suffit de le regarder comme tel.
+// Two vertices at most, `vx[ 0 ] <= vx[ 1 ]`, and one cut per end: `cid[ 0 ]` carries the left
+// end, `cid[ 1 ]` the right. The unbounded case follows the same convention as the other dimensions --
+// an end marked `INFINITE` is placed at an invented distance ( `+-1` from the other end ) and pushed back
+// before each cut that could classify it; here "pushing back" is immediate: an infinite end is
+// always on the right side, it is enough to look at it as such.
 //
-// Il n'y a pas de noyau a registres ni de diagramme en 1D ( `SdotPlan1d` a le sien ) : c'est la
-// forme de `Cell_1.py`, et rien de plus.
+// There is no register kernel nor diagram in 1D ( `SdotPlan1d` has its own ): this is the
+// shape of `Cell_1.py`, and nothing more.
 // =====================================================================================
 
 #include <loom/support/common_types.h>
 #include <loom/support/containers/Vector.h>
 #include "Scratch.h"
 #include "Plane.h"
-#include "Etat.h"
+#include "State.h"
 #include "Ids.h"
 
 #include <limits>
@@ -32,7 +32,7 @@ struct Local1 {
     using TKernel = TK;
     using PlaneT  = Plane<TK,1>;
 
-    int  nb  = 0;                                        ///< 0 ( vide ) ou 2
+    int  nb  = 0;                                        ///< 0 ( empty ) or 2
     int  cap = 0;
     TK  *vx  = nullptr;
     int *cid = nullptr;
@@ -84,8 +84,8 @@ struct Local1 {
         if ( nb == 0 || p.dir[ 0 ] == 0 )
             return p.dir[ 0 ] == 0 && p.off < 0 ? ( nb = 0, CutStatus::EMPTY ) : CutStatus::UNCHANGED;
         const TK x = p.off / p.dir[ 0 ];
-        // le bout que la coupe retient est `x` ; l'autre reste s'il est du bon cote -- un bout
-        // infini l'est toujours
+        // the end that the cut keeps is `x`; the other stays if it is on the right side -- an
+        // infinite end always is
         const int keep = p.dir[ 0 ] > 0 ? 0 : 1, kill = 1 - keep;
         const bool kill_inf = unbounded_at( kill ), keep_inf = unbounded_at( keep );
         if ( ! kill_inf && ( p.dir[ 0 ] > 0 ? vx[ kill ] <= x : vx[ kill ] >= x ) )
@@ -96,7 +96,7 @@ struct Local1 {
         }
         vx[ kill ] = x;
         cid[ kill ] = p.id;
-        if ( keep_inf )                                  // l'autre bout, factice, suit a distance 1
+        if ( keep_inf )                                  // the other, fake end, follows at distance 1
             vx[ keep ] = keep ? x + 1 : x - 1;
         return CutStatus::CUT;
     }

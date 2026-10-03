@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Le banc GPU. Autonome : il ne depend ni de CGAL ni de `2d_des_familles`, il lit le fichier de
-# connectivite ecrit par `power_{2,3}d_light --dump`.
+# The GPU benchmark. Self-contained : it depends on neither CGAL nor `2d_des_familles`, it reads the
+# connectivity file written by `power_{2,3}d_light --dump`.
 #
-# `-arch=sm_75` : Turing (RTX 2080 Ti). A changer sur une autre carte.
-# Pas de `--use_fast_math` : il remplacerait les divisions par des reciproques approchees, ce qui
-# fausserait justement ce que ce banc essaie de mesurer -- la precision du FP32 sur la geometrie.
+# `-arch=sm_75` : Turing (RTX 2080 Ti). To be changed on another card.
+# No `--use_fast_math` : it would replace divisions with approximate reciprocals, which
+# would distort precisely what this benchmark tries to measure -- the FP32 precision on the geometry.
 set -euo pipefail
 here="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 nvcc -O3 -std=c++17 -arch="${ARCH:-sm_75}" -lineinfo \

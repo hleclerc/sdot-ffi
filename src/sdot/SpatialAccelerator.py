@@ -2,49 +2,49 @@ from loom.util import Aggregate
 
 
 class SpatialAccelerator( Aggregate ):
-    """Ce qui répond à « QUELS germes valent la peine d'être essayés, et dans quel ordre ».
+    """What answers "WHICH seeds are worth trying, and in what order".
 
-    Un accélérateur ne sait pas ce qu'est une cellule. Il connaît la répartition des germes dans
-    l'espace, et il en tire une ÉNUMÉRATION : au lieu des `n - 1` bissectrices que
-    `PowerDiagram_Plain` essaie une par une, il propose les germes proches d'abord et s'arrête
-    d'explorer une région dès que l'appelant lui dit qu'elle ne peut plus rien couper. C'est le
-    seul endroit où le `O(n²)` se joue -- la géométrie, elle, ne change pas d'un iota.
+    An accelerator does not know what a cell is. It knows how the seeds are spread out in
+    space, and it derives an ENUMERATION from that: instead of the `n - 1` bisectors that
+    `PowerDiagram_Plain` tries one by one, it proposes the nearby seeds first and stops
+    exploring a region as soon as the caller tells it that it can no longer cut anything. This is the
+    only place where the `O(n²)` is decided -- the geometry itself does not change one iota.
 
-    Un accélérateur est aussi un ORDRE de stockage : `PowerDiagram_Bsp` range les germes comme
-    l'arbre les regroupe (`seed_indices`), et c'est ce rangement, autant que l'élagage, qui fait
-    la vitesse (une feuille se lit d'un seul tenant).
+    An accelerator is also a storage ORDER: `PowerDiagram_Bsp` arranges the seeds the way
+    the tree groups them (`seed_indices`), and it is this arrangement, as much as the pruning, that makes
+    the speed (a leaf is read in one go).
 
-    = Le contrat, côté C++
+    = The contract, C++ side
 
-    La CELLULE dirige (`cell/Moteur.h`) : elle demande un demi-espace à un FOURNISSEUR, coupe,
-    redemande. Un accélérateur est donc, côté kernel, un fournisseur -- un objet dont la méthode
+    The CELL drives (`cell/Engine.h`): it asks a PROVIDER ( `Provider` ) for a half-space, cuts,
+    asks again. On the kernel side, an accelerator is thus a supplier -- an object whose method
 
-        template<class Etat> bool suivant( const Etat &e, Local &l, Plane<TK,D> &p );
+        template<class State> bool next( const State &e, Local &l, Plane<TK,D> &p );
 
-    remplit le prochain plan et rend `true`, ou `false` quand il n'a plus rien ; `e` est la
-    cellule telle qu'elle est DEVENUE (ses sommets, en registres ou en mémoire, voir `cell/Etat.h`)
-    et `l` un état que le moteur loge par cellule (la pile d'une descente d'arbre, par exemple).
-    C'est là que vivent l'élagage et l'ordre des candidats ; le moteur, lui, n'a aucune politique.
+    fills in the next plane and returns `true`, or `false` when it has nothing left; `e` is the
+    cell as it has BECOME (its vertices, in registers or in memory, see `cell/State.h`)
+    and `l` a state that the engine ( `Engine` ) allocates per cell (the stack of a tree descent, for example).
+    This is where the pruning and the candidate order live; the engine itself has no policy.
 
-    `AaBsp` est le seul accélérateur aujourd'hui, et son fournisseur est
-    `cell/Fournisseurs.h::FournisseurBsp`, qui lit ses tenseurs (`node_box`, `node_begin` /
-    `node_end`, `seed_indices`, le majorant affine des poids) et élague par `cell/Elagage.h` --
-    exact : une boîte n'est rejetée que si AUCUN sommet de la cellule ne peut être coupé par un
-    germe qui s'y trouve. Un autre accélérateur demanderait son propre fournisseur ET son propre
-    stockage (`PowerDiagram_Xxx.py` / `.h`, sur le modèle de `PowerDiagram_Bsp`), dont
-    `fournisseur<TK>( k0 )` le rend.
+    `AaBsp` is the only accelerator today, and its supplier is
+    `cell/Providers.h::ProviderBsp`, which reads its tensors (`node_box`, `node_begin` /
+    `node_end`, `seed_indices`, the affine upper bound of the weights) and prunes through `cell/Pruning.h` --
+    exactly: a box is rejected only if NO vertex of the cell can be cut by a
+    seed lying in it. Another accelerator would need its own supplier AND its own
+    storage (`PowerDiagram_Xxx.py` / `.h`, modeled on `PowerDiagram_Bsp`), which
+    `provider<TK>( k0 )` returns.
 
-    = Le contrat, côté Python
+    = The contract, Python side
 
-    `nb_seeds()`, pour que le diagramme vérifie que l'accélérateur indexe bien SES germes.
+    `nb_seeds()`, so that the diagram checks that the accelerator indexes ITS seeds.
     """
 
     def nb_seeds( self ):
-        """Sur combien de germes il a été construit -- ou `None` s'il ne le sait pas.
+        """How many seeds it was built on -- or `None` if it does not know.
 
-        Un accélérateur INDEXE les germes de l'appelant : construit sur un autre nuage, ses indices
-        désignent autre chose et la réponse est fausse sans que rien ne le dise. C'est ce que ce
-        compte permet de vérifier pour rien du tout, côté appelant.
+        An accelerator INDEXES the caller's seeds: built on another cloud, its indices
+        designate something else and the answer is wrong without anything saying so. This count
+        makes it possible to check this for free, on the caller's side.
         """
         return None
 

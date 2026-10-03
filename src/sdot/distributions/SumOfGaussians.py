@@ -7,45 +7,45 @@ from .Distribution import Distribution
 
 
 class SumOfGaussians( Distribution ):
-    """Une somme de gaussiennes ISOTROPES, comme densité continue.
+    """A sum of ISOTROPIC gaussians, as a continuous density.
 
-        rho( x ) = somme_i  weights( i ) * exp( - |x - positions( i )|^2 / ( 2 sigmas( i )^2 ) )
+        rho( x ) = sum_i  weights( i ) * exp( - |x - positions( i )|^2 / ( 2 sigmas( i )^2 ) )
                             / ( 2 pi sigmas( i )^2 ) ^ ( d / 2 )
 
-    `weights( i )` est donc la MASSE de la gaussienne `i`, pas sa hauteur : la masse totale est la
-    somme des poids, sans une intégrale à calculer, et normaliser n'est qu'une division.
+    `weights( i )` is therefore the MASS of gaussian `i`, not its height: the total mass is the
+    sum of the weights, with no integral to compute, and normalizing is just a division.
 
-    = Isotrope aujourd'hui, et comment on dira le contraire
+    = Isotropic today, and how we will say otherwise
 
-    L'INTENTION se lit sur le RANG de `sigmas`, pas sur un drapeau :
+    The INTENT is read from the RANK of `sigmas`, not from a flag:
 
-        sigmas : RealTensor[ "num_gaussian" ]                   -- un scalaire  -> isotrope (ici)
-        sigmas : RealTensor[ "num_gaussian", "dim" ]            -- un vecteur   -> alignée sur les axes
-        sigmas : RealTensor[ "num_gaussian", "dim", "dim" ]     -- une matrice  -> quelconque
+        sigmas : RealTensor[ "num_gaussian" ]                   -- a scalar  -> isotropic (here)
+        sigmas : RealTensor[ "num_gaussian", "dim" ]            -- a vector  -> axis-aligned
+        sigmas : RealTensor[ "num_gaussian", "dim", "dim" ]     -- a matrix  -> arbitrary
 
-    C'est le bon endroit pour le dire parce que c'est là que la FFI le lit : le rang traverse dans le
-    type C++ du membre, donc `SumOfGaussians::value_at` peut brancher dessus avec un
-    `if constexpr ( sigmas.ct_rank == 1 )` -- pas un test à l'exécution, pas un second agrégat, et
-    le cas isotrope ne paie rien pour l'existence des autres. Seul le rang 1 est écrit pour l'instant.
+    It is the right place to say it because it is where the FFI reads it: the rank crosses over in the
+    C++ type of the member, so `SumOfGaussians::value_at` can branch on it with an
+    `if constexpr ( sigmas.ct_rank == 1 )` -- not a runtime test, not a second aggregate, and
+    the isotropic case pays nothing for the existence of the others. Only rank 1 is written for now.
 
-    = Ce qu'elle sert à tester
+    = What it is used to test
 
-    C'est la première densité qui n'est PAS constante par morceaux, donc la première à faire passer
-    l'intégrateur par sa quadrature (voir `PowerDiagram::integrate_into`). Elle ne découpe rien --
-    son morceau est la cellule entière -- et ne fournit que trois choses ponctuelles : `value_at`,
-    `gradient_at`, et où accumuler `d rho / d paramètres`. Elle ne sait rien des cellules, et
-    `PowerDiagram` ne sait rien des gaussiennes : c'est exactement le partage qu'on veut éprouver.
+    It is the first density that is NOT piecewise constant, hence the first to make the integrator
+    go through its quadrature (see `PowerDiagram::integrate_into`). It cuts nothing --
+    its piece is the whole cell -- and only provides three pointwise things: `value_at`,
+    `gradient_at`, and where to accumulate `d rho / d parameters`. It knows nothing about cells, and
+    `PowerDiagram` knows nothing about gaussians: it is exactly the split we want to put to the test.
 
-    = Le support
+    = The support
 
-    Une gaussienne n'en a pas, mais au-delà de quelques écarts-types il ne reste rien : le support
-    que la distribution DÉCLARE ( `bounding_half_spaces` ) est le pavé `[ c_i - k s_i, c_i + k s_i ]`
-    réuni sur les gaussiennes, `k = support_sigmas` ( 6 par défaut : la queue au-delà pèse 2e-9 ).
-    C'est ce qui borne le domaine d'un transport ( `SdotPlanNd` : le domaine vient de la densité, et
-    d'elle seule ) et ce que `PowerDiagram` ajoute à ses demi-espaces. `support_sigmas = None` : pas
-    de support déclaré -- les cellules du bord restent infinies et `measures` y répond `TF::max`,
-    à moins d'un `boundaries`. La masse hors du domaine est perdue, et la somme des mesures vaut la
-    masse cible MOINS les queues : c'est la vérité de ce qu'on a demandé, pas une erreur numérique.
+    A gaussian has none, but beyond a few standard deviations nothing is left: the support
+    that the distribution DECLARES ( `bounding_half_spaces` ) is the box `[ c_i - k s_i, c_i + k s_i ]`
+    united over the gaussians, `k = support_sigmas` ( 6 by default: the tail beyond weighs 2e-9 ).
+    It is what bounds the domain of a transport ( `SdotPlanNd`: the domain comes from the density, and
+    from it alone ) and what `PowerDiagram` adds to its half-spaces. `support_sigmas = None`: no
+    declared support -- the boundary cells stay infinite and `measures` answers `TF::max` there,
+    unless a `boundaries` is given. The mass outside the domain is lost, and the sum of the measures equals the
+    target mass MINUS the tails: it is the truth of what was asked for, not a numerical error.
     """
 
     nb_gaussians     : ShapeVar
@@ -61,17 +61,17 @@ class SumOfGaussians( Distribution ):
     current_mass     : ComputedAttribute[ RealTensor, ( "weights", ) ]
 
     def __init__( self, positions, sigmas, weights = None, target_mass = 1.0, support_sigmas = 6.0, **kwargs ):
-        """`positions` : `[ n, d ]`. `sigmas` : `[ n ]` (isotrope). `weights` : `[ n ]`, la MASSE de
-        chaque gaussienne -- toutes égales par défaut. `support_sigmas` : le support déclaré, en
-        écarts-types ( voir la docstring de la classe ) ; `None` pour ne pas en déclarer."""
+        """`positions`: `[ n, d ]`. `sigmas`: `[ n ]` (isotropic). `weights`: `[ n ]`, the MASS of
+        each gaussian -- all equal by default. `support_sigmas`: the declared support, in
+        standard deviations ( see the class docstring ); `None` to declare none."""
         self.__base_init__( positions = positions, sigmas = sigmas, target_mass = target_mass, **kwargs )
         self.support_sigmas = None if support_sigmas is None else float( support_sigmas )
         if weights is not None:
             self.weights = weights
         elif self.weights.is_undefined:
-            # toutes de même masse : la valeur exacte n'a pas d'importance, `normalized_version` la
-            # remet à l'échelle -- ce qui compte est qu'elles soient DÉFINIES, le kernel les lisant
-            # sans branche (contrairement aux `weights` d'un `PowerDiagram`, où l'absence a un sens).
+            # all of the same mass: the exact value does not matter, `normalized_version` rescales
+            # it -- what matters is that they are DEFINED, the kernel reading them
+            # without a branch (unlike the `weights` of a `PowerDiagram`, where absence has a meaning).
             self.weights = RealTensor[ *self.batch_axes, self.num_gaussian ].full( 1.0 )
 
     def normalized_version( self ):
@@ -79,8 +79,8 @@ class SumOfGaussians( Distribution ):
         if not self.target_mass.is_defined:
             return self
 
-        # la masse totale est la somme des poids (chaque gaussienne est normalisée à `weights( i )`),
-        # donc normaliser est une DIVISION et pas une intégrale -- et l'autodiff la traverse.
+        # the total mass is the sum of the weights (each gaussian is normalized to `weights( i )`),
+        # so normalizing is a DIVISION and not an integral -- and autodiff goes through it.
         return SumOfGaussians(
             nb_gaussians = self.nb_gaussians.value,
             nb_dims = self.nb_dims.value,
@@ -95,22 +95,22 @@ class SumOfGaussians( Distribution ):
         )
 
     def bounding_half_spaces( self ):
-        """le pavé `[ c_i - k s_i, c_i + k s_i ]` réuni sur les gaussiennes ( voir la docstring de la
-        classe ) -- `None` sans `support_sigmas`, ou quand les paramètres ne sont pas lisibles côté
-        hôte ( sous `jit` ) : borner est une optimisation, elle ne doit pas casser l'appel"""
+        """the box `[ c_i - k s_i, c_i + k s_i ]` united over the gaussians ( see the class
+        docstring ) -- `None` without `support_sigmas`, or when the parameters are not readable on the
+        host side ( under `jit` ): bounding is an optimization, it must not break the call"""
         if self.support_sigmas is None:
             return None
         try:
             d = int( self.nb_dims.value )
             c = numpy.asarray( self.positions, dtype = float ).reshape( -1, d )
             s = numpy.asarray( self.sigmas, dtype = float ).reshape( -1, 1 )
-        except ( TypeError, ValueError ):
+        except ( TypeError, ValueError, RuntimeError ):      # RuntimeError: a torch tensor that requires grad
             return None
         lo = ( c - self.support_sigmas * s ).min( axis = 0 )
         hi = ( c + self.support_sigmas * s ).max( axis = 0 )
         return numpy.concatenate( [ numpy.eye( d ), -numpy.eye( d ) ] ), numpy.concatenate( [ hi, -lo ] )
 
     def _update_current_mass( self ):
-        # réduction sur l'axe des GAUSSIENNES seulement, pour qu'un éventuel axe de batch survive
-        # (même raison que `SumOfDiracs._update_current_mass`).
+        # reduction over the GAUSSIAN axis only, so that a possible batch axis survives
+        # (same reason as `SumOfDiracs._update_current_mass`).
         self.current_mass = self.weights.sum( axis = self.num_gaussian )

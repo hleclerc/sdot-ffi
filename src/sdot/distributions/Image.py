@@ -57,9 +57,9 @@ class Image( Distribution ):
         self.__base_init__( values = values, target_mass = 1.0, **kwargs )
 
     def _grid_geometry( self ):
-        """`( d, frame, origin, lo, hi )` de la grille, côté HÔTE -- ou `None` si elle n'est pas
-        lisible ici (un tracer sous `jit`). Borner est une optimisation : on s'en passe plutôt que
-        de faire échouer l'appel."""
+        """`( d, frame, origin, lo, hi )` of the grid, on the HOST side -- or `None` if it is not
+        readable here (a tracer under `jit`). Bounding is an optimization: we do without it rather than
+        make the call fail."""
         try:
             d = int( self.nb_dims.value )
             shape = numpy.asarray( self.shape.value, dtype = int ).reshape( -1 )
@@ -76,24 +76,24 @@ class Image( Distribution ):
         return d, frame, origin, lo, hi
 
     def bounding_half_spaces( self ):
-        # voir `Distribution.bounding_half_spaces`. Le support est le pavé de la grille, écrit en
-        # coordonnées PHYSIQUES : `t_a = n_a . ( x - origin )` avec `n_a` la colonne `a` de `F^-1`
-        # (convention `x = origin + F^T t`, celle de `Image::measure`), et la bande utile va de
-        # `knots( a, 0 )` à `knots( a, shape_a )`.
+        # see `Distribution.bounding_half_spaces`. The support is the block of the grid, written in
+        # PHYSICAL coordinates: `t_a = n_a . ( x - origin )` with `n_a` the column `a` of `F^-1`
+        # (convention `x = origin + F^T t`, that of `Image::measure`), and the useful band goes from
+        # `knots( a, 0 )` to `knots( a, shape_a )`.
         g = self._grid_geometry()
         if g is None:
             return None
         d, frame, origin, lo, hi = g
-        nrm = numpy.linalg.inv( frame ).T                        # ligne `a` = la normale de l'axe `a`
+        nrm = numpy.linalg.inv( frame ).T                        # row `a` = the normal of axis `a`
 
         sh = nrm @ origin
         return ( numpy.concatenate( [ nrm, -nrm ] ),
                  numpy.concatenate( [ hi + sh, -( lo + sh ) ] ) )
 
     def extra_cuts_per_piece( self, nb_dims ):
-        # un morceau est `cellule INTER pavé de la grille`, et un pavé est l'intersection de 2d
-        # demi-espaces (voir `Image::_for_each_piece`). Les coupes de la cellule, elles, sont déjà
-        # comptées par la capacité de la cellule.
+        # a piece is `cell INTERSECT grid block`, and a block is the intersection of 2d
+        # half-spaces (see `Image::_for_each_piece`). The cuts of the cell itself are already
+        # counted by the capacity of the cell.
         return 2 * nb_dims
 
     @property

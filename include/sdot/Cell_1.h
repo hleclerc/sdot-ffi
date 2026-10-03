@@ -9,12 +9,12 @@
 
 namespace sdot {
 
-// LE SEGMENT ( `Cell_1.py` ).
+// THE SEGMENT ( `Cell_1.py` ).
 //
-// Les tenseurs sont ceux de `Cell_1.py` -- le format PRATIQUE, un sommet par ligne, dans le flottant
-// de l'appelant. Un kernel ne travaille jamais dessus directement : il pose la cellule dans sa
-// forme locale ( `Local`, sur le scratch de l'item, dans le flottant du noyau ), travaille, et la
-// repose. Les operations elles-memes sont dans `cell/Ops.h`, communes aux trois regimes.
+// The tensors are those of `Cell_1.py` -- the CONVENIENT format, one vertex per row, in the
+// caller's float. A kernel never works on them directly: it puts the cell in its local
+// form ( `Local`, on the item's scratch, in the kernel's float ), works, and puts it back. The
+// operations themselves are in `cell/Ops.h`, shared by the three regimes.
 SDOT_TEMPLATE_DECL_FOR_Cell_1
 struct Cell_1 {
     SDOT_ATTRIBUTES_OF_Cell_1

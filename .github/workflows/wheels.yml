@@ -1,29 +1,30 @@
-# Les wheels `loom` et `sdot`, avec le CATALOGUE des noyaux précompilés (voir
-# `loom/compilation/catalogue.py` et la commande `loom-kernels`).
+# The `loom` and `sdot` wheels, with the CATALOGUE of precompiled kernels (see
+# `loom/compilation/catalogue.py` and the `loom-kernels` command).
 #
-# POURQUOI ICI, dans le dépôt de sdot, alors que le catalogue est une affaire de loom : c'est le
-# wheel `sdot` qui PORTE les binaires (`sdot/catalogue/`), et `catalogue_record/` est versionné à
-# côté. Producteur du relevé et consommateur des binaires sont donc dans le même dépôt, et le
-# workflow n'a qu'un seul checkout à ajouter -- celui de loom, qui reste un wheel pur python.
+# WHY HERE, in the sdot repository, when the catalogue is a loom matter: it is the
+# `sdot` wheel that CARRIES the binaries (`sdot/catalogue/`), and `catalogue_record/` is versioned
+# alongside. The producer of the record and the consumer of the binaries are therefore in the same
+# repository, and the workflow only has one checkout to add -- that of loom, which remains a pure
+# python wheel.
 #
-# Le relevé des sources (`catalogue_record/`) est fait sur une machine de développement -- il
-# faut EXÉCUTER les appels, donc un GPU pour la partie CUDA -- et versionné avec le dépôt. Ici on
-# ne fait que COMPILER ce relevé, par plateforme et par variante, sans GPU :
-#   - Linux x86-64 : les niveaux v2, v3, v4 dans le même wheel (l'import charge le plus riche que
-#     la machine porte), et le catalogue CUDA (fatbin sm_70..sm_90) avec le compilateur CUDA du
-#     paquet pip ;
-#   - macOS arm64 : armv8-a.
-# Un wheel se suffit : un usage standard n'a rien à compiler ; le reste se compile sur place si
-# un compilateur est là (`LOOM_KERNELS=auto`). Eigen et AMGCL (les solveurs linéaires du transport)
-# sont téléchargés par loom lui-même au premier noyau compilé (`loom/compilation/externals.py`).
-# La validation finale tourne avec `LOOM_KERNELS=catalogue` : un relevé périmé (des sources qui ne
-# correspondent plus à ce que loom génère) y échoue, au lieu de retomber en silence sur la
+# The record of the sources (`catalogue_record/`) is made on a development machine -- the calls
+# must be EXECUTED, hence a GPU for the CUDA part -- and versioned with the repository. Here we
+# only COMPILE that record, per platform and per variant, without a GPU:
+#   - Linux x86-64: the v2, v3, v4 levels in the same wheel (the import loads the richest one that
+#     the machine supports), and the CUDA catalogue (fatbin sm_70..sm_90) with the CUDA compiler of the
+#     pip package;
+#   - macOS arm64: armv8-a.
+# A wheel is self-sufficient: standard usage has nothing to compile; the rest is compiled on the spot if
+# a compiler is there (`LOOM_KERNELS=auto`). Eigen and AMGCL (the linear solvers of the transport)
+# are downloaded by loom itself at the first compiled kernel (`loom/compilation/externals.py`).
+# The final validation runs with `LOOM_KERNELS=catalogue`: a stale record (sources that no longer
+# match what loom generates) fails there, instead of silently falling back to
 # compilation.
 #
-# `loom` reste un wheel pur python (ses sources C++ se compilent sur place) ; `sdot` porte des
-# binaires indépendants de l'ABI python (ctypes) : `py3-none-<plateforme>`.
+# `loom` remains a pure python wheel (its C++ sources are compiled on the spot); `sdot` carries
+# binaries independent of the python ABI (ctypes): `py3-none-<platform>`.
 #
-# Déclenché sur un tag `v*` (une release) ou à la main.
+# Triggered on a `v*` tag (a release) or by hand.
 
 name: wheels
 
@@ -35,29 +36,29 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-24.04
-    # l'image manylinux : ce qui est compilé ici tourne sur toute glibc >= 2.28
+    # the manylinux image: what is compiled here runs on any glibc >= 2.28
     container: quay.io/pypa/manylinux_2_28_x86_64
     env:
       PATH: /opt/python/cp312-cp312/bin:/usr/local/bin:/usr/bin:/bin
     steps:
       - uses: actions/checkout@v4
-      # loom vit dans son propre dépôt depuis qu'on a séparé les quatre paquets : on le pose à
-      # côté, là où `pip wheel loom` et les `-I` de la compilation l'attendent.
+      # loom has lived in its own repository since the four packages were split: we put it
+      # alongside, where `pip wheel loom` and the `-I` of the compilation expect it.
       - uses: actions/checkout@v4
         with:
           repository: hleclerc/loom
           path: loom
-      - name: dépendances
+      - name: dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt ninja wheel "jax[cuda13]" "nvidia-cuda-nvcc<13.4" "nvidia-cuda-crt<13.4" "nvidia-nvvm<13.4"
           python -m pip install -e loom -e .
-      - name: catalogue CPU, une variante par niveau
+      - name: CPU catalogue, one variant per level
         run: |
           for v in x86-64-v2 x86-64-v3 x86-64-v4; do
             loom-kernels compile --record catalogue_record --out catalogue --import sdot --variant $v
           done
-      - name: catalogue CUDA (compilation seule, pas de GPU)
+      - name: CUDA catalogue (compilation only, no GPU)
         run: |
           loom-kernels compile --record catalogue_record --out catalogue --import sdot --device cuda --arch sm_70,sm_75,sm_80,sm_86,sm_89,sm_90
       - name: wheels
@@ -65,7 +66,7 @@ jobs:
           python -m pip wheel --no-deps -w dist loom
           python -m pip wheel --no-deps -w dist .
           python -m wheel tags --remove --python-tag py3 --abi-tag none --platform-tag manylinux_2_28_x86_64 dist/sdot-*.whl
-      - name: validation dans un venv neuf, le catalogue seul
+      - name: validation in a fresh venv, catalogue only
         run: |
           LOOM_KERNELS=catalogue python scripts/validate_wheel.py --wheel dist/loom-*.whl dist/sdot-*.whl
       - uses: actions/upload-artifact@v4
@@ -86,12 +87,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: dépendances
+      - name: dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt ninja wheel jax
           python -m pip install -e loom -e .
-      - name: catalogue CPU
+      - name: CPU catalogue
         run: |
           loom-kernels compile --record catalogue_record --out catalogue --import sdot --variant armv8-a
       - name: wheels
@@ -99,7 +100,7 @@ jobs:
           python -m pip wheel --no-deps -w dist loom
           python -m pip wheel --no-deps -w dist .
           python -m wheel tags --remove --python-tag py3 --abi-tag none --platform-tag macosx_11_0_arm64 dist/sdot-*.whl
-      - name: validation dans un venv neuf, le catalogue seul
+      - name: validation in a fresh venv, catalogue only
         run: |
           LOOM_KERNELS=catalogue python scripts/validate_wheel.py --wheel dist/loom-*.whl dist/sdot-*.whl
       - uses: actions/upload-artifact@v4

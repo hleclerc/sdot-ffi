@@ -1,34 +1,34 @@
-// Le MEME calcul que `test_PowerDiagram::pd accelerated`, mais par CGAL : un diagramme de
-// puissance 2D sur `n` germes du carre unite, les cellules clippees sur ce carre, et leurs AIRES.
+// The SAME computation as `test_PowerDiagram::pd accelerated`, but with CGAL : a 2D power
+// diagram on `n` seeds of the unit square, the cells clipped to this square, and their AREAS.
 //
-// = Pourquoi un programme a part, et pas un test
+// = Why a separate program, and not a test
 //
-// C'est un ETALON, pas une verification : ce qu'on lui demande est un temps, dans les memes
-// conditions que le notre (meme machine, meme n, meme FP64), et la somme des aires comme seul
-// controle -- elle doit valoir 1 a l'arrondi pres, sans quoi le chiffre ne mesure rien.
+// It is a BENCHMARK REFERENCE, not a verification : what is asked of it is a time, under the same
+// conditions as ours (same machine, same n, same FP64), and the sum of the areas as the only
+// check -- it must equal 1 up to rounding, otherwise the figure measures nothing.
 //
-// = Ce que CGAL fait, et ce qu'il ne fait pas
+// = What CGAL does, and what it does not do
 //
-// `Regular_triangulation_2` est la triangulation reguliere (le dual du diagramme de puissance) :
-// elle rend l'ADJACENCE, pas les cellules. La cellule d'un germe se reconstruit en tournant autour
-// de lui (`incident_faces`) et en reliant les CENTRES DE PUISSANCE des faces incidentes -- c'est le
-// polygone dual. Deux choses en sortent qui n'existent pas de notre cote :
+// `Regular_triangulation_2` is the regular triangulation (the dual of the power diagram) :
+// it returns the ADJACENCY, not the cells. The cell of a seed is rebuilt by turning around
+// it (`incident_faces`) and joining the POWER CENTERS of the incident faces -- this is the
+// dual polygon. Two things come out of it that do not exist on our side :
 //
-//   * un germe « caché » (`hidden`) n'a pas de cellule du tout : c'est le cas qu'un poids assez bas
-//     produit, et CGAL le retire de la triangulation au lieu de lui laisser une cellule vide.
-//   * une cellule de BORD est infinie. CGAL ne connait pas notre domaine, donc le clip sur le carre
-//     unite est fait ici, a la main (Sutherland-Hodgman), apres coup.
+//   * a "hidden" seed (`hidden`) has no cell at all : this is the case a low enough weight
+//     produces, and CGAL removes it from the triangulation instead of leaving it an empty cell.
+//   * a BORDER cell is infinite. CGAL does not know our domain, so the clip to the unit
+//     square is done here, by hand (Sutherland-Hodgman), afterwards.
 //
-// Le clip est donc DE NOTRE COTE dans cette comparaison, alors qu'il est dans le kernel du notre.
-// C'est le seul endroit ou les deux ne font pas exactement le meme travail, et il joue en faveur
-// de CGAL (notre boite est coupee AVANT les bissectrices, la sienne apres) -- a garder en tete en
-// lisant l'ecart.
+// The clip is therefore ON OUR SIDE in this comparison, whereas it is in the kernel for ours.
+// This is the only place where the two do not do exactly the same work, and it plays in favor
+// of CGAL (our box is cut BEFORE the bisectors, its own after) -- to keep in mind when
+// reading the gap.
 //
-// = Le noyau
+// = The kernel
 //
-// `Exact_predicates_inexact_constructions_kernel` : predicats exacts (c'est ce qui rend la
-// triangulation robuste), constructions en `double`. C'est le choix normal pour une mesure, et
-// c'est celui qui se compare a notre FP64. Un noyau a constructions exactes serait un autre banc.
+// `Exact_predicates_inexact_constructions_kernel` : exact predicates (this is what makes the
+// triangulation robust), constructions in `double`. It is the normal choice for a measurement, and
+// the one that compares to our FP64. A kernel with exact constructions would be another benchmark.
 
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/Regular_triangulation_2.h>
@@ -42,8 +42,8 @@
 #include <string>
 #include <vector>
 
-// Le NOYAU sert directement de traits : `CGAL::Regular_triangulation_traits_2`, l'adaptateur
-// d'autrefois, n'existe plus en CGAL 6 -- un noyau porte desormais son propre `Weighted_point_2`.
+// The KERNEL serves directly as traits : `CGAL::Regular_triangulation_traits_2`, the adapter
+// of old, no longer exists in CGAL 6 -- a kernel now carries its own `Weighted_point_2`.
 using K    = CGAL::Exact_predicates_inexact_constructions_kernel;
 using Rt   = CGAL::Regular_triangulation_2<K>;
 using Wp   = Rt::Weighted_point;
@@ -53,7 +53,7 @@ namespace {
 
 struct P2 { double x, y; };
 
-// Sutherland-Hodgman contre UN demi-plan `a.x + b.y <= c`, en place dans `poly`.
+// Sutherland-Hodgman against ONE half-plane `a.x + b.y <= c`, in place in `poly`.
 void clip_half( std::vector<P2> &poly, double a, double b, double c, std::vector<P2> &tmp ) {
     tmp.clear();
     const std::size_t n = poly.size();
@@ -83,16 +83,16 @@ double area( const std::vector<P2> &poly ) {
     return 0.5 * ( a < 0 ? -a : a );
 }
 
-/// Un nuage de `2d_des_familles/cases/` : des lignes `#`, puis `n`, puis `n` fois « x y w ».
+/// A cloud from `2d_des_familles/cases/` : `#` lines, then `n`, then `n` times "x y w".
 ///
-/// La convention de poids est la MEME des deux cotes -- CGAL minimise `|x - p|^2 - w` comme nous --
-/// donc les fichiers se lisent tels quels, sans conversion, et les deux calculent bien le meme
-/// diagramme. C'est ce qui permet de comparer les temps sur les nuages DURS, ou l'uniforme cesse
-/// d'etre representatif.
+/// The weight convention is the SAME on both sides -- CGAL minimizes `|x - p|^2 - w` like us --
+/// so the files are read as is, without conversion, and both really compute the same
+/// diagram. This is what makes it possible to compare times on HARD clouds, where the uniform one stops
+/// being representative.
 bool load_cloud( const std::string &path, std::vector<Wp> &pts ) {
     std::FILE *f = std::fopen( path.c_str(), "rb" );
     if ( ! f ) {
-        std::printf( "impossible d'ouvrir '%s'\n", path.c_str() );
+        std::printf( "cannot open '%s'\n", path.c_str() );
         return false;
     }
     std::fseek( f, 0, SEEK_END );
@@ -149,10 +149,10 @@ int main( int argc, char **argv ) {
         if ( ! load_cloud( load, pts ) )
             return 1;
         n = int( pts.size() );
-        std::printf( "  nuage '%s' : %d germes\n", load.c_str(), n );
+        std::printf( "  cloud '%s' : %d seeds\n", load.c_str(), n );
     } else {
-        // le MEME nuage que le banc python, dans l'esprit : uniforme dans [ 0.01, 0.99 ]^2. Pas les
-        // memes tirages (deux generateurs differents), ce qui n'a pas d'importance pour un temps.
+        // the SAME cloud as the python benchmark, in spirit : uniform in [ 0.01, 0.99 ]^2. Not the
+        // same draws (two different generators), which does not matter for a timing.
         std::mt19937_64 rng( 0 );
         std::uniform_real_distribution<double> uni( 0.01, 0.99 );
         pts.reserve( n );
@@ -164,13 +164,13 @@ int main( int argc, char **argv ) {
     for ( int r = 0; r < reps; ++r ) {
         const auto t0 = std::chrono::steady_clock::now();
 
-        // l'insertion en VRAC : CGAL trie alors les points lui-meme (Hilbert) et insere avec
-        // localisation spatiale, ce qui est de loin le chemin le plus rapide -- l'insertion une par
-        // une mesurerait surtout le cout de la localisation.
+        // BULK insertion : CGAL then sorts the points itself (Hilbert) and inserts with
+        // spatial localization, which is by far the fastest path -- inserting one by
+        // one would mostly measure the cost of localization.
         Rt rt;
         rt.insert( pts.begin(), pts.end() );
 
-        // les cellules, une par sommet fini : le polygone dual, puis le clip sur le carre unite.
+        // the cells, one per finite vertex : the dual polygon, then the clip to the unit square.
         double sum = 0;
         std::vector<P2> poly, tmp;
         for ( auto v = rt.finite_vertices_begin(); v != rt.finite_vertices_end(); ++v ) {
@@ -178,9 +178,9 @@ int main( int argc, char **argv ) {
             poly.push_back( { 0, 0 } ); poly.push_back( { 1, 0 } );
             poly.push_back( { 1, 1 } ); poly.push_back( { 0, 1 } );
 
-            // couper par la bissectrice de puissance avec chaque voisin. Passer par les VOISINS
-            // plutot que par les centres de puissance des faces evite d'avoir a traiter a part les
-            // faces infinies : un demi-plan est un demi-plan, borne ou non.
+            // cut by the power bisector with each neighbour. Going through the NEIGHBOURS
+            // rather than the power centers of the faces avoids having to handle the infinite
+            // faces separately : a half-plane is a half-plane, bounded or not.
             const auto &p0 = v->point();
             Rt::Vertex_circulator c = rt.incident_vertices( v ), done( c );
             if ( c != nullptr ) {
@@ -204,7 +204,7 @@ int main( int argc, char **argv ) {
         last_sum = sum;
     }
 
-    std::printf( "  %d germes en 2D : %.3f s (%.0f ns/germe), somme des mesures %.6f\n",
+    std::printf( "  %d seeds in 2D : %.3f s (%.0f ns/seed), sum of measures %.6f\n",
                  n, best, best / n * 1e9, last_sum );
     return 0;
 }

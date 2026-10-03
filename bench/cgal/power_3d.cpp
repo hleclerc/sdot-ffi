@@ -1,35 +1,35 @@
-// L'ETALON 3D, pendant de `power_2d.cpp` : ce que coute a CGAL la TRIANGULATION REGULIERE d'un
-// nuage pondere 3D, et l'extraction de l'adjacence.
+// THE 3D BENCHMARK, counterpart of `power_2d.cpp`: what it costs CGAL to build the REGULAR
+// TRIANGULATION of a weighted 3D cloud, and to extract the adjacency.
 //
-// = Ce qu'il mesure, et surtout ce qu'il NE mesure PAS
+// = What it measures, and above all what it does NOT measure
 //
-// Il chronometre deux choses :
+// It times two things:
 //
-//   1. `Regular_triangulation_3` sur `n` points ponderes -- l'insertion par plage, donc avec le
-//      tri spatial que CGAL fait tout seul ;
-//   2. le tour de chaque sommet (`finite_adjacent_vertices`), qui rend la LISTE DES VOISINS.
+//   1. `Regular_triangulation_3` on `n` weighted points -- range insertion, hence with the
+//      spatial sort that CGAL does on its own;
+//   2. the tour of each vertex (`finite_adjacent_vertices`), which returns the LIST OF NEIGHBORS.
 //
-// Il ne construit AUCUNE cellule : ni les sommets duals, ni les faces, ni le clip sur le cube, ni
-// les volumes. Le chiffre qui en sort est donc une BORNE INFERIEURE du prix qu'aurait CGAL pour
-// faire le meme travail que nous. C'est ce qu'on veut savoir en premier : si cette borne depasse
-// deja notre temps complet, la question est reglee sans ecrire l'extraction.
+// It builds NO cell: neither the dual vertices, nor the faces, nor the clip on the cube, nor
+// the volumes. The figure it yields is therefore a LOWER BOUND on the price CGAL would pay to
+// do the same work as us. That is what we want to know first: if this bound already exceeds
+// our full time, the question is settled without writing the extraction.
 //
-// Le controle de sanite est le nombre moyen de voisins : une cellule de Laguerre 3D poissonienne
-// en a environ 15.5, et c'est ce que notre banc compte de son cote (15.2 sur ce nuage).
+// The sanity check is the average number of neighbors: a Poissonian 3D Laguerre cell
+// has about 15.5 of them, and that is what our bench counts on its side (15.2 on this cloud).
 //
-// = Le noyau
+// = The kernel
 //
-// `Exact_predicates_inexact_constructions_kernel`, comme en 2D : predicats exacts -- ce qui rend la
-// triangulation robuste, et c'est precisement ce que notre coupe n'a pas besoin d'etre -- et
-// constructions en `double`, pour se comparer a notre FP64.
+// `Exact_predicates_inexact_constructions_kernel`, as in 2D: exact predicates -- which makes the
+// triangulation robust, and that is precisely what our cut does not need to be -- and
+// constructions in `double`, to compare with our FP64.
 
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/Regular_triangulation_3.h>
 
-// NOS en-tetes, pris tels quels dans le banc. Ils sont sans dependance -- c'est tout l'objet de
-// `2d_des_familles` -- donc les inclure ici n'y fait entrer ni CGAL ni gmp : la dependance ne va
-// que dans ce sens. `--cells` mesure alors la chaine COMPLETE : triangulation CGAL, adjacence,
-// puis NOTRE coupe et NOTRE mesure, avec les 15.5 vrais voisins au lieu des 87.8 proposes.
+// OUR headers, taken as is in the bench. They have no dependency -- that is the whole point of
+// `2d_des_familles` -- so including them here brings in neither CGAL nor gmp: the dependency goes
+// in that direction only. `--cells` then measures the COMPLETE chain: CGAL triangulation, adjacency,
+// then OUR cut and OUR measure, with the 15.5 true neighbors instead of the 87.8 proposed.
 #include "geometry/Cell3.h"
 
 #include <algorithm>
@@ -52,11 +52,11 @@ double now() {
     return duration<double>( steady_clock::now().time_since_epoch() ).count();
 }
 
-/// Un nuage de `2d_des_familles/cases/` en 3D : des lignes `#`, puis `n`, puis `n` fois « x y z w ».
-/// Meme convention de poids que nous -- CGAL minimise `|x - p|^2 - w` -- donc rien a convertir.
+/// A cloud from `2d_des_familles/cases/` in 3D: `#` lines, then `n`, then `n` times "x y z w".
+/// Same weight convention as ours -- CGAL minimizes `|x - p|^2 - w` -- so nothing to convert.
 bool load_cloud( const std::string &path, std::vector<Wp> &pts ) {
     std::FILE *f = std::fopen( path.c_str(), "rb" );
-    if ( ! f ) { std::printf( "impossible d'ouvrir '%s'\n", path.c_str() ); return false; }
+    if ( ! f ) { std::printf( "cannot open '%s'\n", path.c_str() ); return false; }
     std::fseek( f, 0, SEEK_END );
     const long sz = std::ftell( f );
     std::fseek( f, 0, SEEK_SET );
@@ -106,8 +106,8 @@ int main( int argc, char **argv ) {
         else if ( s == "--cells" ) cells = true;
         else if ( s == "--sort" ) { cells = true; tri = true; }
         else if ( s == "--help" ) {
-            std::printf( "usage: power_3d [n] [--load FICHIER] [--reps R] [--cells]\n"
-                         "  --cells  construit aussi les cellules avec NOTRE noyau, et somme\n" );
+            std::printf( "usage: power_3d [n] [--load FILE] [--reps R] [--cells]\n"
+                         "  --cells  also builds the cells with OUR kernel, and sums\n" );
             return 0;
         } else n = std::atoi( argv[ i ] );
     }
@@ -124,8 +124,8 @@ int main( int argc, char **argv ) {
     }
 
     double tt = 1e30, ta = 1e30, tc = 1e30;
-    double voisins = 0, somme = 0;
-    std::size_t caches = 0, sommets = 0;
+    double neighbors = 0, sum = 0;
+    std::size_t hidden = 0, vertices = 0;
     for ( int r = 0; r < reps; ++r ) {
         const double t0 = now();
         Rt rt( pts.begin(), pts.end() );
@@ -152,10 +152,10 @@ int main( int argc, char **argv ) {
                 c.init_as_unit_cube();
                 pd::SI id = 0;
                 if ( tri ) {
-                    // DU PLUS PROCHE AU PLUS LOIN, au sens de la puissance. Ici les 15.5 plans sont
-                    // TOUS des faces de la cellule finale : l'ordre ne change donc pas le resultat,
-                    // seulement la taille des polyedres INTERMEDIAIRES -- et la coupe balaie tous
-                    // les sommets a chaque fois.
+                    // FROM NEAREST TO FARTHEST, in the power sense. Here the 15.5 planes are
+                    // ALL faces of the final cell: the order therefore does not change the result,
+                    // only the size of the INTERMEDIATE polyhedra -- and the cut sweeps all
+                    // the vertices every time.
                     std::sort( ad.begin(), ad.end(), [ & ]( Rt::Vertex_handle a, Rt::Vertex_handle b ) {
                         const auto &pa = a->point(); const auto &pb = b->point();
                         const double da = ( pa.x() - x0 ) * ( pa.x() - x0 ) + ( pa.y() - y0 ) * ( pa.y() - y0 )
@@ -181,22 +181,22 @@ int main( int argc, char **argv ) {
 
         tt = std::min( tt, t1 - t0 );
         ta = std::min( ta, t2 - t1 );
-        if ( cells ) { tc = std::min( tc, t3 - t2 ); somme = sv; }
-        sommets = rt.number_of_vertices();
-        caches = std::size_t( n ) - sommets;
-        voisins = vs / double( sommets );
+        if ( cells ) { tc = std::min( tc, t3 - t2 ); sum = sv; }
+        vertices = rt.number_of_vertices();
+        hidden = std::size_t( n ) - vertices;
+        neighbors = vs / double( vertices );
     }
 
-    std::printf( "%-46s n=%d\n", load.empty() ? "uniforme" : load.c_str(), n );
-    std::printf( "   triangulation  %7.3f s (%7.0f ns/germe)\n", tt, 1e9 * tt / n );
-    std::printf( "   adjacence      %7.3f s (%7.0f ns/germe)\n", ta, 1e9 * ta / n );
+    std::printf( "%-46s n=%d\n", load.empty() ? "uniform" : load.c_str(), n );
+    std::printf( "   triangulation  %7.3f s (%7.0f ns/seed)\n", tt, 1e9 * tt / n );
+    std::printf( "   adjacency      %7.3f s (%7.0f ns/seed)\n", ta, 1e9 * ta / n );
     if ( cells ) {
-        std::printf( "   coupe + mesure %7.3f s (%7.0f ns/germe)\n", tc, 1e9 * tc / n );
-        std::printf( "   CHAINE ENTIERE %7.3f s (%7.0f ns/germe)   voisins %.2f   caches %zu"
-                     "   somme %.9f\n",
-                     tt + ta + tc, 1e9 * ( tt + ta + tc ) / n, voisins, caches, somme );
+        std::printf( "   cut + measure  %7.3f s (%7.0f ns/seed)\n", tc, 1e9 * tc / n );
+        std::printf( "   WHOLE CHAIN    %7.3f s (%7.0f ns/seed)   neighbors %.2f   hidden %zu"
+                     "   sum %.9f\n",
+                     tt + ta + tc, 1e9 * ( tt + ta + tc ) / n, neighbors, hidden, sum );
     } else
-        std::printf( "   BORNE INF      %7.3f s (%7.0f ns/germe)   voisins %.2f   caches %zu\n",
-                     tt + ta, 1e9 * ( tt + ta ) / n, voisins, caches );
+        std::printf( "   LOWER BOUND    %7.3f s (%7.0f ns/seed)   neighbors %.2f   hidden %zu\n",
+                     tt + ta, 1e9 * ( tt + ta ) / n, neighbors, hidden );
     return 0;
 }

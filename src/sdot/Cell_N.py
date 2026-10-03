@@ -1,10 +1,10 @@
-"""Un polytope SIMPLE en dimension >= 3 : la connectivité est portée par les sommets.
+"""A SIMPLE polytope in dimension >= 3: the connectivity is carried by the vertices.
 
-Chaque sommet est sur EXACTEMENT `d` plans ( position générale ), et nomme ses `d` coupes
-( `vertex_cuts`, indices dans `cut_ids`, croissants ) et ses `d` voisins ( `vertex_nbrs` ) -- le
-voisin `r` étant « en face » de la coupe `r` : de l'autre côté de l'arête portée par les `d - 1`
-autres coupes. C'est cette bijection qui rend les faces et les arêtes lisibles sans rien chercher.
-Les plans se relisent sur les sommets de chaque face. Côté noyau : `cell/LocalN.h`.
+Each vertex is on EXACTLY `d` planes ( general position ), and names its `d` cuts
+( `vertex_cuts`, indices into `cut_ids`, increasing ) and its `d` neighbors ( `vertex_nbrs` ) -- the
+neighbor `r` being "opposite" cut `r`: on the other side of the edge carried by the `d - 1`
+other cuts. This bijection is what makes the faces and edges readable without searching for anything.
+The planes are read back off the vertices of each face. Kernel side: `cell/LocalN.h`.
 """
 
 import numpy as np
@@ -30,11 +30,11 @@ class Cell_N( Cell ):
     default_nb_dims = 3
     _GEOMETRY = ( "vertex_positions", "vertex_cuts", "vertex_nbrs", "cut_ids" )
 
-    # ---- ce que le noyau demande ---------------------------------------------------------------
+    # ---- what the kernel asks for --------------------------------------------------------------
 
     def scratch_words( self, cap, fp_size ):
-        """`LocalN::words_for( cap )` : `cap` sommets ET `cap` coupes, avec les temporaires de la
-        coupe, de la compaction et de la triangulation"""
+        """`LocalN::words_for( cap )`: `cap` vertices AND `cap` cuts, with the temporaries of the
+        cut, of the compaction and of the triangulation"""
         d = self.dim
         return ( 4 * d + 5 ) * words_of( fp_size // 8, cap ) + ( 5 * d + 10 ) * words_of( 4, cap )
 
@@ -42,20 +42,20 @@ class Cell_N( Cell ):
         return 2 ** self.dim
 
     def _cut_capacities( self ):
-        """Ce qu'une coupe peut produire au plus : une coupe de plus, et pour les sommets, en 3D,
-        Euler sur un polytope simple ( `V = 2 F - 4` ), donc `2 ( nc + 1 ) - 4`. Au-delà il n'y a
-        pas de borne linéaire en `F` ; chaque sommet neuf est sur une arête traversante, et un
-        polytope simple a `nv d / 2` arêtes."""
+        """The most a cut can produce: one more cut, and for the vertices, in 3D,
+        Euler on a simple polytope ( `V = 2 F - 4` ), hence `2 ( nc + 1 ) - 4`. Beyond that there is
+        no linear bound in `F`; each new vertex is on a crossing edge, and a
+        simple polytope has `nv d / 2` edges."""
         d = self.dim
         cap_c = self._cap_c() + 1
         cap_v = 2 * cap_c - 4 if d == 3 else self._cap_v() * ( 1 + d // 2 )
         return max( cap_v, self.init_capacity() ), cap_c
 
-    # ---- lire un item, et ce qui s'en dérive -------------------------------------------------------
+    # ---- reading an item, and what derives from it -------------------------------------------------
 
     def _item( self, b ):
         d = self.dim
-        if self.vertex_positions.raw is None:              # jamais écrite : pas un sommet
+        if self.vertex_positions.raw is None:              # never written: not a vertex
             return Item( np.zeros( ( 0, d ) ), np.zeros( 0, int ), vc = np.zeros( ( 0, d ), int ), vn = np.zeros( ( 0, d ), int ) )
         nv, nc = self._count( self.nb_vertices, b ), self._count( self.nb_cuts, b )
         return Item( self._rows( self.vertex_positions, b, nv ).astype( float ),
@@ -67,7 +67,7 @@ class Cell_N( Cell ):
         return it.vc
 
     def _edges_of( self, it ):
-        """une arête par paire `( a, vn[ a, r ] )`, chacune vue une fois"""
+        """one edge per pair `( a, vn[ a, r ] )`, each seen once"""
         nv, d = it.vn.shape
         a = np.repeat( np.arange( nv ), d )
         b = it.vn.reshape( -1 )
@@ -75,7 +75,7 @@ class Cell_N( Cell ):
         return np.stack( [ a[ keep ], b[ keep ] ], axis = 1 )
 
     def _edge_cuts_of( self, it ):
-        """l'arête en face de la coupe `r` du sommet `a` est portée par ses `d - 1` autres coupes"""
+        """the edge opposite cut `r` of vertex `a` is carried by its other `d - 1` cuts"""
         nv, d = it.vn.shape
         res = []
         for a in range( nv ):
@@ -85,8 +85,8 @@ class Cell_N( Cell ):
         return np.asarray( res, int ).reshape( -1, d - 1 )
 
     def _faces_of( self, it ):
-        """En 3D seulement : pour chaque coupe, la marche de voisin en voisin sur sa face -- de `v`
-        on va vers `vn[ v, r ]` pour les deux `r` dont la coupe `vc[ v, r ]` n'est PAS la face."""
+        """In 3D only: for each cut, the walk from neighbor to neighbor on its face -- from `v`
+        we go to `vn[ v, r ]` for the two `r` whose cut `vc[ v, r ]` is NOT the face."""
         nv, d = it.vc.shape
         if d != 3:
             return []
@@ -109,9 +109,9 @@ class Cell_N( Cell ):
         return res
 
     def _planes_of( self, it ):
-        """Le vecteur nul de l'espace engendré par les sommets de chaque face -- par SVD, qui ne
-        dépend ni de l'ordre ni de sommets confondus -- orienté vers l'extérieur par le sommet LE
-        PLUS LOIN du plan ( pas le premier venu, qui peut être confondu avec la face à 1e-16 près )."""
+        """The null vector of the space spanned by the vertices of each face -- by SVD, which depends
+        neither on the order nor on coincident vertices -- oriented outward by the vertex FARTHEST
+        from the plane ( not the first one that comes, which may coincide with the face to 1e-16 )."""
         nv, d = it.vp.shape
         dirs, offs = np.zeros( ( len( it.cid ), d ) ), np.zeros( len( it.cid ) )
         for k in range( len( it.cid ) ):
@@ -121,7 +121,7 @@ class Cell_N( Cell ):
             pts = it.vp[ on ]
             _, sv, vt = np.linalg.svd( pts - pts.mean( axis = 0 ), full_matrices = True )
             if len( sv ) >= d and sv[ d - 2 ] <= 1e-9 * max( sv[ 0 ], 1e-300 ):
-                continue                                    # pas un hyperplan : face dégénérée
+                continue                                    # not a hyperplane: degenerate face
             n = vt[ -1 ]
             off = float( n @ pts[ 0 ] )
             others = np.setdiff1d( np.arange( nv ), on )
