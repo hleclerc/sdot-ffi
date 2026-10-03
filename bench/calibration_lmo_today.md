@@ -431,3 +431,99 @@ both carry the weights).
 * The 3D runs are 1 call per rep; 3D double at 11 s per call is 2 minutes of measurement per case.
 * The accuracy reference is the GPU double kernel, not the CPU witness (the old one): GPU double against CPU double differs by
   ~1e-10 (old campaign, `doc/03-chiffres.md`), far below the float errors measured here.
+
+
+# GPU step 2: a dedicated 2D cell kernel for `measures` (2026-10-03 night -> 10-04)
+
+Code: `include/sdot/gpu/Cell2D.cuh` (header comment = the design), dispatched by `PowerDiagram_Bsp._measures_on_card`
+(`src/sdot/PowerDiagram_Bsp.py`; hook `PowerDiagram._measures_on_card` called first by `measures`). It takes the call only
+on a CUDA device, in 2D, with the BSP tree, the unit density, a pure box domain, no neighbour memory and nothing to
+differentiate (traced or `requires_grad` seeds); everything else (3D, moments, facets, hessian rows, derivatives,
+distributions, other domains) keeps the generic path. `pd.use_card_cells = False` or `SDOT_CARD_CELLS=0` forces the
+generic path; `SDOT_CARD_STATS=1` prints the overflow counts of each pass. loom: `CudaQueue.h` gains `launch_kernel`
+(a hand-written `__global__` with its own geometry, on the call's stream, timed like loom's launches: slot kind
+"custom"), `resident_grid`, `read_back`, `zero_fill`; the body is a plain `FfiCode.inline` handler with `allocator = True`.
+Tests: `tests/test_CardCells.py` (5 entries: card vs generic double on uniform / clustered / off-centre box, three
+weight regimes incl. empty cells, rings of 12 / 40 / 100 / 300 seeds around a centre (second, third and fourth passes),
+1 seed, 7 seeds, a grid, a seed outside the domain + duplicated seeds, weights changed between calls).
+
+## Protocol
+
+Unchanged (`bench_diagram` on `lmo-jax` through the exclusive queue, kernel-only = sum of all the launches of the call,
+min of 10). Some intermediate runs below were taken while a CPU job of the user ran next to the queue (it does not
+touch the card; the GPU kernel times were stable to 1-2 % across those runs). Final runs: `runs/bench_diagram/diagram/2026-10-04_00h51m43-*`.
+
+## Experiment log (kernel-only ns/seed; P1..P4 = the passes, ms; `fin` = the float finish kernel)
+
+| # | change | uniform 1e6 float | lines V float | lines eq float | double (u / lV / le) | notes |
+|---|---|---|---|---|---|---|
+| 0 | baseline (generic path, scratch in global memory) | 78.1 | 102.1 | 403.7 | 183 / 191 / 963 | 88 regs, acc. median 3.7e-5, max 2.4e-3 |
+| 1 | levers 1-5 in one dedicated kernel: cell in registers (R1 = 8, `filmsk` masks + one barrel), overflow -> second pass (R2 = 16, no read back) -> third pass in global memory; AoS nodes in the kernel float (box rounded outward), int32 stack of 48; seed frame + two-float positions/weights + double re-solve + area on re-solved vertices | 12.2 | - | - | 92.3 / - / - | P1 7.26 ms (127 regs, 304 B local, 50 %), P2 3.97 (255 regs), P3 0.84 |
+| 1b | correctness: several outside runs on concurrent bisectors (seeds on a circle) -> keep the run of the farthest vertex (`main_run`); re-solved vertex trusted within 1e3 eps L / sin of the float one | = | | | | float vs double max 1.0e-3 -> 1.1e-8 (uniform 1e6) |
+| 2 | `__launch_bounds__( 128, 6 )` on P1 (80 regs, spills) | 23.0 | | | | REJECTED (P1 18 ms) |
+| 3 | the float re-solve in its own kernel (P1 leaves its cells in global memory, SoA) | 11.3 | | | | P1 127 -> 72 regs (88 %), P1 4.90 + fin 1.60 |
+| 4 | P2 cells deferred too; third pass in LOCAL memory (cap 64), one cell per thread | 10.5 | 81.4 | 107.3 | | lines: P3 5.6 / 6.9 ms = the unrelated big cells of a warp run one after the other |
+| 5 | late passes: one cell per WARP (first lane only) | 9.4 | 34.1 | 60.4 | | |
+| 6 | first cut by the nearest of ranks k +- 4 (to cut the transient growth) | 9.4 | 36.2 | 64.2 | | overflow stays 10.4 %: REJECTED |
+| 7 | R1 = 10 (overflow 10.5 % -> 1.0 %) | 9.2 | 42.6 | 72.7 | | P1 +1.1 ms, lines tails longer: REJECTED |
+| 8 | third pass in SHARED memory (cap 512, one lane), no fourth pass on the cases | 9.4 | 29.3 | 64.1 | | |
+| 9 | third pass = `WarpCell`: the 32 lanes share the cell (pruning test, signs, run, compaction by shuffles) | 9.3 | 26.0 | 50.4 | | the single-lane cell was 0.5-5 M cycles of dependent shared reads |
+| 10 | `WarpCell` as the SECOND pass too (cap 64) | 15.6 | 26.7 | 53.3 | | REJECTED (uniform P2 8.5 ms); kept: a leaf read by the 32 lanes at once + shuffles (P3 0.55 -> 0.44 / 1.20 -> 0.27 ms) |
+| 11 | P2 in rank order (overflow flags instead of a list) | 12.5 | 27.2 | 54.3 | | REJECTED (P2 2.3 -> 5.4 ms) |
+| 12 | state after 1-11 | 9.4 | 25.7 | 51.6 | 90.9 / 133.4 / 518.2 | |
+| 13 | pruning in FLOAT for both kernels (double kernel: the vertex rounded, a 1e-6 margin on the terms), nodes in float for both (32 / 48 B), descend into the nearest child without a push; plane norms carried in the finish | 9.4 | 24.9 | 51.9 | 56.9 / 82.1 / 283.1 | double P1 74 -> 45 ms (uniform) |
+| 14 | the float projection fallback (near-parallel planes: project the float vertex on its outgoing plane) | = | = | = | | no measurable effect, kept (harmless) |
+| 15 | `EXACT_VERTICES`: P1/P2 vertices as intersections of two planes (re-read) instead of interpolated | 10.9 | 28.2 | 57.2 | | max float/double 1.1e-8 -> 4.6e-14 (u), 2.3e-9 -> 8e-14 (lV): compile-time switch, OFF |
+
+Overflow counts (`SDOT_CARD_STATS=1`): over 8 vertices 10.45 % (uniform) / 10.2 % (lines V) / 11.2 % (lines eq); over 16:
+0.004 % / 0.13 % / 0.14 %; over the shared capacity (384 float, 256 double): 0 on the three clouds (the rings of the tests go there).
+
+## Final table (min of 10, kernel only; old = `reference_lmo_gpu.py`)
+
+| case | kernel | kernel ns/seed | wall ns/seed | main kernel regs / occ. | accuracy vs double kernel (median / p99.99 / max) | old best | new/old | baseline today |
+|---|---|---|---|---|---|---|---|---|
+| 2D uniform 1e6 | float | **9.3** | 16.9 | P1 72 / 88 % | 1.3e-14 / 7.7e-13 / 1.1e-8 | 7.6 (filnrm8); **10.6 accurate (filmsk8m: 4.9e-14 / 4.9e-12 / 4.6e-8)** | 1.22; **0.88** vs filmsk8m | 78.1 |
+| 2D uniform 1e6 | double | **57.0** | 64.7 | P1 96 / 62 % | - | 96.7 (filmsk8g) | **0.59** | 183.0 |
+| 2D lines Voronoi | float | **25.1** | 66.7 | P2 121 / 50 % | 1.4e-14 / 5.0e-12 / 2.3e-9 | 18.5 (filnrm8; filmsk8m 5.8e-15 / - / 1.8e-10) | 1.36 | 102.1 |
+| 2D lines Voronoi | double | **80.1** | 121.6 | P1 96 / 62 % | - | 132 (filnrm8) | **0.61** | 190.7 |
+| 2D lines equal | float | **52.0** | 101.8 | P1 72 / 88 % | 2.1e-14 / 1.4e-12 / **5.2e-5** (one cell) | 45.2 (filnrm8; filmsk8m 1.0e-11 / - / 2.1e-7) | 1.15 | 403.7 |
+| 2D lines equal | double | **289.0** | 336.6 | P1 99 / 50 % | - | 385 (filmix6) | **0.75** | 962.7 |
+
+Split of the float calls (ms): uniform P1 4.98, P2 2.44, P3 0.15, finish 1.58, tree + seeds + seeding 0.15; lines V
+0.66 / 1.09 / 0.55 / 0.18; lines eq 1.92 / 1.91 / 1.16 / 0.17. Double: no finish kernel (area on the vertices).
+
+* The double kernel now beats the old one everywhere (x0.59 / x0.61 / x0.75): the pruning in float (lever 4 taken past
+  the float kernel) halved its first pass.
+* The float kernel is between the old fast (7.6) and the old accurate (10.6) kernels on the uniform cloud, MORE accurate
+  than the old accurate one (median 1.3e-14 vs 4.9e-14, p99.99 7.7e-13 vs 4.9e-12, max 1.1e-8 vs 4.6e-8; 4.6e-14 max with
+  `EXACT_VERTICES` for +16 %). It costs 9.3 against 7.6 for filnrm8 mostly in the finish (1.6 ms of double arithmetic, which
+  hides nothing in a kernel of its own) and in the second pass (10 % of the cells redone from scratch at 121 registers).
+* The lines (n = 1e5) are TAIL-bound: the whole cloud is resident at once, so each pass costs its slowest warp, and the
+  passes are chained (P1 0.66 + P2 1.09 + P3 0.55 ms). The rare hard cells (a few hundred, > 16 vertices or thousands of
+  candidates) pay the walk two or three times.
+* lines equal, float max 5.2e-5: ONE cell (a seed clamped at x = 1e-4, neighbours at 2e-4 with weight gaps 1000x d^2): a cut
+  decided in float on planes whose offset is dominated by the weight gap (the `eps |w| / h^2` term) -- the float topology
+  is wrong by a sliver along a nearly parallel edge, a first-order error that neither the re-solve nor `EXACT_VERTICES`
+  removes (the old filmsk8m had 2.1e-7 there). p99.99 is 1.4e-12.
+* Wall - kernel: 7.6 ms per call in 2D uniform (dispatch, output seeding, the error buffer read, and one read back of the
+  third pass's count, a synchronization), 4.2-5 ms at 1e5 seeds; the 0.93 G-word scratch and its fill are gone.
+
+CPU unchanged (`lmo-numpy`, 8 pinned threads, double, min of 3, same session): 2D uniform 1e6 141 ns/seed, lines Voronoi 164.
+
+## What remains
+
+* float uniform: the second pass (2.4 ms for 10 % of the cells) and the finish (1.6 ms, FP64 bound: ~32 DP ops per vertex).
+  Ideas not done: continue an overflowing cell in local memory instead of restarting it; the finish in float-float.
+* lines: the tails of the chained passes (send the cells that will overflow 16 straight to the warp pass; a warp per
+  hard cell from the start).
+* the lines-equal sliver (decide near-ties in double).
+* 3D (warp per cell) is the next step, not started.
+
+## Risks
+
+* The dispatch condition is Python-side: a jit-traced or differentiated call goes to the generic path (correct, slow).
+* `MAX_DEPTH = 27` (node index and height packed in 32 bits): ~6.7e8 seeds at 10 per leaf; deeper trees fall back.
+* A cell with more than 2^18 (float) / 2^17 (double) vertices gets NaN (the fourth pass gives up after 5 growths).
+* The double kernel prunes in float with a margin of 1e-6 of the terms: conservative by construction, measured equal to
+  the generic double path to 1e-11-1e-9 (`test_CardCells`).
+* The fourth pass and the overflow statistics read a count back (a stream synchronization per call).

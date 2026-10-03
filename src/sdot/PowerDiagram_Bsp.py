@@ -84,6 +84,47 @@ class PowerDiagram_Bsp( PowerDiagram ):
         self.memo_nbrs = nbrs.raw
         self.memo_counts = counts.raw
 
+    # ---- the 2D cells of the card ( `include/sdot/gpu/Cell2D.cuh` ) -----------------------------------
+    #
+    # `measures` on a CUDA device, in 2D: one thread per cell, the cell in registers, the overflow redone by
+    # a second and a third pass, the tree as aligned records in the kernel's float, the float accuracy fixes
+    # of the old GPU campaign. It takes the call only where it computes the SAME thing: the unit density,
+    # a box domain, no neighbour memory, and nothing to differentiate ( a traced or `requires_grad` seed:
+    # the generic path, whose adjoint redoes the sweep ). `use_card_cells = False` on a diagram, or
+    # `SDOT_CARD_CELLS=0` in the environment, sends every call to the generic path ( the tests compare the two ).
+
+    use_card_cells = True
+
+    def _measures_on_card( self ):
+        import os
+        if not self.use_card_cells or os.environ.get( "SDOT_CARD_CELLS", "1" ).lower() in ( "0", "no", "false", "off" ):
+            return None
+        if self.dim_count != 2 or self.distribution is not None or self.memo_counts.is_defined:
+            return None
+        if not getattr( driver.device, "is_cuda_gpu", False ):
+            return None
+        if not self.box_min.is_defined or self.bnd_directions.is_defined:
+            return None
+        for t in ( self.sorted_positions, self.sorted_weights ):
+            if t.is_defined and ( driver.is_traced( t.raw ) or getattr( t.raw, "requires_grad", False ) ):
+                return None
+        if int( getattr( self.tree, "max_depth", 99 ) ) > 27:   # `gpu2d::MAX_DEPTH`: node index and height in 32 bits
+            return None
+
+        from loom.compilation.FfiCode import FfiCode
+        from .CellScratch import fp_size
+        tk = "float" if fp_size( self._domain_cell().kernel_dtype ) == 32 else "double"
+        res = RealTensor[ self.num_point ]()
+        loom.ffi_call(
+            "power_diagram_measures_card_2d",
+            FfiCode.inline( f"sdot::gpu2d::measures<{ tk }>( queue, args.inputs.power_diagram, args.outputs.res, args.allocator );",
+                            includes = [ "sdot/gpu/Cell2D.cuh" ], allocator = True ),
+            power_diagram = self,
+            res = loom.out( res ),
+            has_dynamic_capacity = False,
+        )
+        return res
+
     def _gather( self, seeds ):
         """`seeds[ seed_indices ]`, through the backend: a tracer stays a tracer, and the derivative
         with respect to what we gather comes back through here on its own"""

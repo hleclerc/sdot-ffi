@@ -216,6 +216,12 @@ class PowerDiagram( Aggregate ):
     def _memo_after_call( self, produced ):
         pass
 
+    # ---- a dedicated kernel for the card ( `PowerDiagram_Bsp` only ) ---------------------------------
+
+    def _measures_on_card( self ):
+        """the measures by a kernel written for the device, or `None`: the generic path takes the call"""
+        return None
+
     # ---- the scratch -------------------------------------------------------------------------------
 
     def _scratch_words( self, cap, nb_cells, with_grad ):
@@ -244,7 +250,14 @@ class PowerDiagram( Aggregate ):
         DIFFERENTIABLE with respect to the seeds, `positions` as well as `weights`, and with respect to the VALUES of
         the distribution ( `diagram::measures_bwd` redoes the same sweep ). The DOMAIN is a
         constant: a cut that comes from it carries a negative identifier, so its share goes nowhere.
+
+        On a CUDA card, in 2D, a dedicated kernel may take the call instead ( `_measures_on_card`, see
+        `PowerDiagram_Bsp` ): same cells, cell in registers.
         """
+        res = self._measures_on_card()
+        if res is not None:
+            return res
+
         dom = self._domain_cell()
         # the budget that decides parallelism: what ONE work-item holds -- its scratch, sized
         # for the backward from the forward on ( it redoes the sweep on a scratch of the same shape )
