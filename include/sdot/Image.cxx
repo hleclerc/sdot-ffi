@@ -7,6 +7,7 @@
 #include <loom/support/containers/Vector.h>           // Vector<TF,d>::zeros()          -- default `origin`
 #include <loom/support/containers/Matrix.h>
 #include <loom/support/atomic_add.h>
+#include <limits>
 #include "cell/Ids.h"
 #include "ConstantDensity.h"
 #include "CstUdPiece.h"
@@ -130,6 +131,7 @@ UTP HD void DTP::_for_each_piece( const auto &cell, auto &&ws, auto &&func ) con
     // CORRECT (the image has compact support, so the integral is finite even on an
     // infinite cell) and costs only time -- a domain (`box = ...`) removes the case.
     Vector<SI,d> k0, k1;
+    Vector<TF,d> t_lo, t_hi;                // the extent of the cell along each axis, in grid coordinates
     const bool bounded = cell.bounded();
     for ( PI a = 0; a < d; ++a ) {
         const SI nb = SI( values.shape( a ) );
@@ -138,6 +140,8 @@ UTP HD void DTP::_for_each_piece( const auto &cell, auto &&ws, auto &&func ) con
         if ( ! bounded ) {
             k0[ a ] = 0;
             k1[ a ] = nb;
+            t_lo[ a ] = - std::numeric_limits<TF>::max();
+            t_hi[ a ] =   std::numeric_limits<TF>::max();
             continue;
         }
 
@@ -155,6 +159,8 @@ UTP HD void DTP::_for_each_piece( const auto &cell, auto &&ws, auto &&func ) con
         if ( t_max < TF( knots( a, 0 ) ) || t_min > TF( knots( a, nb ) ) )
             return;
 
+        t_lo[ a ] = t_min;
+        t_hi[ a ] = t_max;
         k0[ a ] = knot_index( a, t_min, nb );
         k1[ a ] = knot_index( a, t_max, nb ) + 1;
     }
@@ -172,22 +178,30 @@ UTP HD void DTP::_for_each_piece( const auto &cell, auto &&ws, auto &&func ) con
             return;
 
     while ( true ) {
-        bool alive = true, fitted = true;
+        // A plane that every vertex already satisfies cuts nothing: it is not made. In the common case
+        // of a cell that lies inside its tile ( one tile for the whole domain, and the interior cells ) NO plane is
+        // made, nothing is copied, and the cell itself is the piece.
+        bool alive = true, fitted = true, started = false;
         for ( PI a = 0; a < d && alive; ++a ) {
             const TF lo = TF( knots( a, k[ a ] ) ) + shift[ a ];
             const TF hi = TF( knots( a, k[ a ] + 1 ) ) + shift[ a ];
+            const TF tile_lo = TF( knots( a, k[ a ] ) ), tile_hi = TF( knots( a, k[ a ] + 1 ) );
 
             // those planes carry `PIECE`: they face no seed, and that is exactly what
             // the adjoint reads to know that their share goes nowhere (see
             // `PowerDiagram::scatter_cell_grad`).
-            fitted = ( a == 0 ) ? ws.start( cell, nrm[ a ], hi )
-                                : ws.cut  (       nrm[ a ], hi );
-            if ( ! fitted ) break;
-            if ( ws.nb_vertices() == 0 ) { alive = false; break; }
-
-            fitted = ws.cut( - nrm[ a ], - lo );
-            if ( ! fitted ) break;
-            if ( ws.nb_vertices() == 0 ) { alive = false; break; }
+            if ( t_hi[ a ] > tile_hi ) {
+                fitted = started ? ws.cut( nrm[ a ], hi ) : ws.start( cell, nrm[ a ], hi );
+                started = true;
+                if ( ! fitted ) break;
+                if ( ws.nb_vertices() == 0 ) { alive = false; break; }
+            }
+            if ( t_lo[ a ] < tile_lo ) {
+                fitted = started ? ws.cut( - nrm[ a ], - lo ) : ws.start( cell, - nrm[ a ], - lo );
+                started = true;
+                if ( ! fitted ) break;
+                if ( ws.nb_vertices() == 0 ) { alive = false; break; }
+            }
         }
 
         // a cut that did not fit: the missing capacity is recorded, the host will relaunch with
@@ -199,15 +213,15 @@ UTP HD void DTP::_for_each_piece( const auto &cell, auto &&ws, auto &&func ) con
         if ( alive ) {
             const auto idx = detail::image_index_tuple( k, tuple(), Ct<int,0>() );
             const TF value = TF( values( idx ) );
-            ws.with_current( [&]( const auto &piece ) {
-                func( piece, ConstantDensity{ value, [&]( auto &&grad_dist, TF g ) {
-                    // the gradient sink of the piece: `d mass / d values( k )` is the volume of the
-                    // piece, and `k` is what this closure knows and the caller does not.
-                    // Atomic: several work-items integrate cells that touch the same tile.
-                    if constexpr ( DECAYED_TYPE_OF( grad_dist.values )::is_valid )
-                        atomic_add( grad_dist.values( idx ).ref(), g );
-                } } );
-            } );
+            auto density = ConstantDensity{ value, [&]( auto &&grad_dist, TF g ) {
+                // the gradient sink of the piece: `d mass / d values( k )` is the volume of the
+                // piece, and `k` is what this closure knows and the caller does not.
+                // Atomic: several work-items integrate cells that touch the same tile.
+                if constexpr ( DECAYED_TYPE_OF( grad_dist.values )::is_valid )
+                    atomic_add( grad_dist.values( idx ).ref(), g );
+            } };
+            if ( started ) ws.with_current( [&]( const auto &piece ) { func( piece, density ); } );
+            else           func( cell, density );
         }
 
         PI a = 0;

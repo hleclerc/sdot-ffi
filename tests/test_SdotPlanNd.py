@@ -1,6 +1,7 @@
 import numpy
 
 from errand import Param, experiment, test
+from loom.testing import need
 
 from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
                    box_half_spaces, ot_solve, write_convergence_html )
@@ -40,6 +41,7 @@ def _target_masses( plan ):
 
 
 if test( "newton_matches_the_target_masses" ):
+    need( "cpu" )
     # the basic test: the masses of the CELLS, once the fit is done, must fall back on
     # the masses of the DIRACS -- this is the only thing `SdotPlanNd` promises. ONE Gaussian, wide and
     # well centered on the cloud of diracs: the simplest case, with no density desert at all.
@@ -59,6 +61,7 @@ if test( "newton_matches_the_target_masses" ):
 
 
 if test( "ot_solve_and_the_warm_start_is_a_PLAN_not_weights" ):
+    need( "cpu" )
     # `ot_solve` is ONLY the shortcut: same plan, up to the last digits. And the warm start
     # is a PLAN -- either given through `ot_plan`, or proposed by the `OtProblem` which keeps its last
     # solution. A plan and not weights: as soon as there are coincident seeds, `w` alone does not describe
@@ -126,6 +129,7 @@ if test( "ot_solve_and_the_warm_start_is_a_PLAN_not_weights" ):
 
 
 if test( "starting_from_nonzero_weights_still_converges" ):
+    need( "cpu" )
     # the starting point should only be a matter of speed, not of result -- here we
     # start already NEAR the solution ( `weights0` drawn at random but small ) rather than from zero, and
     # the solver keeps those weights ( `start = "weights0"` ): they empty no cell.
@@ -143,6 +147,7 @@ if test( "starting_from_nonzero_weights_still_converges" ):
 
 
 if test( "no_cell_dies_even_with_scattered_targets" ):
+    need( "cpu" )
     # the HARD case ( `_scattered_target` ): without a floor, this scenario empties several cells and gets
     # stuck there. Here we check the TWO things the damping promises: no cell dies
     # ALONG THE WAY ( `min_measure` stays `> 0` at EVERY step of `plan.history` ), and
@@ -212,6 +217,7 @@ if test( "the_hessian_rows_hold_in_3d_too" ):
 
 
 if test( "newton_converges_quadratically_on_an_image" ):
+    need( "cpu" )
     # on an image, a few steps suffice, the residual drops quadratically at the end, and a warm
     # start ( the weights of a neighboring cloud ) needs only two or three -- which is what a
     # reconstruction lives on ( `otrec.models.ProjectedDiracModel` )
@@ -240,6 +246,7 @@ if test( "newton_converges_quadratically_on_an_image" ):
 
 
 if test( "newton_starts_from_a_similarity_when_the_voronoi_has_empty_cells" ):
+    need( "cpu" )
     # diracs OUTSIDE the domain ( their Voronoi cell restricted to the domain is empty ): the
     # start is the Voronoi of the cloud brought back into the domain by a similarity, written as a
     # power diagram of the original cloud -- all cells fed, and Newton converges
@@ -263,6 +270,7 @@ if test( "newton_starts_from_a_similarity_when_the_voronoi_has_empty_cells" ):
 
 
 if test( "newton_works_in_3d" ):
+    need( "cpu" )
     # the same promise in 3D, without a distribution ( Lebesgue on the cube ): the facet is a face
     rng = numpy.random.default_rng( 61 )
     n = 200
@@ -275,16 +283,37 @@ if test( "newton_works_in_3d" ):
     assert numpy.allclose( got, _target_masses( plan ), atol = 1e-11 )
 
 
+if test( "the_log_residual_and_the_lin_residual_reach_the_same_plan" ):
+    need( "cpu" )
+    # `residual = "log"` ( the default: the log residual, then the lin one as soon as `max|a-nu|/nu <= 2` ), `"lin"`
+    # ( KMT ) and `"power"` change the path, never the solution ( `solvers_des_familles` README § 24.5 )
+    rng = numpy.random.default_rng( 81 )
+    pos = rng.uniform( 0.1, 0.9, size = ( 60, 2 ) )
+    src = SumOfDiracs( pos )
+    dst = _scattered_target( 2, 4, seed = 6 )
+    plans = { r: OtProblem( src, dst ).solve( Iterative( max_iter = 200, tol = 1e-12, continuation = "never",
+                                                         tuning = Tuning( step = "trials", residual = r ) ) )
+              for r in ( "lin", "log", "power" ) }
+    for r, plan in plans.items():
+        assert plan.converged, ( r, plan.stats )
+        assert numpy.allclose( numpy.asarray( plan.weights ), numpy.asarray( plans[ "lin" ].weights ), atol = 1e-9 ), r
+    assert plans[ "lin" ].stats[ "it_switch" ] == -1, plans[ "lin" ].stats
+    assert plans[ "log" ].stats[ "it_switch" ] >= 0, plans[ "log" ].stats        # the switch happened
+
+
 if test( "the_limits_step_reaches_the_same_plan_with_fewer_diagrams" ):
+    need( "cpu" )
     # `step = "limits"` ( the default in 2D ): the same weights as KMT's trials ( `"trials"` ), and
     # fewer diagrams -- on the HARD case, where the trials back off ( `solvers_des_familles` README § 7 )
     rng = numpy.random.default_rng( 81 )
     pos = rng.uniform( 0.1, 0.9, size = ( 60, 2 ) )
     src = SumOfDiracs( pos )
     dst = _scattered_target( 2, 4, seed = 6 )
-    # ( without continuation: it is the direct Newton, and its backtracking, that we compare here )
-    a = OtProblem( src, dst ).solve( Iterative( max_iter = 200, tol = 1e-12, continuation = "never", tuning = Tuning( step = "trials" ) ) )
-    b = OtProblem( src, dst ).solve( Iterative( max_iter = 200, tol = 1e-12, continuation = "never", tuning = Tuning( step = "limits" ) ) )
+    # ( without continuation: it is the direct Newton, and its backtracking, that we compare here; with the
+    # KMT residual -- `residual = "lin"` -- the case where the trials back off: the `log` one, the default,
+    # already saves most of the backtracks of this small case, and the limits have nothing left to correct )
+    a = OtProblem( src, dst ).solve( Iterative( max_iter = 200, tol = 1e-12, continuation = "never", tuning = Tuning( step = "trials", residual = "lin" ) ) )
+    b = OtProblem( src, dst ).solve( Iterative( max_iter = 200, tol = 1e-12, continuation = "never", tuning = Tuning( step = "limits", residual = "lin" ) ) )
     assert a.converged and b.converged, ( a.stats, b.stats )
     assert numpy.allclose( numpy.asarray( a.weights ), numpy.asarray( b.weights ), atol = 1e-9 )
     assert b.stats[ "nb_diag" ] <= a.stats[ "nb_diag" ], ( a.stats[ "nb_diag" ], b.stats[ "nb_diag" ] )
@@ -292,6 +321,7 @@ if test( "the_limits_step_reaches_the_same_plan_with_fewer_diagrams" ):
 
 
 if test( "the_continuation_solves_what_direct_newton_cannot" ):
+    need( "cpu" )
     # NARROW bumps ( the bench's hard case, `solvers_des_familles` README § 9 ): cells with no
     # mass at the start, direct Newton STAGNATES; the width continuation ( `sdotplan/Continuation.h` )
     # converges, and `"auto"` triggers it by itself based on the smallest mass at the start
@@ -321,6 +351,7 @@ if test( "the_continuation_solves_what_direct_newton_cannot" ):
 
 
 if test( "the_domain_comes_from_the_density_alone" ):
+    need( "cpu" )
     # Gaussians: the domain is the support they DECLARE ( `centers +- 6 sigma` ), not
     # the envelope of the diracs -- diracs drawn in a corner of the domain have cells that go
     # far from them, and the transport sends them there ( the barycenters leave the box of the diracs )
@@ -345,6 +376,7 @@ if test( "the_domain_comes_from_the_density_alone" ):
 
 
 if test( "the_plain_storage_gives_the_same_plan" ):
+    need( "cpu" )
     # `accelerator = "plain"`: the same weights as the BSP tree, up to rounding ( the acceleration
     # only changes what the diagram costs )
     rng = numpy.random.default_rng( 71 )
@@ -395,6 +427,7 @@ if test( "moments_are_the_closed_forms" ):
 
 
 if test( "the_transport_cost_derives_by_the_envelope_theorem" ):
+    need( "cpu" )
     # `cost_and_position_grad`: the derivative of the cost with respect to the dirac positions, at the
     # fitted weights, against the finite difference of the cost itself ( each evaluation refitting
     # its weights, restarting from the previous ones ). On an IMAGE: its moments are exact ( those of a

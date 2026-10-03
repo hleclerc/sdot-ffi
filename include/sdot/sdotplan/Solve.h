@@ -49,7 +49,7 @@ namespace sdotplan {
 enum Stat : int {
     STATUS = 0, RESIDUAL, RESIDUAL0, NB_ITER, NB_DIAG, NB_BACKTRACKS, T_MAJORANT, T_DIAG, T_ASM, T_LIN, T_LIM, EPS,
     DOMAIN_MASS, NB_OVERFLOWED, NB_CELL_LIM, NB_LIMIT_ROUNDS, LIN_NB_HIERARCHIES, LIN_NB_ITER, LIN_WORST, START, T_TOTAL,
-    NB_CONTINUATION_STEPS, MIN_START_MASS,
+    NB_CONTINUATION_STEPS, MIN_START_MASS, IT_SWITCH,
     NB_STATS
 };
 enum Start : int { START_GIVEN = 0, START_VORONOI = 1, START_SIMILARITY = 2 };
@@ -60,6 +60,7 @@ enum Hist : int { H_STEP = 0, H_T, H_RESIDUAL_L2, H_MIN_MASS, H_MAX_RESIDUAL, H_
 struct SolverOptions {
     NewtonOptions newton;
     Lin    lin = Lin::AUTO;
+    LinearOptions lin_options;       ///< the tolerance, the AMG variant ( defaults: those of the solver )
     SI     cap0 = 64;                ///< vertices per local cell, at the start
     enum Continuation : int { NEVER = 0, AUTO = 1, ALWAYS = 2 };
     int    continuation = AUTO;
@@ -123,7 +124,7 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
 
     Convolved<Dist> conv( dist );
     Sweep<PD,DECAYED_TYPE_OF( dom ),Dist,TK> bal( queue, pd, pd_in, dom, dist, o.cap0 );
-    auto lin = linear_solver( o.lin, n, D );
+    auto lin = linear_solver( o.lin, n, D, o.lin_options );
     Newton<decltype( bal )> newton( bal, *lin, o.newton );
 
     // ---- the history, one row per accepted step
@@ -270,7 +271,7 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
         total.nb_limit_rounds += newton.st.nb_limit_rounds;
         total.t_asm += newton.st.t_asm;
         total.t_lim += newton.st.t_lim;
-        if ( step == 0 ) { total.residual0 = newton.st.residual0; total.eps = newton.st.eps; }
+        if ( step == 0 ) { total.residual0 = newton.st.residual0; total.eps = newton.st.eps; total.it_switch = newton.st.it_switch; }
         total.status = newton.st.status;
         total.residual = newton.st.residual;
         if ( newton.st.status == NewtonStats::LINEAR_FAILURE )
@@ -332,6 +333,7 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
     put( T_TOTAL, now() - t_begin );
     put( NB_CONTINUATION_STEPS, double( scales.size() ) );
     put( MIN_START_MASS, min_start_mass );
+    put( IT_SWITCH, double( total.it_switch ) );
 }
 
 } // namespace sdotplan

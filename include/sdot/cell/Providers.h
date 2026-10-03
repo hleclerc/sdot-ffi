@@ -153,7 +153,11 @@ struct ProviderBsp {
         TF res = 0;
         for ( int d = 0; d < D; ++d ) {
             const TF lo = TF( pd.tree.node_box( n, 0, d ) ), hi = TF( pd.tree.node_box( n, 1, d ) );
-            const TF e  = p0[ d ] < lo ? lo - p0[ d ] : ( p0[ d ] > hi ? p0[ d ] - hi : TF( 0 ) );
+            // branch-free ( it is the unpredictable one of the descent ): the distance to `[ lo, hi ]`
+            TF e = lo - p0[ d ];
+            const TF f = p0[ d ] - hi;
+            e = f > e ? f : e;
+            e = e > 0 ? e : TF( 0 );
             res += e * e;
         }
         return res;

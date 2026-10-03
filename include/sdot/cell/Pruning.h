@@ -39,10 +39,13 @@ struct Box {
     TK a[ D ], b;                                        ///< `w( q ) <= a . q + b`
 };
 
-/// the test, for a state in MEMORY ( `nb` vertices, `D` arrays )
+/// the test, for a state in MEMORY ( `nb` vertices, `D` arrays ): eight vertices per step, in
+/// registers, and out as soon as ONE block holds a vertex that can be cut. The tail is loaded
+/// PARTIALLY and its dead lanes are masked ( a stale `s` would otherwise give up a legitimate pruning ).
 template<bool WEIGHTED,class TK,int D>
 HD inline bool can_cut_box( int nb, const TK *const *v, const TK *p0, TK w0, const Box<TK,D> &B ) {
-    const TK cb = WEIGHTED ? w0 - B.b : TK( 0 );
+#ifdef __CUDACC__
+    const TK cb = WEIGHTED ? w0 - B.b : TK( 0 );         // the GPU has no register kernel: the plain loop
     for ( int i = 0; i < nb; ++i ) {
         TK s = cb;
         for ( int d = 0; d < D; ++d ) {
@@ -57,6 +60,46 @@ HD inline bool can_cut_box( int nb, const TK *const *v, const TK *p0, TK w0, con
             return true;
     }
     return false;
+#else
+    using V = asimd::SimdVec<TK,8>;
+    V lo[ D ], hi[ D ], a[ D ], half[ D ], c[ D ];
+    for ( int d = 0; d < D; ++d ) {
+        lo[ d ] = V( B.lo[ d ] );
+        hi[ d ] = V( B.hi[ d ] );
+        c [ d ] = V( p0[ d ] );
+        if constexpr ( WEIGHTED ) {
+            a   [ d ] = V( B.a[ d ] );
+            half[ d ] = V( B.a[ d ] / 2 );
+        }
+    }
+    const V cb( WEIGHTED ? w0 - B.b : TK( 0 ) ), zero( TK( 0 ) );
+
+    // `s = min_q ( |x - q|^2 - a . q ) - |x - p0|^2 + w0 - b`, for eight vertices
+    auto balance = [&]( auto load ) {
+        V s = cb;
+        for ( int d = 0; d < D; ++d ) {
+            const V x = load( d );
+            V y = x;
+            if constexpr ( WEIGHTED ) y = y + half[ d ];
+            y = asimd::min( asimd::max( y, lo[ d ] ), hi[ d ] );
+            const V u = y - x, f = x - c[ d ];
+            s = asimd::fma( u, u, s ) - f * f;
+            if constexpr ( WEIGHTED ) s = s - a[ d ] * y;
+        }
+        return s;
+    };
+
+    const int full = nb & ~7;
+    int i = 0;
+    for ( ; i < full; i += 8 )
+        if ( asimd::to_bits( asimd::ge( zero, balance( [&]( int d ) { return V::load_unaligned( v[ d ] + i ); } ) ) ) )
+            return true;
+    if ( i < nb ) {
+        const auto q = asimd::LaneRange<0>( nb - i );
+        return asimd::to_bits( asimd::ge( zero, balance( [&]( int d ) { return V::load_partial( v[ d ] + i, q ); } ) ), q ) != 0;
+    }
+    return false;
+#endif
 }
 
 /// the same test, on the eight lanes of an `StateReg` ( 2D, registers )

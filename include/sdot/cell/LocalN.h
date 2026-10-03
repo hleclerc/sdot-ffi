@@ -42,6 +42,7 @@
 #include <loom/support/common_types.h>
 #include <loom/support/containers/Matrix.h>
 #include <loom/support/containers/Vector.h>
+#include <asimd/asimd.h>
 #include "Scratch.h"
 #include "Plane.h"
 #include "State.h"
@@ -320,26 +321,59 @@ struct LocalN {
         return cut_impl( p );
     }
 
-    HD int nb_outside( const PlaneT &p ) const {
-        int res = 0;
-        for ( int i = 0; i < nv; ++i ) {
-            TK s = - p.off;
-            for ( int d = 0; d < D; ++d )
-                s += p.dir[ d ] * v[ d ][ i ];
-            res += s > 0;
-        }
-        return res;
-    }
-
-    HD int cut_impl( const PlaneT &p ) {
-        int nb_out = 0;
+    /// THE FIRST PASS: `si[ i ] = dir . v_i - off` for every vertex, written to `out` ( if not null ),
+    /// and the number of vertices strictly outside. Eight vertices per step, in registers: the
+    /// carved arrays are runtime pointers, which a compiler cannot prove disjoint from `out`, so it
+    /// does not vectorize the scalar loop. The tail is loaded PARTIALLY ( no byte beyond `nv`, and
+    /// its dead lanes do not count ).
+    HD int signed_distances( const PlaneT &p, TK *out ) const {
+#ifdef __CUDACC__
+        int nb_out = 0;                                  // the GPU has no register kernel: the plain loop
         for ( int i = 0; i < nv; ++i ) {
             TK si = - p.off;
             for ( int d = 0; d < D; ++d )
                 si += p.dir[ d ] * v[ d ][ i ];
-            s[ i ] = si;
+            if ( out )
+                out[ i ] = si;
             nb_out += si > 0;
         }
+        return nb_out;
+#else
+        using V = asimd::SimdVec<TK,8>;
+        const V zero( TK( 0 ) ), moff( - p.off );
+        V dir[ D ];
+        for ( int d = 0; d < D; ++d )
+            dir[ d ] = V( p.dir[ d ] );
+        auto dist = [&]( auto load ) {
+            V sv = moff;
+            for ( int d = 0; d < D; ++d )
+                sv = asimd::fma( dir[ d ], load( d ), sv );
+            return sv;
+        };
+        int nb_out = 0;
+        const int full = nv & ~7;
+        int i = 0;
+        for ( ; i < full; i += 8 ) {
+            const V sv = dist( [&]( int d ) { return V::load_unaligned( v[ d ] + i ); } );
+            if ( out )
+                sv.store_unaligned( out + i );
+            nb_out += __builtin_popcountll( asimd::to_bits( sv > zero ) );
+        }
+        if ( i < nv ) {
+            const auto q = asimd::LaneRange<0>( nv - i );
+            const V sv = dist( [&]( int d ) { return V::load_partial( v[ d ] + i, q ); } );
+            if ( out )
+                sv.store_partial( out + i, q );
+            nb_out += __builtin_popcountll( asimd::to_bits( sv > zero, q ) );
+        }
+        return nb_out;
+#endif
+    }
+
+    HD int nb_outside( const PlaneT &p ) const { return signed_distances( p, nullptr ); }
+
+    HD int cut_impl( const PlaneT &p ) {
+        const int nb_out = signed_distances( p, s );
         if ( nb_out == 0 )
             return CutStatus::UNCHANGED;
         if ( nb_out == nv ) {
@@ -409,18 +443,33 @@ struct LocalN {
             nn_[ D - 1 ][ i ] = rec_v[ i ];
         }
         for ( int i = 0; i < nm; ++i ) {
+            int ki[ D - 1 ];
+            for ( int a = 0; a < D - 1; ++a )
+                ki[ a ] = nk[ a ][ i ];
             for ( int j = i + 1; j < nm; ++j ) {
-                // both lists are sorted: we merge them while counting the common ones
-                int a = 0, b = 0, common = 0, ai = -1, bj = -1;
-                while ( a < D - 1 && b < D - 1 ) {
-                    if      ( nk[ a ][ i ] == nk[ b ][ j ] ) { ++common; ++a; ++b; }
-                    else if ( nk[ a ][ i ] <  nk[ b ][ j ] ) { ai = a; ++a; }
-                    else                                     { bj = b; ++b; }
+                // both lists are sorted and strictly increasing: the number of common cuts is the number of
+                // entries of `i` found in `j`, and the entry of each that is NOT shared ( the edge's
+                // opposite cut ) falls out of the same comparisons. Branch-free: a merge with a
+                // data-dependent branch per step mispredicts about as often as it decides.
+                int kj[ D - 1 ];
+                for ( int b = 0; b < D - 1; ++b )
+                    kj[ b ] = nk[ b ][ j ];
+                int common = 0, ai = 0, bj = 0;
+                for ( int a = 0; a < D - 1; ++a ) {
+                    bool in = false;
+                    for ( int b = 0; b < D - 1; ++b )
+                        in |= ki[ a ] == kj[ b ];
+                    common += in;
+                    ai = in ? ai : a;
                 }
                 if ( common != D - 2 )
                     continue;
-                if ( a < D - 1 ) ai = a;                 // the remainder, not shared
-                if ( b < D - 1 ) bj = b;
+                for ( int b = 0; b < D - 1; ++b ) {
+                    bool in = false;
+                    for ( int a = 0; a < D - 1; ++a )
+                        in |= kj[ b ] == ki[ a ];
+                    bj = in ? bj : b;
+                }
                 nn_[ ai ][ i ] = dest[ j ];
                 nn_[ bj ][ j ] = dest[ i ];
             }

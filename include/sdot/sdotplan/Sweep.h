@@ -7,8 +7,8 @@
 //     measures( a, &fa )             ONE sweep : the measure of each cell AND its facets
 //                                   `c_ij = int_{facet} rho / ( 2 |p_i - p_j| )` ( `Laplacian.h` )
 //
-// Everything runs here on the CPU queue ( `CpuQueue::run_threads` : contiguous slices of cells,
-// in storage order, where two consecutive seeds are neighbours in space ). The scratch
+// Everything runs here on the CPU queue ( `CpuQueue::run_threads` : blocks of cells dealt in turn,
+// in storage order, where two consecutive seeds are neighbours in space: `diagram::for_each_seed` ). The scratch
 // of the cells is MANAGED HERE, not by loom : a solver chains a hundred diagrams in a single
 // call, and an overflow must only restart the sweep in progress, not the whole call. One
 // row of words per thread, doubled as long as a cell does not fit.
@@ -126,7 +126,7 @@ struct Sweep {
     PD             &pd;                                  ///< the weights are written there ( output views )
     const Dom      &dom;
     const Dist     *dist;                                ///< the current density ( it changes from one step to the next )
-    int             nt;                                  ///< virtual threads ( contiguous slices )
+    int             nt;                                  ///< virtual threads ( blocks of cells dealt in turn )
     SI              cap;                                 ///< vertices per local cell
     SI              words = 0;
     std::vector<std::vector<std::int32_t>> scratch;      ///< one row per thread
@@ -220,15 +220,13 @@ struct Sweep {
                 else                     piece = c;
                 auto &fv = fa_th[ t ];
                 fv.clear();
-                SI b, e;
-                thread_range( n, t, nt, b, e );
-                for ( SI k = b; k < e; ++k ) {
+                diagram::for_each_seed<PD>( n, t, nt, [&]( SI k ) {
                     const SI i = pd.user_id( k );
                     if ( ! measure_and_facets( pd, k, c, piece, dom, *dist, a[ i ],
                                                [&]( SI j, double cij ) { fv.push_back( Facet{ i, pd.user_id( j ), cij } ); },
                                                fa != nullptr ) ) {
                         overflowed = true;
-                        return;
+                        return false;
                     }
                     // the memory ( 3D ) : the neighbours of this cell, proposed first to the next sweep --
                     // even from a rejected trial, a memory stays exact ( it only orders the cuts )
@@ -236,7 +234,8 @@ struct Sweep {
                         if constexpr ( PD::has_memo )
                             diagram::memorize( c, k, pd.memo_nbrs, pd.memo_counts );
                     }
-                }
+                    return true;
+                } );
             } );
             if ( ! overflowed )
                 break;
@@ -280,20 +279,18 @@ struct Sweep {
                 if constexpr ( nbc > 1 ) piece.attach( cv, cap );
                 else                     piece = c;
                 double acc = 0;
-                SI b, e;
-                thread_range( n, t, nt, b, e );
-                for ( SI k = b; k < e; ++k ) {
+                diagram::for_each_seed<PD>( n, t, nt, [&]( SI k ) {
                     const SI i = pd.user_id( k );
                     if ( ! diagram::make_cell( pd, c, k, dom ) ) {
                         overflowed = true;
-                        return;
+                        return false;
                     }
                     TF m = 0, m2 = 0;
                     TF mx[ D ];
                     auto first = [&]( int d ) -> TF & { return mx[ d ]; };
                     if ( ! diagram::integrate_moments_into<TF>( m, first, m2, c, piece, *dist ) ) {
                         overflowed = true;
-                        return;
+                        return false;
                     }
                     const auto p = pd.point( k );
                     double pp = 0, px = 0;
@@ -307,7 +304,8 @@ struct Sweep {
                     // and dividing by zero downstream would be worse
                     for ( int d = 0; d < D; ++d )
                         bary[ size_t( i ) * D + d ] = double( m ) > 0 ? double( mx[ d ] ) / double( m ) : double( p[ d ] );
-                }
+                    return true;
+                } );
                 cost_th[ t ] = acc;
             } );
             if ( ! overflowed )

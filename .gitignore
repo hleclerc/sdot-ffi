@@ -26,3 +26,4 @@ runs/
 # misc
 tmp/
 .cache/
+bench/cases/

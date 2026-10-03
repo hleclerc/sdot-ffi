@@ -74,13 +74,15 @@ from .PowerDiagram import PowerDiagram
 # what `stats` carries, in the order of `sdotplan/Solve.h::Stat`
 _STATS = [ "status", "residual", "residual0", "nb_iter", "nb_diag", "nb_backtracks", "t_majorant", "t_diag", "t_asm", "t_lin", "t_lim", "eps",
            "domain_mass", "nb_overflowed", "nb_cell_lim", "nb_limit_rounds", "lin_nb_hierarchies", "lin_nb_iter", "lin_worst", "start", "t_total",
-           "nb_continuation_steps", "min_start_mass" ]
+           "nb_continuation_steps", "min_start_mass", "it_switch" ]
 # one row of `history`, in the order of `sdotplan/Solve.h::Hist`
 _HISTORY = [ "step", "t", "residual_l2", "min_measure", "max_abs_residual", "nb_diag", "nb_evals", "s" ]
 _STATUS = { 0: "running", 1: "converged", 2: "max iterations", 3: "stagnation", 4: "linear solver failure" }
 _START = { 0: "weights0", 1: "voronoi", 2: "similarity" }
 _LIN = { "auto": 0, "cholesky": 1, "amg": 2, "cg": 3 }
+_AMG_VARIANT = { "auto": -1, "sa_spai0": 0, "sa_gs": 1, "rs_gs": 2 }
 _STEP = { "trials": 0, "limits": 1 }
+_RESIDUAL = { "lin": 0, "log": 1, "power": 2 }
 _CONTINUATION = { "never": 0, "auto": 1, "always": 2 }
 
 #: the old arguments of `SdotPlanNd( src, dst, ... )`, and where they live now -- read by the
@@ -104,10 +106,15 @@ class _Options( Aggregate ):
     conv_ratio     : RealTensor
     conv_min       : RealTensor
     conv_threshold : RealTensor
+    residual_power : RealTensor
+    lin_tol        : RealTensor
+    residual_switch : RealTensor
     max_iter       : IntTensor
     max_backtracks : IntTensor
     lin            : IntTensor
+    amg_variant    : IntTensor
     step           : IntTensor
+    residual       : IntTensor
     trace          : IntTensor
     continuation   : IntTensor
     cap0           : IntTensor
@@ -185,6 +192,10 @@ class SdotPlanNd:
             raise ValueError( "step = 'limits': 2D only for now ( see `sdotplan/Bounds.h` )" )
         if step not in _STEP:
             raise ValueError( f"unknown step: { tun.step !r } ( 'auto', 'trials' or 'limits' )" )
+        if tun.amg_variant not in _AMG_VARIANT:
+            raise ValueError( f"unknown amg_variant: { tun.amg_variant !r } ( { ', '.join( _AMG_VARIANT ) } )" )
+        if tun.residual not in _RESIDUAL:
+            raise ValueError( f"unknown residual: { tun.residual !r } ( { ', '.join( _RESIDUAL ) } )" )
         if tun.linear_solver not in _LIN:
             raise ValueError( f"unknown linear_solver: { tun.linear_solver !r } ( { ', '.join( _LIN ) } )" )
 
@@ -219,8 +230,9 @@ class SdotPlanNd:
             mult_ok = float( tun.restart_factor ), factor = 0.9, beta0 = 0.25, mult_lim = 2.0, confidence = 0.0,
             conv_s0 = float( tun.conv_start or 0.0 ), conv_ratio = float( tun.conv_ratio ),
             conv_min = float( tun.conv_min or 0.0 ), conv_threshold = float( tun.conv_threshold ),
-            max_iter = int( settings.max_iter ), max_backtracks = int( tun.max_backtracks ), lin = _LIN[ tun.linear_solver ],
-            step = _STEP[ step ], trace = int( bool( verbose ) ), continuation = _CONTINUATION[ settings.continuation ],
+            residual_power = float( tun.residual_power ), lin_tol = float( tun.linear_tol or 0.0 ), residual_switch = float( tun.residual_switch ),
+            max_iter = int( settings.max_iter ), max_backtracks = int( tun.max_backtracks ), lin = _LIN[ tun.linear_solver ], amg_variant = _AMG_VARIANT[ tun.amg_variant ],
+            step = _STEP[ step ], residual = _RESIDUAL[ tun.residual ], trace = int( bool( verbose ) ), continuation = _CONTINUATION[ settings.continuation ],
             cap0 = int( pd._scratch_capacity ),
             kernel_fp_size = fp_size( pd.kernel_dtype ),
         )
@@ -266,7 +278,9 @@ class SdotPlanNd:
                     "no.mult_lim = double( inputs.options.mult_lim ); no.confidence = double( inputs.options.confidence );",
                     "no.maxit = int( SI( inputs.options.max_iter ) ); no.max_backtracks = int( SI( inputs.options.max_backtracks ) );",
                     "no.step = int( SI( inputs.options.step ) ); no.trace = SI( inputs.options.trace ) != 0;",
+                    "no.residual = int( SI( inputs.options.residual ) ); no.power = double( inputs.options.residual_power ); no.switch_residual = double( inputs.options.residual_switch );",
                     "os.lin = sdotplan::Lin( int( SI( inputs.options.lin ) ) ); os.cap0 = SI( inputs.options.cap0 );",
+                    "os.lin_options.tol = double( inputs.options.lin_tol ); os.lin_options.amg_variant = int( SI( inputs.options.amg_variant ) );",
                     "os.continuation = int( SI( inputs.options.continuation ) ); os.continuation_threshold = double( inputs.options.conv_threshold );",
                     "os.conv_s0 = double( inputs.options.conv_s0 ); os.conv_ratio = double( inputs.options.conv_ratio ); os.conv_min = double( inputs.options.conv_min );",
                     f"sdotplan::solve<TK_sdotplan>( queue, pd_sdotplan, inputs.power_diagram, inputs.dom_cell, { dist_expr }, inputs.nu, inputs.w0, os, "
@@ -335,6 +349,7 @@ class SdotPlanNd:
         st = stats.raw
         self.stats = { name: float( st[ k ] ) for k, name in enumerate( _STATS ) }
         self.stats[ "status" ] = _STATUS.get( int( self.stats[ "status" ] ), "?" )
+        self.stats[ "it_switch" ] = int( self.stats[ "it_switch" ] )
         self.stats[ "start" ] = _START.get( int( self.stats[ "start" ] ), "?" )
         for name in ( "nb_iter", "nb_diag", "nb_backtracks", "nb_overflowed", "nb_cell_lim", "nb_limit_rounds",
                       "lin_nb_hierarchies", "lin_nb_iter", "nb_continuation_steps" ):

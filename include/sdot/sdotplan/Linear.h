@@ -12,8 +12,11 @@
 //             at n=1e5, and in 2D up to a few hundred thousand seeds.
 //   AMG       AMGCL, algebraic multigrid + CG. The hessian is the laplacian of an almost
 //             planar graph: the cost stays O( n ). 4.9x on the total at n=1e6 against
-//             Cholesky. Ruge-Stuben+GS, which picks its coarse nodes edge by edge, holds on
-//             the clouds where smoothed aggregation fails ( incomparable edge weights ).
+//             Cholesky. The default is that of the old `newton` bench: smoothed aggregation + spai0
+//             ( parallel on both sides ), `LinearOptions::amg_variant` selects Ruge-Stuben+GS, which
+//             picks its coarse nodes edge by edge and holds on the clouds where smoothed aggregation
+//             fails ( incomparable edge weights ). The builtin backend of AMGCL is parallel through
+//             OPENMP only: see `Linear.cpp` for what that takes.
 //   CG        the conjugate gradient preconditioned by Jacobi, written here: what remains when neither
 //             Eigen nor AMGCL are there ( `__has_include` ). Five times slower than Cholesky, but
 //             always available.
@@ -50,9 +53,15 @@ struct LinearSolver {
     LinearStats st;
 };
 
-/// THE solver for `method` -- AUTO: Cholesky in 2D up to 3e5 seeds if it is there, AMG if it is
+/// the settings of the solvers that have some ( `0` / `-1`: the default of the solver )
+struct LinearOptions {
+    double tol = 0;           ///< AMG, CG: the RELATIVE residual to reach ( AMG default: 1e-6, README § 17.2; the old `newton` bench ran 1e-10 )
+    int    amg_variant = -1;  ///< AMG: 0 aggregation + spai0 ( the default ), 1 aggregation + Gauss-Seidel, 2 Ruge-Stuben + Gauss-Seidel
+};
+
+/// THE solver for `method` -- AUTO: AMG when it is compiled with OpenMP ( parallel ), else Cholesky in 2D up to 3e5 seeds, AMG if it is
 /// there, CG otherwise. A requested method that is absent falls back on the next available one.
-std::unique_ptr<LinearSolver> linear_solver( Lin method, SI n, int dim );
+std::unique_ptr<LinearSolver> linear_solver( Lin method, SI n, int dim, const LinearOptions &opts = {} );
 
 /// the compiled methods ( a mask: bit `int( Lin::X )` )
 int available_linear_methods();

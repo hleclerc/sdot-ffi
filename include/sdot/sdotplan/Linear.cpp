@@ -26,6 +26,11 @@
 #  include <amgcl/solver/cg.hpp>
 #endif
 
+#ifdef _OPENMP
+#  include <omp.h>
+#  include <cstdlib>
+#endif
+
 #if __has_include( <Eigen/SparseCholesky> )
 #  define SDOT_EIGEN 1
 #  include <Eigen/SparseCholesky>
@@ -100,8 +105,8 @@ struct Cg : LinearSolver {
 #ifdef SDOT_AMGCL
 struct Amg : LinearSolver {
     enum Variant : int { SA_SPAI0 = 0, SA_GS = 1, RS_GS = 2 };
-    int    variant = RS_GS;
-    double tol      = 1e-10;       ///< RELATIVE residual
+    int    variant = SA_SPAI0;     ///< the default of the old `newton` bench
+    double tol      = 1e-6;        ///< RELATIVE residual: a DAMPED direction needs no more ( README § 17.2: 1e-4 starts to cost diagrams ); the old `newton` bench ran at 1e-10
     int    maxit    = 20000;
 
     const char *name() const override {
@@ -110,6 +115,15 @@ struct Amg : LinearSolver {
     }
 
     bool solves( const Laplacian &L, const std::vector<double> &b, std::vector<double> &d ) override {
+#ifdef _OPENMP
+        // as many OpenMP threads as the pool has workers, unless the user chose ( `OMP_NUM_THREADS` ): more threads
+        // than the pinned pool's cores oversubscribes them ( measured: 3D planes, 12.0 s of linear algebra with 16
+        // threads against 2.7 s with 8 )
+        if ( ! std::getenv( "OMP_NUM_THREADS" ) )
+            if ( const char *nt = std::getenv( "SDOT_NB_THREADS" ) )
+                if ( std::atoi( nt ) > 0 )
+                    omp_set_num_threads( std::atoi( nt ) );
+#endif
         const SI n = L.n, m = n - 1;
         const double t0 = now();
         std::vector<int> ptr, col;
@@ -225,10 +239,19 @@ int available_linear_methods() {
     return res;
 }
 
-std::unique_ptr<LinearSolver> linear_solver( Lin method, SI n, int dim ) {
+std::unique_ptr<LinearSolver> linear_solver( Lin method, SI n, int dim, const LinearOptions &opts ) {
     const int available = available_linear_methods();
+    // AUTO. The builtin backend of AMGCL is parallel through OpenMP ONLY. With it ( `-fopenmp` ), AMG wins from 2D
+    // uniform on ( 0.84 s of linear algebra against 1.78 s for Cholesky, 8 pinned threads, n = 1e5 ) and
+    // everywhere in 3D; the old bench chose it in 2D too. Without it, AMG is sequential and 4x slower than
+    // that ( 3.6 s ): Cholesky stays the choice in 2D up to a few hundred thousand seeds.
+#ifdef _OPENMP
+    constexpr bool amg_is_parallel = true;
+#else
+    constexpr bool amg_is_parallel = false;
+#endif
     if ( method == Lin::AUTO )
-        method = dim <= 2 && n <= 300000 ? Lin::CHOLESKY : Lin::AMG;
+        method = ( dim <= 2 && n <= 300000 && ! amg_is_parallel ) ? Lin::CHOLESKY : Lin::AMG;
     if ( method == Lin::CHOLESKY && ! ( available & ( 1 << int( Lin::CHOLESKY ) ) ) ) method = Lin::AMG;
     if ( method == Lin::AMG      && ! ( available & ( 1 << int( Lin::AMG      ) ) ) ) method = Lin::CHOLESKY;
     if ( ! ( available & ( 1 << int( method ) ) ) )                                   method = Lin::CG;
@@ -236,9 +259,16 @@ std::unique_ptr<LinearSolver> linear_solver( Lin method, SI n, int dim ) {
     if ( method == Lin::CHOLESKY ) return std::make_unique<Cholesky>();
 #endif
 #ifdef SDOT_AMGCL
-    if ( method == Lin::AMG ) return std::make_unique<Amg>();
+    if ( method == Lin::AMG ) {
+        auto res = std::make_unique<Amg>();
+        if ( opts.tol > 0 ) res->tol = opts.tol;
+        if ( opts.amg_variant >= 0 ) res->variant = opts.amg_variant;
+        return res;
+    }
 #endif
-    return std::make_unique<Cg>();
+    auto res = std::make_unique<Cg>();
+    if ( opts.tol > 0 ) res->tol = opts.tol;
+    return res;
 }
 
 } // namespace sdotplan

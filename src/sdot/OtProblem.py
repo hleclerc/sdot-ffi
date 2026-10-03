@@ -66,16 +66,25 @@ class Tuning:
     def __init__( self,
                   # the step, and the linear solver -- `auto` = what § 24.4 concludes
                   step = "auto", linear_solver = "auto",
+                  # the AMG: `auto` = aggregation + spai0 ( the old `newton` default ), `rs_gs`, `sa_gs`; the relative
+                  # tolerance of the iterative solvers ( `None`: 1e-6 for AMG, README § 17.2 )
+                  amg_variant = "auto", linear_tol = None,
                   # the scale of the width continuation ( § 9.2 : the ratio sqrt( 2 ) is measured )
                   conv_start = None, conv_ratio = 2 ** 0.5, conv_min = None, conv_threshold = 1e-2,
                   # the damping safeguards ( § 3 : `restart_factor = 4` is measured )
                   t_min = 1e-10, max_backtracks = 60, restart_factor = 4.0, mass_rtol = 0.0,
+                  # the residual of the direction and of the merit ( § 24.5 ): `log` then `lin` once
+                  # `max|a-nu|/nu <= residual_switch` ( the old default, -50 % of the diagrams on the hard
+                  # cases ), `lin` ( the previous behaviour ), or `power` ( `g_p`, `p = residual_power` )
+                  residual = "log", residual_power = 0.5, residual_switch = 2.0,
                   # the aggregation ( § 23.5 : trouble starts around 0.2 % of the median spacing )
                   delta_aggregation = None,
                   # the machine : the spatial accelerator, the neighbour memory ( § 11 ), the scratch ( § 18.2 )
                   accelerator = None, memory = None, scratch_capacity = None ):
         self.step              = step
         self.linear_solver     = linear_solver
+        self.amg_variant       = amg_variant
+        self.linear_tol        = linear_tol
         self.conv_start        = conv_start
         self.conv_ratio        = conv_ratio
         self.conv_min          = conv_min
@@ -84,6 +93,9 @@ class Tuning:
         self.max_backtracks    = max_backtracks
         self.restart_factor    = restart_factor
         self.mass_rtol         = mass_rtol
+        self.residual          = residual
+        self.residual_power    = residual_power
+        self.residual_switch   = residual_switch
         self.delta_aggregation = delta_aggregation
         self.accelerator       = accelerator
         self.memory            = memory

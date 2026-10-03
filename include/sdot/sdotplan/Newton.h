@@ -38,6 +38,24 @@
 // measured ( -37 % of diagrams on the lines, the backtracks disappear on the densities ); it
 // requires a limits pass that only 2D knows how to do today.
 //
+// = The residual ( `solvers_des_familles` § 24.5, `NewtonOptions::residual` )
+//
+// The Newton system and the merit of the damping can be written on `g( a_i / nu_i )` instead of
+// `a_i - nu_i`: the same solution, another Newton and another judge. With the power family
+//
+//     g_p( x ) = ( x^p - 1 ) / p,   g_p'( x ) = x^( p - 1 ),   g_0 = log,   x = a_i / nu_i ( floored at 1e-8 )
+//
+// `p = 1` is LIN ( up to the sign ), `p = 0` is LOG. The direction solves `L d = b` with
+// `b_i = ( nu_i / g'( x_i ) ) ( c - g( x_i ) )`, `c` the weighted mean that makes `b` sum to zero ( the
+// gauge deletes a row: without it that row would carry the whole inconsistency ), and the merit is the
+// dimensionless norm `| g( a / nu ) - mean |_2` ( LIN: `| a - nu |_2`, the reference numbers ).
+// A starving cell ( `x << 1` ) then asks for a fraction of its logarithmic gap only, which is what the
+// wide dynamic of `a / nu` ( 1 to 2000 ) of the first iterations needs: -50 % of the diagrams on the
+// hard 2D cases, -37 % in 3D ( README § 24 ). LIN is the true Newton and the one that converges
+// quadratically at the end, so the residual SWITCHES to LIN, once and for all, as soon as
+// `max |a - nu| / nu <= switch_residual` ( 2 ): near the solution every residual gives the same
+// direction. The default is the old one: LOG, then LIN. `residual = LIN` is the previous behaviour.
+//
 // = What an iteration costs
 //
 // ONE diagram per trial step, and nothing more: the accepted step delivers both the measures ( the
@@ -70,6 +88,10 @@ struct NewtonOptions {
     double beta0      = 0.25;    ///< LIMITS: the very first trial
     double mult_lim   = 2;       ///< LIMITS: after a trial that passed DIRECTLY, `beta *= mult_lim`
     double confidence = 0;       ///< LIMITS: after a CORRECTED step, the next trial is at least `confidence * t`
+    enum Residual : int { LIN = 0, LOG = 1, POWER = 2 };
+    int    residual   = LOG;     ///< the residual `g` of the direction and of the merit ( see the head of the file )
+    double power      = 0.5;     ///< POWER: the exponent `p` of `g_p` ( LOG is `p = 0`, LIN `p = 1` )
+    double switch_residual = 2;  ///< back to LIN once `max |a - nu| / nu <= switch_residual` ( 0: never )
     /// called after each ACCEPTED step ( and at the start, `it = 0` ): `w` and `a` are those of the step
     std::function<void( int it, double t, int nb_evals )> after_step;
 };
@@ -81,6 +103,7 @@ struct NewtonStats {
     double residual0 = 0;           ///< the same AT THE START
     double eps    = 0;           ///< the mass floor of the damping
     int    nb_iter = 0, nb_backtracks = 0;
+    int    it_switch = -1;       ///< the iteration where the residual switched to LIN ( -1: never, or LIN from the start )
     SI     nb_cell_lim = 0;      ///< cells computed by the limits passes, in all
     int    nb_limit_rounds = 0;   ///< LIMITS: trials corrected by local limits
     double t_asm = 0, t_lin = 0, t_lim = 0;
@@ -119,6 +142,7 @@ struct Newton {
     NewtonStats         st;
     double              t_last = 1;   ///< the last accepted step
     int                 nb_evals_last = 0;
+    int                 res_cur = NewtonOptions::LIN;   ///< the residual IN USE ( `switch_residual` changes it )
     double              beta;            ///< LIMITS: the next trial -- KEPT from one `solves` to the next ( the
                                          ///< steps of a continuation: a close start accepts `t = 1` right away )
 
@@ -130,10 +154,52 @@ struct Newton {
         return std::sqrt( s );
     }
 
-    /// `| a - nu |_2`, the merit of the damping
+    /// `g( x )` and `g'( x )` of the residual `r`, `x = a / nu` floored away from zero
+    static double g_of( double x, int r, double p ) {
+        x = std::max( x, 1e-8 );
+        if ( r == NewtonOptions::POWER ) return p == 0 ? std::log( x ) : ( std::pow( x, p ) - 1 ) / p;
+        return r == NewtonOptions::LOG ? std::log( x ) : x - 1;
+    }
+    static double gp_of( double x, int r, double p ) {
+        x = std::max( x, 1e-8 );
+        if ( r == NewtonOptions::POWER ) return std::pow( x, p - 1 );
+        return r == NewtonOptions::LOG ? 1 / x : 1;
+    }
+
+    /// the right-hand side of Newton for the residual in use: `b_i = nu_i / g'( x_i ) ( c - g( x_i ) )`;
+    /// LIN gives `nu - a`
+    void rhs( const std::vector<double> &A, std::vector<double> &b ) const {
+        const SI n = SI( A.size() );
+        b.assign( n, 0.0 );
+        if ( res_cur == NewtonOptions::LIN ) {
+            for ( SI i = 0; i < n; ++i ) b[ i ] = nu[ i ] - A[ i ];
+            return;
+        }
+        double su = 0, sug = 0;
+        for ( SI i = 0; i < n; ++i ) {
+            const double x = A[ i ] / nu[ i ], u = nu[ i ] / gp_of( x, res_cur, o.power );
+            su += u;
+            sug += u * g_of( x, res_cur, o.power );
+        }
+        const double c = sug / su;
+        for ( SI i = 0; i < n; ++i ) {
+            const double x = A[ i ] / nu[ i ];
+            b[ i ] = nu[ i ] / gp_of( x, res_cur, o.power ) * ( c - g_of( x, res_cur, o.power ) );
+        }
+    }
+
+    /// the merit of the damping: `| a - nu |_2` for LIN, `| g( a / nu ) - mean |_2` otherwise
     double merit( const std::vector<double> &A ) const {
+        const SI n = SI( A.size() );
         double s = 0;
-        for ( SI i = 0; i < SI( A.size() ); ++i ) s += ( nu[ i ] - A[ i ] ) * ( nu[ i ] - A[ i ] );
+        if ( res_cur == NewtonOptions::LIN ) {
+            for ( SI i = 0; i < n; ++i ) s += ( nu[ i ] - A[ i ] ) * ( nu[ i ] - A[ i ] );
+            return std::sqrt( s );
+        }
+        double m = 0;
+        for ( SI i = 0; i < n; ++i ) m += g_of( A[ i ] / nu[ i ], res_cur, o.power );
+        m /= double( n );
+        for ( SI i = 0; i < n; ++i ) { const double e = g_of( A[ i ] / nu[ i ], res_cur, o.power ) - m; s += e * e; }
         return std::sqrt( s );
     }
 
@@ -162,16 +228,24 @@ struct Newton {
         if ( o.after_step ) o.after_step( 0, 0, 1 );
 
         double eps = 0;
+        res_cur = o.residual;                            // ... that `switch_residual` brings back to LIN
         for ( int it = 0; it < o.maxit; ++it ) {
             double worst = 0, worst_rel = 0;
             SI nb_empty = 0;
-            b.assign( n, 0.0 );
             for ( SI i = 0; i < n; ++i ) {
                 nb_empty += ! ( a[ i ] > 0 );
                 worst = std::max( worst, std::fabs( nu[ i ] - a[ i ] ) );
                 worst_rel = std::max( worst_rel, std::fabs( nu[ i ] - a[ i ] ) / nu[ i ] );
-                b[ i ] = nu[ i ] - a[ i ];               // `-r`, the right-hand side of Newton
             }
+            // THE SWITCH, decided BEFORE the right-hand side and the merit so that `b`, `nr` and `n2r` all speak
+            // the same residual; latched ( `worst_rel` is not monotone, and we do not go back )
+            if ( o.switch_residual > 0 && res_cur != NewtonOptions::LIN && worst_rel <= o.switch_residual ) {
+                res_cur = NewtonOptions::LIN;
+                st.it_switch = it;
+                if ( o.trace )
+                    std::printf( "      switch: residual -> lin ( max|a-nu|/nu %.3e <= %.3e )\n", worst_rel, o.switch_residual );
+            }
+            rhs( a, b );
             if ( it == 0 ) {                             // the mass floor of the damping
                 double am = a[ 0 ], nm = nu[ 0 ];
                 for ( SI i = 0; i < n; ++i ) { am = std::min( am, a[ i ] ); nm = std::min( nm, nu[ i ] ); }
