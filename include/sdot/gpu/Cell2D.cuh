@@ -1,44 +1,61 @@
 #pragma once
 
 // =====================================================================================
-// THE 2D CELLS OF THE CARD: `PowerDiagram.measures` on a CUDA device, in 2D, with the BSP tree.
+// THE 2D CELLS OF THE CARD: power diagrams with weights in a box, on a CUDA device, with the BSP tree --
+// what `PowerDiagram.measures` and Newton's iterations of `SdotPlanNd` need of a diagram, and nothing else.
 //
-// A dedicated path, written for the card and nothing else ( `PowerDiagram_Bsp._measures_on_card` decides when
-// it applies; everything else -- 3D, moments, derivatives, facets, a distribution, a domain that is not a box,
-// the neighbour memory -- keeps the generic path of `diagram/Ops.h` ). It is the old GPU campaign's kernel
-// ( `nsdot/gpu_des_familles`, `FilMsk2D.cuh` + `Arbre.cuh` + `Mesures.cu` ) brought to this code base:
+// A dedicated path, written for the card ( `PowerDiagram_Bsp._card_variant` decides when it applies; 3D, a
+// distribution that is not a constant, a domain that is not a box, the neighbour memory keep the generic path
+// of `diagram/Ops.h` ). It is the old GPU campaign's kernel ( `nsdot/gpu_des_familles`, `FilMsk2D.cuh` +
+// `Arbre.cuh` + `Mesures.cu` + `Hess2D.cuh` ) brought to this code base.
+//
+// = WHAT A CELL GIVES ( `Out`, a compile-time set: what is not asked for is not compiled )
+//
+//   * MEASURES  `rho |cell|`;
+//   * FACETS    for each neighbour `j` of rank above the cell's, `c_kj = rho |facet| / ( 2 |p_k - p_j| )`: one
+//               entry of a COO list ( rank, rank, value ), which `Laplacian2D.cuh` assembles into the symmetric
+//               CSR of the Laguerre graph's laplacian -- Newton's Hessian;
+//   * VJP       the adjoint of the measures, `g -> ( dm/dp )^T g, ( dm/dw )^T g`, as a GATHER: the facet ij moves
+//               by `( x - p_i ) . dp_i / d` for cell i and the opposite for cell j, so with `c_ij` as above and `x_ij`
+//               the middle of the facet,
+//                   grad_w_i = sum_j c_ij ( g_i - g_j ),   grad_p_i = sum_j 2 c_ij ( g_i - g_j ) ( x_ij - p_i ),
+//               written by cell `i` alone from its own facets ( no atomic, the same order at every run );
+//   * MOMENTS   the barycentre and `rho int |x - p_k|^2` ( the transport cost of the cell, whose sum is
+//               differentiated by the envelope theorem: `d cost / d p_k = 2 m_k ( p_k - b_k )` ).
+//
+// = HOW A CELL IS BUILT
 //
 //   * ONE THREAD PER CELL, the cell in REGISTERS: `R1 = 8` vertices in three arrays with immediate indices only
-//     ( the masks and the single barrel shift of `filmsk`: `RegCell::cut` ), starting from the domain box. No
-//     scratch at all.
+//     ( the masks and the single barrel shift of `filmsk`: `RegCell::cut` ), starting from the domain box.
 //   * THE OVERFLOW IS REDONE BY LATER PASSES, launched without reading any count back ( each strides over a list
-//     whose length only the card knows ): the cells that needed more than `R1` vertices at some point ( a tenth
-//     of them ) by a second pass with `R2 = 16` registers, what overflows that ( a thousandth ) by a third pass
-//     with ONE WARP PER CELL ( `WarpCell`, the vertices in shared memory: those cells are big, few and unrelated,
-//     a thread each ran them one after the other ), and what overflows that ( none on the campaign's clouds ) by
-//     a fourth pass in global memory, sized on a count read back, grown until nothing overflows.
-//   * THE FLOAT KERNEL'S FINISH IN A KERNEL OF ITS OWN ( `finish_pass` ): the cells of the first two passes are
-//     left in global memory and re-solved there -- the double arithmetic of the re-solve cost the walk half its
-//     occupancy when it was in the same kernel.
-//   * THE TREE NODES as ONE aligned record in FLOAT ( `Node`: box rounded outward, majorant slopes and constant
-//     rounded up, slice ), rebuilt from the tree's tensors at every call ( `make_nodes`: ~1 % of the call, and
-//     always in sync with the weights ); the tree is the same perfect binary tree in preorder as `ProviderBsp`
-//     walks ( left child `n + 1`, right child `n + 2^( h - 1 )` ), so a node does not store its children. The
-//     pruning is in float for both kernels ( the double one with a margin: `vertex_may_go` ).
-//   * THE ACCURACY FIXES of the old campaign ( its `doc/04-echelle.md`, "les trois reparations" + "la quatrieme" ):
-//       - the cell lives in the SEED's frame ( vertices counted from `p0` ), so the bisector is `|d|^2 / 2`
-//         and nothing large is subtracted to make something of the cell's size;
-//       - the positions reach a `float` kernel as TWO floats ( `x = xh + xl`, 48 bits ): `dx = ( xh_q - xh_0 ) +
-//         ( xl_q - xl_0 )` is the double difference rounded once, in single precision arithmetic only ( the old
-//         kernel used 64-bit fixed point for the same effect ); the WEIGHTS likewise, so the plane carries the
-//         weight DIFFERENCE, never a weight rounded on its own;
-//       - at the end every vertex is RE-SOLVED in double from the two planes that carry it ( re-read from the
-//         positions as given, by rank ), and the area is taken on these re-solved vertices, streaming ( the
-//         shoelace closes on the first one ): the float only decides WHICH cuts apply.
-//   * an int32 stack of 48 entries, node index and height packed ( the old `PILE = 48` ).
+//     whose length only the card knows ): the cells that needed more than `R1` vertices ( a tenth ) by a second pass
+//     with `R2 = 16` registers, what overflows that ( a thousandth ) by a third pass with ONE WARP PER CELL
+//     ( `WarpCell`, the vertices in shared memory ), and what overflows that ( none on the campaign's clouds ) by a
+//     fourth pass, the same warp cell in GLOBAL memory: one slot of `spill_cap` vertices per resident warp, the warps
+//     striding over the list. NOTHING IS READ BACK: `spill_cap` is a CAPACITY chosen ahead by Python ( the loom
+//     ShapeVar `nb_spill` ), and a cell that does not fit in it marks its STATUS and asks for more through loom's
+//     error buffer -- loom runs the call again with a larger capacity ( eager ), or raises ( under a trace ). Past
+//     `max_vertices` ( a hard limit, Python's too ) a cell is a FAILURE, reported as such: never a NaN.
+//   * PER-CELL STATUS ( `int` per cell, user order, 0 = done ): why a cell was not done ( `Status` ).
+//   * THE FLOAT KERNEL'S FINISH IN A KERNEL OF ITS OWN ( `finish_pass` ): the cells of the first two passes are left in
+//     global memory and finished there -- the double arithmetic of the re-solve cost the walk half its occupancy.
+//   * THE TREE NODES as ONE aligned record in FLOAT ( `Node`: box rounded outward, majorant slopes and constant rounded
+//     up, slice ), rebuilt from the tree's tensors at every call; the tree is the perfect binary tree in PREORDER of
+//     `ProviderBsp` ( left child `n + 1`, right child `n + 2^( h - 1 )` ). The pruning is in float for both kernels
+//     ( the double one with a margin: `vertex_may_go` ).
+//   * THE WALK'S STACK IS INDEXED BY HEIGHT: a depth-first descent pushes at most one node per height, and the heights
+//     on the stack decrease from bottom to top, so `stack[ h ]` plus a bit mask of the occupied heights is the stack,
+//     the top being the lowest bit. No packing, no depth limit: the node index type ( `TN` ) and the stack's size
+//     ( `MAX_HEIGHT`, 32 or 64 ) are template parameters chosen by Python from the tree ( `Variant` ), as is the rank type
+//     ( `TR`, 64 bits past 2^31 seeds ).
+//   * THE ACCURACY FIXES of the old campaign ( its `doc/04-echelle.md` ): the cell lives in the SEED's frame; the
+//     positions and weights reach a float kernel as TWO floats ( `x = xh + xl` ), so that a plane carries the double
+//     difference rounded once; at the end every vertex is RE-SOLVED in double from the two planes that carry it, and
+//     everything a cell gives ( measure, facets, adjoint, moments ) is taken on these re-solved vertices: the float
+//     only decides WHICH cuts apply.
 //
 // The double kernel ( `TK = double` ) is the same code without the two-float split, the finish pass and the
-// re-solve. Diagnosis: `SDOT_CARD_STATS=1` prints how many cells each pass left over.
+// re-solve. Diagnosis: `SDOT_CARD_STATS=1` prints how many cells each pass left over ( a read back: a diagnosis only ).
 // =====================================================================================
 
 #include <loom/support/kernels/CudaQueue.h>
@@ -48,15 +65,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
 namespace sdot::gpu2d {
 
 constexpr int    BLOCK      = 128;                       ///< threads per block, every kernel here
-constexpr int    STACK      = 48;                        ///< the walk's stack ( depth + 1 entries at most )
-constexpr int    H_BITS     = 5;                         ///< the height, packed under the node index
-constexpr int    MAX_DEPTH  = 27;                        ///< node indices fit in 32 - H_BITS bits
 constexpr int    R1         = 8;                         ///< vertices in registers, first pass
 constexpr int    R2         = 16;                        ///< ... second pass
 constexpr int    RD         = 12;                        ///< vertex slots per cell left for the finish ( float kernel )
@@ -66,6 +81,35 @@ constexpr double DET_MIN    = 1e-6;                      ///< under this relativ
 /// float against double max 1.1e-8 -> 4.6e-14 on the uniform cloud, 2.3e-9 -> 8e-14 on the lines, for +16 %
 /// of time ( 9.4 -> 10.9 ns/seed ); the median is 1e-14 either way. Off: the speed is what the card is for.
 constexpr bool   EXACT_VERTICES = false;
+
+/// WHAT A CELL GIVES ( see the header ): a bit set, a template parameter of everything below
+enum Out : unsigned { MEASURES = 1, FACETS = 2, VJP = 4, MOMENTS = 8 };
+
+/// WHY A CELL WAS NOT DONE ( the per-cell status, 0 = done )
+enum Status : int {
+    DONE              = 0,
+    SPILL_CAPACITY    = 1,   ///< more vertices than the global-memory pass was given room for: loom runs again with more
+    TOO_MANY_VERTICES = 2,   ///< more than `max_vertices`: a failure ( the error buffer says which cell )
+    FACET_CAPACITY    = 3,   ///< the COO of the facets was full: loom runs again with more
+};
+
+/// what goes to loom's error buffer besides the capacities ( kind 2, `ErrorKind::failure`: `id` is the code below,
+/// `value` the user index of the cell ); the message is Python's ( `PowerDiagram_Bsp._CARD_FAILURES` )
+enum Failure : int { FAIL_TOO_MANY_VERTICES = 1 };
+constexpr int ERROR_KIND_FAILURE = 2;
+
+/// THE VARIANT, chosen by Python from the inputs ( `PowerDiagram_Bsp._card_variant` ): the kernel's float, the type of
+/// a rank / cut identifier ( `int` up to 2^31 - 5 seeds ), the type of a node index ( `int` up to 2^31 - 1 nodes ), and
+/// the walk's stack ( one slot per height: 32 or 64 ).
+template<class _TK,class _TR,class _TN,int _MAX_HEIGHT>
+struct Variant {
+    using TK = _TK;
+    using TR = _TR;
+    using TN = _TN;
+    static constexpr int MAX_HEIGHT = _MAX_HEIGHT;
+    static_assert( MAX_HEIGHT == 32 || MAX_HEIGHT == 64, "the stack's mask is a 32 or 64-bit word" );
+    using Mask = std::conditional_t<MAX_HEIGHT == 32,unsigned,unsigned long long>;
+};
 
 // ---- the kernel's float: how a seed is stored for it, and the seed's frame ---------------------------------
 
@@ -79,8 +123,8 @@ template<> struct Frame<float>  { float  xh, yh, xl, yl, wh, wl; };
 template<> struct Frame<double> { double x, y, w; };
 
 /// a half-space `dx . v <= off`, `v` counted from the seed; `id`: a rank ( >= 0 ) or a side of the box ( < 0 )
-template<class TK>
-struct Plane { TK dx, dy, off; int id; };
+template<class TK,class TR>
+struct Plane { TK dx, dy, off; TR id; };
 
 __device__ __forceinline__ Frame<float>  frame_of( float4 p, float2 w )   { return { p.x, p.y, p.z, p.w, w.x, w.y }; }
 __device__ __forceinline__ Frame<double> frame_of( double2 p, double w )  { return { p.x, p.y, w }; }
@@ -88,9 +132,9 @@ __device__ __forceinline__ Frame<double> frame_of( double2 p, double w )  { retu
 /// THE POWER BISECTOR in the seed's frame: `|x - p0|^2 - w0 <= |x - q|^2 - wq` is `d . v <= |d|^2 / 2 + ( w0 - wq ) / 2`
 /// with `d = q - p0`. In float, `d` is the difference of the two-float positions: the high parts first ( exact
 /// as soon as the seeds are close, and rounded relatively to `d` otherwise ), then the low parts.
-template<bool W>
-__device__ __forceinline__ Plane<float> bisector( const Frame<float> &f, float4 q, float2 wq, int id ) {
-    Plane<float> p;
+template<bool W,class TR>
+__device__ __forceinline__ Plane<float,TR> bisector( const Frame<float> &f, float4 q, float2 wq, TR id ) {
+    Plane<float,TR> p;
     p.dx  = ( q.x - f.xh ) + ( q.z - f.xl );
     p.dy  = ( q.y - f.yh ) + ( q.w - f.yl );
     p.off = 0.5f * ( p.dx * p.dx + p.dy * p.dy );
@@ -100,9 +144,9 @@ __device__ __forceinline__ Plane<float> bisector( const Frame<float> &f, float4 
     return p;
 }
 
-template<bool W>
-__device__ __forceinline__ Plane<double> bisector( const Frame<double> &f, double2 q, double wq, int id ) {
-    Plane<double> p;
+template<bool W,class TR>
+__device__ __forceinline__ Plane<double,TR> bisector( const Frame<double> &f, double2 q, double wq, TR id ) {
+    Plane<double,TR> p;
     p.dx  = q.x - f.x;
     p.dy  = q.y - f.y;
     p.off = 0.5 * ( p.dx * p.dx + p.dy * p.dy );
@@ -114,24 +158,23 @@ __device__ __forceinline__ Plane<double> bisector( const Frame<double> &f, doubl
 
 // ---- the tree, as the kernel reads it --------------------------------------------------------------------
 
-/// ONE NODE, one aligned record in the kernel's float: the threads of a warp read DIFFERENT nodes ( the walks
-/// diverge ), so what costs is the number of transactions per node, and a 16-byte aligned record is read in
-/// 16-byte loads. 32 bytes for a float Voronoi node, 48 weighted.
-template<class TK,bool W> struct alignas( 16 ) Node;
-template<class TK> struct alignas( 16 ) Node<TK,false> { TK lo[ 2 ], hi[ 2 ]; int beg, end; };
-template<class TK> struct alignas( 16 ) Node<TK,true>  { TK lo[ 2 ], hi[ 2 ], a[ 2 ], b; int beg, end; };
+/// ONE NODE, one aligned record in float: the threads of a warp read DIFFERENT nodes ( the walks diverge ), so what
+/// costs is the number of transactions per node, and a 16-byte aligned record is read in 16-byte loads. 32 bytes
+/// for a Voronoi node, 48 weighted ( `int` slices ).
+template<bool W,class TR> struct alignas( 16 ) Node;
+template<class TR> struct alignas( 16 ) Node<false,TR> { float lo[ 2 ], hi[ 2 ]; TR beg, end; };
+template<class TR> struct alignas( 16 ) Node<true,TR>  { float lo[ 2 ], hi[ 2 ], a[ 2 ], b; TR beg, end; };
 
 /// the first bytes of a node: what the ordering of two children reads
-template<class TK> struct alignas( 16 ) Box { TK lo[ 2 ], hi[ 2 ]; };
+struct alignas( 16 ) Box { float lo[ 2 ], hi[ 2 ]; };
 
 /// a node seen from the seed: its box in the seed's frame, and for a weighted diagram the slopes and the
 /// constant `c = w0 - b - a . p0` of the majorant ( `w( q ) <= a . q + b` )
-template<class TK>
-struct CBox { TK lo[ 2 ], hi[ 2 ], a[ 2 ], c; };
+struct CBox { float lo[ 2 ], hi[ 2 ], a[ 2 ], c; };
 
-template<bool W>
-__device__ __forceinline__ CBox<float> centred( const Node<float,W> &nd, const Frame<float> &f ) {
-    CBox<float> B;
+template<bool W,class TR>
+__device__ __forceinline__ CBox centred( const Node<W,TR> &nd, const Frame<float> &f ) {
+    CBox B;
     // the box is rounded OUTWARD ( `make_nodes` ), and its distance to the seed is taken on both halves of
     // the seed: an error relative to that distance, not to the coordinates
     B.lo[ 0 ] = ( nd.lo[ 0 ] - f.xh ) - f.xl;
@@ -163,20 +206,20 @@ __device__ __forceinline__ Frame<float> prune_frame( const Frame<double> &f ) {
 /// THE PRUNING TEST for one vertex `v` ( seed's frame ): `<= 0` says "a seed of the box may remove it". The
 /// minimum of `|v - q|^2 - a . q` over the box is separable, free at `q = v + a / 2`, one clamp per axis gives it
 /// ( `cell/Pruning.h`, the same test in the absolute frame ).
-template<bool W,class TK>
-__device__ __forceinline__ bool vertex_may_go( const CBox<TK> &B, TK vx, TK vy ) {
-    TK yx = vx, yy = vy;
+template<bool W>
+__device__ __forceinline__ bool vertex_may_go( const CBox &B, float vx, float vy ) {
+    float yx = vx, yy = vy;
     if constexpr ( W ) {
-        yx += TK( 0.5 ) * B.a[ 0 ];
-        yy += TK( 0.5 ) * B.a[ 1 ];
+        yx += 0.5f * B.a[ 0 ];
+        yy += 0.5f * B.a[ 1 ];
     }
-    yx = fmin( fmax( yx, B.lo[ 0 ] ), B.hi[ 0 ] );
-    yy = fmin( fmax( yy, B.lo[ 1 ] ), B.hi[ 1 ] );
-    const TK ux = yx - vx, uy = yy - vy;
-    TK s = ux * ux + uy * uy - ( vx * vx + vy * vy );
+    yx = fminf( fmaxf( yx, B.lo[ 0 ] ), B.hi[ 0 ] );
+    yy = fminf( fmaxf( yy, B.lo[ 1 ] ), B.hi[ 1 ] );
+    const float ux = yx - vx, uy = yy - vy;
+    float s = ux * ux + uy * uy - ( vx * vx + vy * vy );
     if constexpr ( W )
         s += B.c - ( B.a[ 0 ] * yx + B.a[ 1 ] * yy );
-    return s <= TK( 0 );
+    return s <= 0.f;
 }
 
 /// THE SAME TEST FOR A DOUBLE VERTEX, in float: the pruning only has to be CONSERVATIVE, and the double kernel
@@ -185,7 +228,7 @@ __device__ __forceinline__ bool vertex_may_go( const CBox<TK> &B, TK vx, TK vy )
 /// of the vertex, of the centred box and of the majorant constant ), so that what the float prunes, the double
 /// would have pruned too.
 template<bool W>
-__device__ __forceinline__ bool vertex_may_go( const CBox<float> &B, double vxd, double vyd ) {
+__device__ __forceinline__ bool vertex_may_go( const CBox &B, double vxd, double vyd ) {
     const float vx = __double2float_rn( vxd ), vy = __double2float_rn( vyd );
     float yx = vx, yy = vy;
     if constexpr ( W ) {
@@ -206,7 +249,7 @@ __device__ __forceinline__ bool vertex_may_go( const CBox<float> &B, double vxd,
 }
 
 /// the squared distance from the seed to a box: the ORDER of two children, not a test
-__device__ __forceinline__ float proximity( const Box<float> &b, const Frame<float> &f ) {
+__device__ __forceinline__ float proximity( const Box &b, const Frame<float> &f ) {
     const float ex = fmaxf( fmaxf( b.lo[ 0 ] - f.xh, f.xh - b.hi[ 0 ] ), 0.f );
     const float ey = fmaxf( fmaxf( b.lo[ 1 ] - f.yh, f.yh - b.hi[ 1 ] ), 0.f );
     return ex * ex + ey * ey;
@@ -225,6 +268,16 @@ struct Strided {
     __device__ __forceinline__ T operator()( SI i, SI j, SI k ) const { return *reinterpret_cast<const T *>( p + i * s[ 0 ] + j * s[ 1 ] + k * s[ 2 ] ); }
 };
 
+/// ... and a strided write ( `p == nullptr`: nothing asked )
+template<class T,int N>
+struct StridedOut {
+    char *p = nullptr;
+    SI    s[ N ] = {};
+
+    __device__ __forceinline__ T &operator()( SI i ) const { return *reinterpret_cast<T *>( p + i * s[ 0 ] ); }
+    __device__ __forceinline__ T &operator()( SI i, SI j ) const { return *reinterpret_cast<T *>( p + i * s[ 0 ] + j * s[ 1 ] ); }
+};
+
 template<class View>
 Strided<std::remove_const_t<typename View::TF>,View::ct_rank> strided( const View &v ) {
     Strided<std::remove_const_t<typename View::TF>,View::ct_rank> res;
@@ -235,28 +288,72 @@ Strided<std::remove_const_t<typename View::TF>,View::ct_rank> strided( const Vie
     return res;
 }
 
-/// EVERYTHING A CELL READS, by value ( kernel parameters ): the kernel's tree and seeds, the seeds as given
-/// ( for the re-solve ), the domain box and where the measure goes
-template<class _TK,class TF,class TI,bool _W>
+/// a writable view of an output, or nothing ( an unbound gradient: `NoneTensor` )
+template<class T,int N,class View>
+StridedOut<T,N> strided_out( const View &v ) {
+    StridedOut<T,N> res;
+    if constexpr ( requires { v.data().raw; } ) {
+        static_assert( View::ct_rank == N );
+        res.p = reinterpret_cast<char *>( const_cast<std::remove_const_t<typename View::TF> *>( v.data().raw ) );
+        [&]<int... I>( std::integer_sequence<int,I...> ) {
+            ( ( res.s[ I ] = SI( v._strides[ Ct<int,I>() ] ) ), ... );
+        }( std::make_integer_sequence<int,N>() );
+    }
+    return res;
+}
+
+/// what the passes count on the card ( zeroed at the start of a run )
+struct Counters {
+    unsigned long long ovf[ 3 ];                         ///< the lists of the second, third and fourth passes
+    unsigned long long nb_facets;                        ///< the upper facets the cells WANTED ( maybe more than the COO holds )
+    unsigned long long spill_need;                       ///< the largest capacity a spilled cell asked for ( 0: none )
+    unsigned long long nb_failed;                        ///< the cells past `max_vertices`
+    unsigned long long pad[ 2 ];
+};
+
+/// EVERYTHING A CELL READS AND WRITES, by value ( kernel parameters )
+template<class _V,class TF,class TI,bool _W,unsigned _OUT>
 struct Problem {
-    using TK  = _TK;
+    using V   = _V;
+    using TK  = typename V::TK;
+    using TR  = typename V::TR;
+    using TN  = typename V::TN;
     using Pos = typename KernelSeeds<TK>::Pos;
     using Wt  = typename KernelSeeds<TK>::Wt;
-    static constexpr bool W = _W;
+    static constexpr bool     W   = _W;
+    static constexpr unsigned OUT = _OUT;
 
-    const Node<float,W> *nodes;                        ///< in float for both kernels: the pruning is in float
+    // ---- the diagram
+    const Node<W,TR> *nodes;                             ///< in float for both kernels: the pruning is in float
     const Pos        *pos;                               ///< the seeds in tree order, in the kernel's form
     const Wt         *w;                                 ///< their weights ( W only )
-    Strided<TF,2>     pos64;                             ///< the seeds as given, `[ n, 2 ]`
+    Strided<TF,2>     pos64;                             ///< the seeds as given, `[ n, 2 ]`, tree order
     Strided<TF,1>     w64;                               ///< the weights as given ( W only )
     Strided<TF,1>     box_min, box_max;                  ///< the domain
     Strided<TI,1>     ids;                               ///< rank -> the user's index
-    char             *res;                               ///< the measures, user's order
-    SI                res_stride;                        ///< in bytes
-    int               n, depth;
+    TR                n;
+    int               depth;
+    double            rho;                               ///< the ( constant ) density, if `rho_dev` is null
+    const TF         *rho_dev;                           ///< ... or read on the card ( a 0-d tensor of the call )
+    bool              user_order;                        ///< per-cell outputs at the user's index ( else at the rank )
 
-    __device__ __forceinline__ Wt   weight( int q ) const { if constexpr ( W ) return w[ q ]; else return Wt{}; }
-    __device__ __forceinline__ void write( int k, double m ) const { *reinterpret_cast<TF *>( res + SI( ids( k ) ) * res_stride ) = TF( m ); }
+    // ---- what the cells write ( see `Out` )
+    StridedOut<TF,1>  res;                               ///< MEASURES
+    int              *status;                            ///< per cell, 0 = done ( may be null )
+    TR               *fi, *fj;                           ///< FACETS: the COO of the upper facets, in ranks
+    double           *fc;
+    unsigned long long fcap;                             ///< ... its capacity
+    Counters         *counters;
+    Strided<TF,1>     g;                                 ///< VJP: the cotangent of the measures ( user order )
+    StridedOut<TF,2>  grad_pos;                          ///< ... -> the positions, rank order ( may be null )
+    StridedOut<TF,1>  grad_w;                            ///< ... -> the weights, rank order ( may be null )
+    StridedOut<TF,2>  bary;                              ///< MOMENTS: the barycentre ( the seed if empty )
+    StridedOut<TF,1>  cost;                              ///< ... and `rho int_cell |x - p|^2`
+
+    __device__ __forceinline__ double density() const { return rho_dev ? double( *rho_dev ) : rho; }
+    __device__ __forceinline__ Wt weight( TR q ) const { if constexpr ( W ) return w[ q ]; else return Wt{}; }
+    __device__ __forceinline__ SI user( TR k ) const { return user_order ? SI( ids( k ) ) : SI( k ); }
+    __device__ __forceinline__ void set_status( TR k, int st ) const { if ( status ) status[ user( k ) ] = st; }
 };
 
 // ---- the cell in registers -------------------------------------------------------------------------------
@@ -264,15 +361,11 @@ struct Problem {
 /// no plane to re-read: the new vertices are interpolated along their edge
 struct NoEdgePlanes {};
 
-/// A NEW VERTEX FROM ITS TWO PLANES, the cut and the edge it falls on, instead of interpolated along that edge.
-/// Interpolated, a vertex inherits the rounding of the edge's ends: `eps L` when the edge spans the domain ( the
-/// first cuts make such edges, their ends on the far sides of the box ) even if the vertex lands next to the
-/// seed -- and a later cut decided on a vertex off by `eps L` can be missed by that much, a first-order error
-/// on the area ( 5e-5 on one cell of the lines cloud ). Intersected, it is off by `eps |v| / sin`. Kept
-/// interpolated where the two planes are nearly parallel.
-template<class TK,class EP>
-__device__ __forceinline__ void refine( const Plane<TK> &p, const EP &edge_plane, int cid, TK &vx, TK &vy ) {
-    const Plane<TK> e = edge_plane( cid );
+/// A NEW VERTEX FROM ITS TWO PLANES, the cut and the edge it falls on, instead of interpolated along that edge
+/// ( `EXACT_VERTICES` ). Kept interpolated where the two planes are nearly parallel.
+template<class TK,class TR,class EP>
+__device__ __forceinline__ void refine( const Plane<TK,TR> &p, const EP &edge_plane, TR cid, TK &vx, TK &vy ) {
+    const Plane<TK,TR> e = edge_plane( cid );
     const TK det = p.dx * e.dy - p.dy * e.dx;
     const TK n2 = ( p.dx * p.dx + p.dy * p.dy ) * ( e.dx * e.dx + e.dy * e.dy );
     if ( det * det > TK( 1e-6 ) * n2 ) {
@@ -282,18 +375,17 @@ __device__ __forceinline__ void refine( const Plane<TK> &p, const EP &edge_plane
     }
 }
 
-
 /// `R` vertices SORTED in `0 .. nb - 1`, counterclockwise, in registers: every index below is a compile-time
 /// constant once the loops are unrolled ( a dynamic index would send the arrays to local memory ). Edge `i`
 /// goes from vertex `i` to vertex `i + 1` and carries the cut `c[ i ]`; vertex `i` lies on `c[ i - 1 ]` and
 /// `c[ i ]`. `nb < 0`: the cell overflowed `R`.
-template<class TK,int R>
+template<class TK,class TR,int R>
 struct RegCell {
     static constexpr int SUR = 3;                        ///< a non-empty cell has three vertices at least
     static_assert( R >= 4 && R < 32, "the box fits in the registers, a mask in 32 bits" );
 
     TK  x[ R ], y[ R ];
-    int c[ R ];
+    TR  c[ R ];
     int nb;
 
     /// the domain box `[ x0, x1 ] x [ y0, y1 ]` ( seed's frame ); its sides are `-1` bottom, `-2` right,
@@ -303,13 +395,13 @@ struct RegCell {
         for ( int i = 0; i < R; ++i ) {
             x[ i ] = i == 1 || i == 2 ? x1 : x0;
             y[ i ] = i == 2 || i == 3 ? y1 : y0;
-            c[ i ] = i < 4 ? -1 - i : 0;
+            c[ i ] = i < 4 ? TR( -1 - i ) : TR( 0 );
         }
         nb = 4;
     }
 
     template<bool W>
-    __device__ __forceinline__ bool may_be_cut_by( const CBox<float> &B ) const {
+    __device__ __forceinline__ bool may_be_cut_by( const CBox &B ) const {
         bool res = false;
 #pragma unroll
         for ( int i = 0; i < R; ++i ) {
@@ -322,7 +414,7 @@ struct RegCell {
     /// the cyclic run of `m` ( an outside mask with several runs ) that holds the vertex farthest outside --
     /// the rare path of `cut`, written for the registers too ( the argmax by selects, the run by bit tricks on
     /// `m` rotated so that the argmax is bit 0 )
-    __device__ __forceinline__ unsigned main_run( const Plane<TK> &p, unsigned m, unsigned valid ) const {
+    __device__ __forceinline__ unsigned main_run( const Plane<TK,TR> &p, unsigned m, unsigned valid ) const {
         int a = 0;
         TK best = p.dx * x[ 0 ] + p.dy * y[ 0 ] - p.off;
 #pragma unroll
@@ -341,12 +433,12 @@ struct RegCell {
 
     /// ONE CUT ( `filmsk`'s `coupe_msk`, see the old campaign for the derivation ). Returns `false` when there
     /// is nothing left to do: the cell is empty ( `nb == 0` ) or overflowed ( `nb == -1` ).
-    __device__ __forceinline__ bool cut( const Plane<TK> &p ) { return cut( p, NoEdgePlanes{} ); }
+    __device__ __forceinline__ bool cut( const Plane<TK,TR> &p ) { return cut( p, NoEdgePlanes{} ); }
 
-    /// `edge_plane( cid, plane )`: the plane of an edge, to compute a new vertex as the intersection of two
-    /// planes rather than by interpolation along the edge ( see `refine` )
+    /// `edge_plane( cid )`: the plane of an edge, to compute a new vertex as the intersection of two planes rather
+    /// than by interpolation along the edge ( see `refine` )
     template<class EP>
-    __device__ __forceinline__ bool cut( const Plane<TK> &p, const EP &edge_plane ) {
+    __device__ __forceinline__ bool cut( const Plane<TK,TR> &p, const EP &edge_plane ) {
         // ---- the mask of the vertices outside
         unsigned m = 0;
 #pragma unroll
@@ -389,7 +481,7 @@ struct RegCell {
         // ---- the four vertices, one loop bounded by `nb`, the compares shared by the selects
         TK x0v = x[ 0 ], y0v = y[ 0 ], x1v = x[ 0 ], y1v = y[ 0 ];
         TK x2v = x[ 0 ], y2v = y[ 0 ], x3v = x[ 0 ], y3v = y[ 0 ];
-        int bid = c[ 0 ], aid = c[ 0 ];
+        TR bid = c[ 0 ], aid = c[ 0 ];
 #pragma unroll
         for ( int i = 1; i < R; ++i ) {
             if ( i >= SUR && i >= nb ) break;
@@ -415,7 +507,7 @@ struct RegCell {
         const int  a = wraps ? 0 : i1;
         const int  e = wraps ? j3 - 1 : nb_out - 1;      // `>= 0`
         TK  ux[ R + 1 ], uy[ R + 1 ];
-        int uc[ R + 1 ];
+        TR  uc[ R + 1 ];
         ux[ 0 ] = x[ 0 ]; uy[ 0 ] = y[ 0 ]; uc[ 0 ] = c[ 0 ];   // never read: `o + e >= 1`
 #pragma unroll
         for ( int o = 1; o < R + 1; ++o ) { ux[ o ] = x[ o - 1 ]; uy[ o ] = y[ o - 1 ]; uc[ o ] = c[ o - 1 ]; }
@@ -437,8 +529,8 @@ struct RegCell {
     }
 
     /// `c[ nb - 1 ]` without a dynamic index
-    __device__ __forceinline__ int last_cut() const {
-        int r = c[ 0 ];
+    __device__ __forceinline__ TR last_cut() const {
+        TR r = c[ 0 ];
 #pragma unroll
         for ( int q = 1; q < R; ++q ) r = q == nb - 1 ? c[ q ] : r;
         return r;
@@ -455,104 +547,7 @@ struct RegCell {
     }
 };
 
-// ---- the cell in global memory ( fourth pass ) -------------------------------------------------------------
-
-/// `cap` vertices in two sets of rows of global memory ( the cut writes the other one: Sutherland-Hodgman, one
-/// plane ), element `v` of the cell of slot `j` at `v * stride + j`, so that the threads of a warp touch
-/// consecutive addresses
-template<class TK>
-struct MemCell {
-    TK  *x[ 2 ], *y[ 2 ];
-    int *c[ 2 ];
-    int  cur, stride, cap, nb;
-
-    __device__ __forceinline__ TK  X( int i ) const { return x[ cur ][ SI( i ) * stride ]; }
-    __device__ __forceinline__ TK  Y( int i ) const { return y[ cur ][ SI( i ) * stride ]; }
-    __device__ __forceinline__ int C( int i ) const { return c[ cur ][ SI( i ) * stride ]; }
-
-    __device__ __forceinline__ void init( TK x0, TK y0, TK x1, TK y1 ) {
-        cur = 0;
-        for ( int i = 0; i < 4; ++i ) {
-            x[ 0 ][ SI( i ) * stride ] = i == 1 || i == 2 ? x1 : x0;
-            y[ 0 ][ SI( i ) * stride ] = i == 2 || i == 3 ? y1 : y0;
-            c[ 0 ][ SI( i ) * stride ] = -1 - i;
-        }
-        nb = 4;
-    }
-
-    template<bool W>
-    __device__ __forceinline__ bool may_be_cut_by( const CBox<float> &B ) const {
-        for ( int i = 0; i < nb; ++i )
-            if ( vertex_may_go<W>( B, X( i ), Y( i ) ) )
-                return true;
-        return false;
-    }
-
-    __device__ __forceinline__ bool cut( const Plane<TK> &p ) {
-        int nb_out = 0;
-        for ( int i = 0; i < nb; ++i )
-            nb_out += p.dx * X( i ) + p.dy * Y( i ) - p.off > TK( 0 );
-        if ( nb_out == 0 )
-            return true;
-        if ( nb_out == nb ) {
-            nb = 0;
-            return false;
-        }
-        const int nxt = 1 - cur;
-        int o = 0;
-        auto put = [&]( TK vx, TK vy, int id ) {
-            x[ nxt ][ SI( o ) * stride ] = vx;
-            y[ nxt ][ SI( o ) * stride ] = vy;
-            c[ nxt ][ SI( o ) * stride ] = id;
-            ++o;
-        };
-        // the outside range is ONE cyclic run `[ b, e ]`: the one that holds the farthest vertex ( several runs
-        // mean vertices that are on the plane in exact arithmetic, see `RegCell::main_run` )
-        auto s_of = [&]( int i ) { return p.dx * X( i ) + p.dy * Y( i ) - p.off; };
-        int a = 0;
-        TK best = s_of( 0 );
-        for ( int i = 1; i < nb; ++i ) { const TK s = s_of( i ); if ( s > best ) { best = s; a = i; } }
-        int b = a, e = a;
-        while ( true ) { const int q = b ? b - 1 : nb - 1; if ( q == e || ! ( s_of( q ) > 0 ) ) break; b = q; }
-        while ( true ) { const int q = e + 1 < nb ? e + 1 : 0; if ( q == b || ! ( s_of( q ) > 0 ) ) break; e = q; }
-        auto out = [&]( int i ) { return b <= e ? i >= b && i <= e : i >= b || i <= e; };
-        if ( nb - ( e - b + nb ) % nb - 1 + 2 > cap ) {
-            nb = -1;
-            return false;
-        }
-        TK xi = X( 0 ), yi = Y( 0 );
-        TK si = s_of( 0 );
-        for ( int i = 0; i < nb; ++i ) {
-            const int j = i + 1 < nb ? i + 1 : 0;
-            const TK xj = X( j ), yj = Y( j );
-            const TK sj = p.dx * xj + p.dy * yj - p.off;
-            const bool in_i = ! out( i ), in_j = ! out( j );
-            if ( in_i )
-                put( xi, yi, C( i ) );
-            if ( in_i != in_j ) {
-                // from the inside vertex, as `RegCell::cut`
-                const TK xa = in_i ? xi : xj, ya = in_i ? yi : yj, sa = in_i ? si : sj;
-                const TK xb = in_i ? xj : xi, yb = in_i ? yj : yi, sb = in_i ? sj : si;
-                const TK t = sa / ( sa - sb );
-                put( xa + ( xb - xa ) * t, ya + ( yb - ya ) * t, in_i ? p.id : C( i ) );
-            }
-            xi = xj; yi = yj; si = sj;
-        }
-        cur = nxt;
-        nb = o;
-        return true;
-    }
-
-    __device__ __forceinline__ int last_cut() const { return C( nb - 1 ); }
-
-    template<class F>
-    __device__ __forceinline__ void for_each_vertex( F &&f ) const {
-        for ( int i = 0; i < nb; ++i )
-            f( i, X( i ), Y( i ), C( i ) );
-    }
-};
-
-// ---- the cell of a whole warp ( third pass ) -----------------------------------------------------------------
+// ---- the cell of a whole warp ( third and fourth passes ) ------------------------------------------------------
 
 /// warp reductions ( sm_75 has no `__reduce_*_sync` )
 __device__ __forceinline__ int warp_sum( int v ) {
@@ -591,42 +586,56 @@ __device__ __forceinline__ int warp_argmax( TK s, int i ) {
     return i;
 }
 
-/// A CELL HELD BY A WHOLE WARP: the vertices in shared memory, each lane in charge of one vertex in 32. What a
-/// lone thread does in a chain of dependent reads ( the pruning test and the cut both run over all the vertices,
-/// several times per cut ), the warp does in one step and a few shuffles: the cells that get here have 16
-/// vertices or more, hundreds to thousands of cuts, and one thread took 0.5 to 5 million cycles over them.
-/// Every lane runs the same walk on the same data ( the planes, the nodes: broadcast reads ); the results the
-/// walk branches on are reduced over the warp, so all the lanes take the same branches.
-template<class TK>
+/// A CELL HELD BY A WHOLE WARP: the vertices in shared ( third pass ) or global ( fourth pass ) memory, each lane in
+/// charge of one vertex in 32. What a lone thread does in a chain of dependent reads ( the pruning test and the cut
+/// both run over all the vertices, several times per cut ), the warp does in one step and a few shuffles: the cells
+/// that get here have 16 vertices or more, hundreds to thousands of cuts. Every lane runs the same walk on the same
+/// data ( the planes, the nodes: broadcast reads ); the results the walk branches on are reduced over the warp, so all
+/// the lanes take the same branches.
+template<class TK,class TR>
 struct WarpCell {
     TK  *x[ 2 ], *y[ 2 ], *s;
-    int *c[ 2 ];
+    TR  *c[ 2 ];
     int  cur, cap, nb, lane;
 
     __device__ __forceinline__ TK  X( int i ) const { return x[ cur ][ i ]; }
     __device__ __forceinline__ TK  Y( int i ) const { return y[ cur ][ i ]; }
-    __device__ __forceinline__ int C( int i ) const { return c[ cur ][ i ]; }
+    __device__ __forceinline__ TR  C( int i ) const { return c[ cur ][ i ]; }
+
+    /// the five rows of `cap` reals then the two rows of `cap` identifiers, at `base` ( 16-byte aligned )
+    __device__ __forceinline__ void attach( unsigned char *base, int cap_ ) {
+        cap = cap_;
+        TK *ts = reinterpret_cast<TK *>( base );
+        TR *cs = reinterpret_cast<TR *>( base + SI( 5 ) * cap * sizeof( TK ) );
+        for ( int q = 0; q < 2; ++q ) {
+            x[ q ] = ts + SI( q ) * cap;
+            y[ q ] = ts + SI( 2 + q ) * cap;
+            c[ q ] = cs + SI( q ) * cap;
+        }
+        s = ts + SI( 4 ) * cap;
+    }
+    static constexpr SI bytes_for( int cap ) { return ( SI( cap ) * SI( 5 * sizeof( TK ) + 2 * sizeof( TR ) ) + 15 ) / 16 * 16; }
 
     __device__ __forceinline__ void init( TK x0, TK y0, TK x1, TK y1 ) {
         cur = 0;
         if ( lane < 4 ) {
             x[ 0 ][ lane ] = lane == 1 || lane == 2 ? x1 : x0;
             y[ 0 ][ lane ] = lane == 2 || lane == 3 ? y1 : y0;
-            c[ 0 ][ lane ] = -1 - lane;
+            c[ 0 ][ lane ] = TR( -1 - lane );
         }
         nb = 4;
         __syncwarp();
     }
 
     template<bool W>
-    __device__ __forceinline__ bool may_be_cut_by( const CBox<float> &B ) const {
+    __device__ __forceinline__ bool may_be_cut_by( const CBox &B ) const {
         bool res = false;
         for ( int i = lane; i < nb; i += 32 )
             res |= vertex_may_go<W>( B, X( i ), Y( i ) );
         return __any_sync( 0xffffffffu, res );
     }
 
-    __device__ __forceinline__ bool cut( const Plane<TK> &p ) {
+    __device__ __forceinline__ bool cut( const Plane<TK,TR> &p ) {
         // the signed distances, kept for the interpolations; how many outside; the farthest
         int nb_out = 0, a = 0;
         TK best = TK( 0 );
@@ -695,26 +704,26 @@ struct WarpCell {
     /// the other, each a full memory latency for a cell that is alone on its warp ), the cuts take them from
     /// the lanes in rank order. Returns `false` when the walk must stop.
     template<class Pb>
-    __device__ __forceinline__ bool cut_leaf( const Pb &pb, const Frame<TK> &f, int beg, int end ) {
-        for ( int q0 = beg; q0 < end; q0 += 32 ) {
+    __device__ __forceinline__ bool cut_leaf( const Pb &pb, const Frame<TK> &f, TR beg, TR end ) {
+        for ( TR q0 = beg; q0 < end; q0 += 32 ) {
             typename Pb::Pos P{};
             typename Pb::Wt  Q{};
             if ( q0 + lane < end ) {
                 P = pb.pos[ q0 + lane ];
                 Q = pb.weight( q0 + lane );
             }
-            const int nq = min( 32, end - q0 );
+            const int nq = int( min( TR( 32 ), TR( end - q0 ) ) );
             for ( int j = 0; j < nq; ++j ) {
                 const typename Pb::Pos Pj = shfl( P, j );
                 const typename Pb::Wt  Qj = shfl( Q, j );
-                if ( ! cut( bisector<Pb::W>( f, Pj, Qj, q0 + j ) ) )
+                if ( ! cut( bisector<Pb::W>( f, Pj, Qj, TR( q0 + j ) ) ) )
                     return false;
             }
         }
         return true;
     }
 
-    __device__ __forceinline__ int last_cut() const { return C( nb - 1 ); }
+    __device__ __forceinline__ TR last_cut() const { return C( nb - 1 ); }
 
     template<class F>
     __device__ __forceinline__ void for_each_vertex( F &&f ) const {
@@ -730,18 +739,22 @@ struct WarpCell {
 /// registers that the walk does not, and a kernel is sized on its worst moment: in the same kernel it halves
 /// the occupancy of the walk ( 127 registers against 57 ); in a kernel of its own it costs ~100 bytes per
 /// cell written and read once.
+template<class TR>
 struct Deferred {
     float *x, *y;
-    int   *c, *nb;
-    int    n;
+    TR    *c;
+    int   *nb;
+    SI     n;
 };
 
 /// a cell of `Deferred`, seen as a cell ( `nb`, `last_cut`, `for_each_vertex` )
+template<class TR>
 struct DeferredCell {
-    const Deferred &d;
-    int             k, nb;
+    const Deferred<TR> &d;
+    SI                  k;
+    int                 nb;
 
-    __device__ __forceinline__ int last_cut() const { return d.c[ SI( nb - 1 ) * d.n + k ]; }
+    __device__ __forceinline__ TR last_cut() const { return d.c[ SI( nb - 1 ) * d.n + k ]; }
 
     template<class F>
     __device__ __forceinline__ void for_each_vertex( F &&f ) const {
@@ -755,23 +768,33 @@ struct DeferredCell {
 /// THE DESCENT, depth first, the nearest child first ( `ProviderBsp::next`, in one piece ): a node is pruned
 /// at POP time, against the cell as it is then; a leaf hands its seeds to `cell.cut` in rank order. Stops as
 /// soon as the cell says so ( empty, or overflowed ).
+///
+/// THE STACK, BY HEIGHT: going down from a node of height `h`, the farther child waits at height `h - 1` and the
+/// walk goes on in the nearer one, whose own waiting children are lower still. So the waiting nodes have distinct
+/// heights, decreasing from the bottom of the stack to its top: `stack[ h ]` holds the one of height `h`, the bit
+/// `h` of `pending` says it is there, and the top is the LOWEST pending height. Nothing to pack, nothing to bound
+/// but the height itself ( `MAX_HEIGHT` ).
 template<class Pb,class Cell,class EP = NoEdgePlanes>
 __device__ __forceinline__ void walk( const Pb &pb, const Frame<typename Pb::TK> &f, Cell &cell, const EP &edge_plane = {} ) {
+    using TN   = typename Pb::TN;
+    using TR   = typename Pb::TR;
+    using Mask = typename Pb::V::Mask;
     const Frame<float> pf = prune_frame( f );
-    int stack[ STACK ];
-    int top = 0;
-    int n = 0, h = pb.depth;                             // the root: node 0, height `depth`
+    TN   stack[ Pb::V::MAX_HEIGHT ];
+    Mask pending = 0;
+    TN   n = 0;
+    int  h = pb.depth;                                   // the root: node 0, height `depth`
     while ( true ) {
-        const Node<float,Pb::W> nd = pb.nodes[ n ];
+        const Node<Pb::W,TR> nd = pb.nodes[ n ];
         // an empty slot ( `beg == end` ), or a subtree that can no longer reach the cell
         if ( nd.beg < nd.end && cell.template may_be_cut_by<Pb::W>( centred( nd, pf ) ) ) {
             if ( h <= 1 ) {                              // a leaf. No "is it me" test: my plane is `0 <= 0`
-                if constexpr ( requires { cell.cut_leaf( pb, f, 0, 0 ); } ) {
+                if constexpr ( requires { cell.cut_leaf( pb, f, TR( 0 ), TR( 0 ) ); } ) {
                     if ( ! cell.cut_leaf( pb, f, nd.beg, nd.end ) )
                         return;
                 } else {
-                    for ( int q = nd.beg; q < nd.end; ++q ) {
-                        const Plane<typename Pb::TK> p = bisector<Pb::W>( f, pb.pos[ q ], pb.weight( q ), q );
+                    for ( TR q = nd.beg; q < nd.end; ++q ) {
+                        const Plane<typename Pb::TK,TR> p = bisector<Pb::W>( f, pb.pos[ q ], pb.weight( q ), q );
                         if constexpr ( std::is_same_v<EP,NoEdgePlanes> ) {
                             if ( ! cell.cut( p ) )
                                 return;
@@ -783,32 +806,34 @@ __device__ __forceinline__ void walk( const Pb &pb, const Frame<typename Pb::TK>
                 }
             } else {
                 // the nearest child is visited at once ( the cell will not change before: no push, no pop ),
-                // the other one waits on the stack and is tested when it comes out
-                const int lc = n + 1, rc = n + ( 1 << ( h - 1 ) );
-                const Box<float> bl = *reinterpret_cast<const Box<float> *>( pb.nodes + lc );
-                const Box<float> br = *reinterpret_cast<const Box<float> *>( pb.nodes + rc );
+                // the other one waits at its height and is tested when it comes out
+                const TN lc = n + 1, rc = n + ( TN( 1 ) << ( h - 1 ) );
+                const Box bl = *reinterpret_cast<const Box *>( pb.nodes + lc );
+                const Box br = *reinterpret_cast<const Box *>( pb.nodes + rc );
                 const bool left_first = proximity( bl, pf ) <= proximity( br, pf );
                 --h;
-                stack[ top++ ] = ( ( left_first ? rc : lc ) << H_BITS ) | h;
+                stack[ h ] = left_first ? rc : lc;
+                pending |= Mask( 1 ) << h;
                 n = left_first ? lc : rc;
                 continue;
             }
         }
-        if ( ! top )
+        if ( ! pending )
             return;
-        const int e = stack[ --top ];
-        n = e >> H_BITS;
-        h = e & ( ( 1 << H_BITS ) - 1 );
+        if constexpr ( sizeof( Mask ) == 4 ) h = __ffs( int( pending ) ) - 1;
+        else                                 h = __ffsll( ( long long ) pending ) - 1;
+        pending &= pending - 1;
+        n = stack[ h ];
     }
 }
 
-// ---- the measure -----------------------------------------------------------------------------------------
+// ---- the end of a cell: its re-solved edges, and what is made of them -------------------------------------------
 
 /// the seed and the box sides in double, in the seed's frame: what the re-solve reads
 struct Origin { double x, y, w, x0, y0, x1, y1; };
 
 template<class Pb>
-__device__ __forceinline__ Origin origin_of( const Pb &pb, int k ) {
+__device__ __forceinline__ Origin origin_of( const Pb &pb, typename Pb::TR k ) {
     Origin o;
     o.x = double( pb.pos64( k, 0 ) );
     o.y = double( pb.pos64( k, 1 ) );
@@ -821,19 +846,19 @@ __device__ __forceinline__ Origin origin_of( const Pb &pb, int k ) {
 }
 
 /// THE PLANE OF A CUT, RE-READ in double from its identifier: the bisector from the positions as given ( the
-/// rank is the identifier ), or a side of the box
+/// rank is the identifier ), or a side of the box. `e`: `|n|^2`, the squared distance of the two seeds for a bisector.
 template<class Pb>
-__device__ __forceinline__ void plane64( const Pb &pb, const Origin &o, int cid, double &nx, double &ny, double &off, double &e ) {
+__device__ __forceinline__ void plane64( const Pb &pb, const Origin &o, typename Pb::TR cid, double &nx, double &ny, double &off, double &e ) {
     if ( cid >= 0 ) {
         nx  = double( pb.pos64( cid, 0 ) ) - o.x;
         ny  = double( pb.pos64( cid, 1 ) ) - o.y;
-        e   = nx * nx + ny * ny;                         // `|n|^2`, for the conditioning of the vertices
+        e   = nx * nx + ny * ny;
         off = 0.5 * e;
         if constexpr ( Pb::W )
             off += 0.5 * ( o.w - double( pb.w64( cid ) ) );
         return;
     }
-    const int f = -1 - cid;                              // 0 bottom, 1 right, 2 top, 3 left
+    const int f = int( -1 - cid );                       // 0 bottom, 1 right, 2 top, 3 left
     const bool vert = f & 1;
     nx  = vert ? 1.0 : 0.0;
     ny  = vert ? 0.0 : 1.0;
@@ -856,13 +881,16 @@ __device__ __forceinline__ bool cross( double ax, double ay, double ao, double e
     return true;
 }
 
-/// THE AREA. Float kernel: every vertex re-solved in double from its two planes, the shoelace taken on them as
-/// they come ( two doubles for the previous vertex, two for the first one ). Double kernel: on the vertices.
-template<class Pb,class Cell>
-__device__ __forceinline__ double area_of( const Pb &pb, int k, const Cell &cell ) {
+/// THE EDGES OF A FINISHED CELL, in order, in double and in the seed's frame: `f( ax, ay, bx, by, id, d2 )` for the
+/// edge from `a` to `b` carried by the cut `id`, `d2` the squared distance between the two seeds ( a bisector ).
+/// Float kernel: every vertex re-solved in double from its two planes, as it comes; double kernel: the vertices.
+template<bool WANT_D2,class Pb,class Cell,class F>
+__device__ __forceinline__ void for_each_edge( const Pb &pb, const Origin &o, const Cell &cell, F &&f ) {
+    using TR = typename Pb::TR;
     if ( cell.nb < 3 )
-        return 0;
-    double a2 = 0, fx = 0, fy = 0, px = 0, py = 0;
+        return;
+    double fx = 0, fy = 0, px = 0, py = 0, pe = 1;
+    TR pc = 0;
     if constexpr ( std::is_same_v<typename Pb::TK,float> ) {
         // a re-solved vertex is only trusted NEAR the float one -- near meaning what the float vertex can be
         // off by, `eps L / sin( angle of the two planes )`, with a margin of a thousand: where the float decided
@@ -871,12 +899,11 @@ __device__ __forceinline__ double area_of( const Pb &pb, int k, const Cell &cell
         //
         // The scale of that error is not the cell's: a float vertex is interpolated from vertices that were
         // once those of the domain box, so it carries `eps L`, `L` the farthest corner of the box from the seed.
-        const Origin o = origin_of( pb, k );
         const double L2 = fmax( o.x0 * o.x0, o.x1 * o.x1 ) + fmax( o.y0 * o.y0, o.y1 * o.y1 );
         const double tol2 = 1e-8 * L2;                       // ( 1e3 eps_float L )^2
         double ax, ay, ao, ea;
         plane64( pb, o, cell.last_cut(), ax, ay, ao, ea );
-        cell.for_each_vertex( [&]( int i, float x, float y, int c ) {
+        cell.for_each_vertex( [&]( int i, float x, float y, TR c ) {
             double bx, by, bo, eb, vx, vy, det2, e12;
             plane64( pb, o, c, bx, by, bo, eb );
             if ( ! cross( ax, ay, ao, ea, bx, by, bo, eb, vx, vy, det2, e12 ) || ( ( vx - x ) * ( vx - x ) + ( vy - y ) * ( vy - y ) ) * det2 > tol2 * e12 ) {
@@ -889,25 +916,153 @@ __device__ __forceinline__ double area_of( const Pb &pb, int k, const Cell &cell
             }
             ax = bx; ay = by; ao = bo; ea = eb;
             if ( i == 0 ) { fx = vx; fy = vy; }
-            else a2 += px * vy - vx * py;
-            px = vx; py = vy;
+            else f( px, py, vx, vy, pc, pe );
+            px = vx; py = vy; pc = c; pe = eb;
         } );
     } else {
-        cell.for_each_vertex( [&]( int i, double x, double y, int ) {
+        cell.for_each_vertex( [&]( int i, double x, double y, TR c ) {
             if ( i == 0 ) { fx = x; fy = y; }
-            else a2 += px * y - x * py;
-            px = x; py = y;
+            else f( px, py, x, y, pc, pe );
+            px = x; py = y; pc = c;
+            if constexpr ( WANT_D2 ) {
+                if ( c >= 0 ) {
+                    const typename Pb::Pos q = pb.pos[ c ];
+                    const double dx = q.x - o.x, dy = q.y - o.y;
+                    pe = dx * dx + dy * dy;
+                } else
+                    pe = 1;
+            }
         } );
     }
-    a2 += px * fy - fx * py;
-    return 0.5 * fabs( a2 );
+    f( px, py, fx, fy, pc, pe );
+}
+
+/// `n` slots of the COO for the calling thread, ONE atomic per group of lanes that get here together ( the lanes of
+/// `__activemask`, each one's offset the sum of the lower lanes' -- a loop over the active lanes: the cooperative
+/// groups' scan would do the same, and their headers do not match the pinned `nvcc` ). Past the COO's capacity the
+/// count goes on: it is what tells loom how much was wanted.
+__device__ __forceinline__ unsigned long long reserve( unsigned long long *count, unsigned n ) {
+    unsigned mask;
+    asm volatile( "activemask.b32 %0;" : "=r"( mask ) );   // `__activemask()`: its intrinsic does not resolve with the pinned `nvcc`
+    const int lane = threadIdx.x % 32, leader = __ffs( int( mask ) ) - 1;
+    unsigned tot = 0, off = 0;
+    for ( unsigned m = mask; m; m &= m - 1 ) {
+        const int src = __ffs( int( m ) ) - 1;
+        const unsigned v = __shfl_sync( mask, n, src );
+        tot += v;
+        off += src < lane ? v : 0u;
+    }
+    unsigned long long base = 0;
+    if ( lane == leader )
+        base = atomicAdd( count, ( unsigned long long ) tot );
+    return __shfl_sync( mask, base, leader ) + off;
+}
+
+/// THE END OF A CELL: everything the call wants of it ( `Pb::OUT` ), from its edges
+template<class Pb,class Cell>
+__device__ __forceinline__ void finish_cell( const Pb &pb, typename Pb::TR k, const Cell &cell ) {
+    using TR = typename Pb::TR;
+    using TF = std::remove_reference_t<decltype( pb.res( 0 ) )>;
+    constexpr unsigned OUT = Pb::OUT;
+    constexpr bool EDGE_TERMS = OUT & ( FACETS | VJP );
+    const Origin o = origin_of( pb, k );
+    const double rho = pb.density();
+
+    // the facets: the upper ones only ( the neighbour's rank above the cell's ), whose number the cuts give
+    unsigned long long fbase = 0;
+    bool fok = false;
+    if constexpr ( bool( OUT & FACETS ) ) {
+        unsigned nup = 0;
+        if ( cell.nb >= 3 )
+            cell.for_each_vertex( [&]( int, auto, auto, TR c ) { nup += c > k; } );
+        fbase = reserve( &pb.counters->nb_facets, nup );
+        fok = fbase + nup <= pb.fcap;
+        if ( ! fok )
+            pb.set_status( k, FACET_CAPACITY );
+    }
+    double gk = 0;
+    if constexpr ( bool( OUT & VJP ) )
+        gk = double( pb.g( SI( pb.ids( k ) ) ) );
+
+    double a2 = 0, m1x = 0, m1y = 0, m2 = 0, gw = 0, gpx = 0, gpy = 0;
+    unsigned t = 0;
+    for_each_edge<EDGE_TERMS>( pb, o, cell, [&]( double ax, double ay, double bx, double by, TR c, double d2 ) {
+        const double cr = ax * by - bx * ay;
+        a2 += cr;
+        if constexpr ( bool( OUT & MOMENTS ) ) {
+            m1x += cr * ( ax + bx );
+            m1y += cr * ( ay + by );
+            m2  += cr * ( ax * ax + ax * bx + bx * bx + ay * ay + ay * by + by * by );
+        }
+        if constexpr ( EDGE_TERMS ) {
+            if ( c >= 0 ) {
+                const double ex = bx - ax, ey = by - ay;
+                const double coef = d2 > 0 ? rho * sqrt( ex * ex + ey * ey ) / ( 2 * sqrt( d2 ) ) : 0.0;
+                if constexpr ( bool( OUT & FACETS ) ) {
+                    if ( c > k && fok ) {
+                        const unsigned long long q = fbase + t++;
+                        pb.fi[ q ] = k;
+                        pb.fj[ q ] = c;
+                        pb.fc[ q ] = coef;
+                    }
+                }
+                if constexpr ( bool( OUT & VJP ) ) {
+                    // `2 c ( g_k - g_j ) ( x_kj - p_k )`, the middle of the facet in the seed's frame being `( a + b ) / 2`
+                    const double dg = coef * ( gk - double( pb.g( SI( pb.ids( c ) ) ) ) );
+                    gw  += dg;
+                    gpx += dg * ( ax + bx );
+                    gpy += dg * ( ay + by );
+                }
+            }
+        }
+    } );
+
+    const double area = 0.5 * fabs( a2 );
+    if constexpr ( bool( OUT & MEASURES ) )
+        pb.res( pb.user( k ) ) = TF( rho * area );
+    if constexpr ( bool( OUT & VJP ) ) {
+        if ( pb.grad_pos.p ) {
+            pb.grad_pos( SI( k ), 0 ) = TF( gpx );
+            pb.grad_pos( SI( k ), 1 ) = TF( gpy );
+        }
+        if constexpr ( Pb::W )
+            if ( pb.grad_w.p )
+                pb.grad_w( SI( k ) ) = TF( gw );
+    }
+    if constexpr ( bool( OUT & MOMENTS ) ) {
+        // the triangles ( seed, a, b ): `int x = |T| ( a + b ) / 3`, `int |x|^2 = |T| ( a.a + a.b + b.b ) / 6`, `|T| = cr / 2`,
+        // in the seed's frame -- so the second moment IS the cost of the cell
+        const SI u = pb.user( k );
+        const double sg = a2 < 0 ? -1.0 : 1.0;
+        pb.bary( u, 0 ) = TF( area > 0 ? o.x + sg * m1x / ( 6 * area ) : o.x );
+        pb.bary( u, 1 ) = TF( area > 0 ? o.y + sg * m1y / ( 6 * area ) : o.y );
+        pb.cost( u ) = TF( rho * sg * m2 / 12 );
+    }
+}
+
+/// A CELL THAT COULD NOT BE DONE: zeros where it writes ( never a NaN: the status and the error buffer say why )
+template<class Pb>
+__device__ __forceinline__ void finish_failed( const Pb &pb, typename Pb::TR k, int st ) {
+    using TF = std::remove_reference_t<decltype( pb.res( 0 ) )>;
+    constexpr unsigned OUT = Pb::OUT;
+    pb.set_status( k, st );
+    if constexpr ( bool( OUT & MEASURES ) )
+        pb.res( pb.user( k ) ) = TF( 0 );
+    if constexpr ( bool( OUT & VJP ) ) {
+        if ( pb.grad_pos.p ) { pb.grad_pos( SI( k ), 0 ) = TF( 0 ); pb.grad_pos( SI( k ), 1 ) = TF( 0 ); }
+        if constexpr ( Pb::W ) if ( pb.grad_w.p ) pb.grad_w( SI( k ) ) = TF( 0 );
+    }
+    if constexpr ( bool( OUT & MOMENTS ) ) {
+        const SI u = pb.user( k );
+        pb.bary( u, 0 ) = TF( 0 ); pb.bary( u, 1 ) = TF( 0 ); pb.cost( u ) = TF( 0 );
+    }
 }
 
 // ---- the kernels -----------------------------------------------------------------------------------------
 
 /// the seed's frame in the kernel's float, and the domain box in that frame
 template<class Pb>
-__device__ __forceinline__ void start_of( const Pb &pb, int k, Frame<typename Pb::TK> &f, typename Pb::TK ( &b )[ 4 ] ) {
+__device__ __forceinline__ void start_of( const Pb &pb, typename Pb::TR k, Frame<typename Pb::TK> &f, typename Pb::TK ( &b )[ 4 ] ) {
     using TK = typename Pb::TK;
     if constexpr ( Pb::W ) f = frame_of( pb.pos[ k ], pb.w[ k ] );
     else                   f = frame_of( pb.pos[ k ], typename Pb::Wt{} );
@@ -918,23 +1073,24 @@ __device__ __forceinline__ void start_of( const Pb &pb, int k, Frame<typename Pb
     b[ 3 ] = TK( double( pb.box_max( 1 ) ) - py );
 }
 
-/// `deferred`: the cell is left in it for `finish_pass` instead of being measured here ( `nullptr`: measured here ).
+/// `deferred`: the cell is left in it for `finish_pass` instead of being finished here ( `nullptr`: finished here ).
 /// `false`: the cell overflowed `R` vertices, nothing was written
 template<int R,class Pb>
-__device__ __forceinline__ bool cell_in_registers( const Pb &pb, int k, const Deferred *deferred = nullptr ) {
+__device__ __forceinline__ bool cell_in_registers( const Pb &pb, typename Pb::TR k, const Deferred<typename Pb::TR> *deferred = nullptr ) {
     using TK = typename Pb::TK;
+    using TR = typename Pb::TR;
     Frame<TK> f;
     TK b[ 4 ];
     start_of( pb, k, f, b );
-    RegCell<TK,R> cell;
+    RegCell<TK,TR,R> cell;
     cell.init( b[ 0 ], b[ 1 ], b[ 2 ], b[ 3 ] );
     // the plane of an edge: a bisector re-read from its seed, or a side of the box ( `-1` bottom, `-2` right,
     // `-3` top, `-4` left )
-    auto edge_plane = [&]( int cid ) {
+    auto edge_plane = [&]( TR cid ) {
         if ( cid >= 0 )
             return bisector<Pb::W>( f, pb.pos[ cid ], pb.weight( cid ), cid );
-        const int s = -1 - cid;
-        Plane<TK> e;
+        const int s = int( -1 - cid );
+        Plane<TK,TR> e;
         e.dx = s & 1 ? TK( 1 ) : TK( 0 );
         e.dy = s & 1 ? TK( 0 ) : TK( 1 );
         e.off = s == 0 ? b[ 1 ] : s == 1 ? b[ 2 ] : s == 2 ? b[ 3 ] : b[ 0 ];
@@ -947,10 +1103,10 @@ __device__ __forceinline__ bool cell_in_registers( const Pb &pb, int k, const De
         walk( pb, f, cell );
     if ( deferred ) {
         if constexpr ( std::is_same_v<TK,float> ) {
-            if ( cell.nb > RD )                          // more than the finish holds: the memory pass
+            if ( cell.nb > RD )                          // more than the finish holds: a later pass
                 cell.nb = -1;
             deferred->nb[ k ] = cell.nb;
-            cell.for_each_vertex( [&]( int i, float x, float y, int c ) {
+            cell.for_each_vertex( [&]( int i, float x, float y, TR c ) {
                 deferred->x[ SI( i ) * deferred->n + k ] = x;
                 deferred->y[ SI( i ) * deferred->n + k ] = y;
                 deferred->c[ SI( i ) * deferred->n + k ] = c;
@@ -960,29 +1116,34 @@ __device__ __forceinline__ bool cell_in_registers( const Pb &pb, int k, const De
     if ( cell.nb < 0 )
         return false;
     if ( ! deferred )
-        pb.write( k, area_of( pb, k, cell ) );
+        finish_cell( pb, k, cell );
     return true;
 }
+
+template<class Pb>
+constexpr bool deferring() { return std::is_same_v<typename Pb::TK,float>; }
 
 /// FIRST PASS: one thread per cell, rank order ( two neighbouring threads are neighbours in the tree, hence in
 /// space: their walks look alike, which is the only thing that limits the divergence -- and it is free )
 template<class Pb>
-__global__ void __launch_bounds__( BLOCK, MINB1 ) first_pass( Pb pb, int *ovf_list, int *ovf_count, Deferred deferred ) {
-    const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( k < pb.n && ! cell_in_registers<R1>( pb, k, std::is_same_v<typename Pb::TK,float> ? &deferred : nullptr ) )
-        ovf_list[ atomicAdd( ovf_count, 1 ) ] = k;
+__global__ void __launch_bounds__( BLOCK, MINB1 ) first_pass( Pb pb, typename Pb::TR *ovf_list, Deferred<typename Pb::TR> deferred ) {
+    using TR = typename Pb::TR;
+    const SI k = SI( blockIdx.x ) * blockDim.x + threadIdx.x;
+    if ( k < SI( pb.n ) && ! cell_in_registers<R1>( pb, TR( k ), deferring<Pb>() ? &deferred : nullptr ) )
+        ovf_list[ atomicAdd( &pb.counters->ovf[ 0 ], 1ull ) ] = TR( k );
 }
 
-/// THE FINISH of the cells the first two passes left in `deferred` ( float kernel ): re-solve, area, write
+/// THE FINISH of the cells the first two passes left in `deferred` ( float kernel )
 template<class Pb>
-__global__ void __launch_bounds__( BLOCK ) finish_pass( Pb pb, Deferred deferred ) {
-    const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( k >= pb.n )
+__global__ void __launch_bounds__( BLOCK ) finish_pass( Pb pb, Deferred<typename Pb::TR> deferred ) {
+    using TR = typename Pb::TR;
+    const SI k = SI( blockIdx.x ) * blockDim.x + threadIdx.x;
+    if ( k >= SI( pb.n ) )
         return;
     const int nb = deferred.nb[ k ];
     if ( nb < 0 )                                        // a later pass has it
         return;
-    pb.write( k, area_of( pb, k, DeferredCell{ deferred, k, nb } ) );
+    finish_cell( pb, TR( k ), DeferredCell<TR>{ deferred, k, nb } );
 }
 
 /// SECOND PASS: the cells the first one could not hold, `R2` registers. Its grid is what the card holds at
@@ -990,123 +1151,100 @@ __global__ void __launch_bounds__( BLOCK ) finish_pass( Pb pb, Deferred deferred
 /// order instead, one thread per rank and a flag per rank, so that a warp holds neighbouring cells only:
 /// 5.4 ms instead of 2.3 on the uniform cloud -- most warps then hold one or two cells. )
 template<class Pb>
-__global__ void __launch_bounds__( BLOCK ) second_pass( Pb pb, const int *list, const int *count, int *ovf_list, int *ovf_count, Deferred deferred ) {
-    const int m = *count;
-    for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < m; i += gridDim.x * blockDim.x )
-        if ( ! cell_in_registers<R2>( pb, list[ i ], std::is_same_v<typename Pb::TK,float> ? &deferred : nullptr ) )
-            ovf_list[ atomicAdd( ovf_count, 1 ) ] = list[ i ];
+__global__ void __launch_bounds__( BLOCK ) second_pass( Pb pb, const typename Pb::TR *list, typename Pb::TR *ovf_list, Deferred<typename Pb::TR> deferred ) {
+    const unsigned long long m = pb.counters->ovf[ 0 ];
+    for ( unsigned long long i = SI( blockIdx.x ) * blockDim.x + threadIdx.x; i < m; i += SI( gridDim.x ) * blockDim.x )
+        if ( ! cell_in_registers<R2>( pb, list[ i ], deferring<Pb>() ? &deferred : nullptr ) )
+            ovf_list[ atomicAdd( &pb.counters->ovf[ 1 ], 1ull ) ] = list[ i ];
 }
 
-/// THE WARP PASS: what the registers of one thread could not hold, ONE CELL PER WARP ( `WarpCell` ), the
-/// vertices in shared memory. The cells that get here have nothing in common any more ( not neighbours in the
-/// tree ): one per thread, a warp of 32 of them ran them one after the other ( 7 ms for the 50 of the lines
-/// cloud ), and one per warp on a single lane each was a chain of dependent reads ( 0.5 to 5 million cycles ).
-/// `CAP = shared_cap< TK >()` vertices ( 48 KB per block of four warps ). Launched without a read back: the
-/// grid is what the card holds, the count is read on the card. ( Tried as the second pass too, with 64
-/// vertices: 8.5 ms instead of 2.3 on the uniform cloud, the tenth of the cells that gets there being too many
-/// for one warp each. )
+/// THE WARP PASSES: what the registers of one thread could not hold, ONE CELL PER WARP ( `WarpCell` ). The cells that
+/// get here have nothing in common any more ( not neighbours in the tree ): one per thread, a warp of 32 of them ran
+/// them one after the other ( 7 ms for the 50 of the lines cloud ), and one per warp on a single lane each was a chain
+/// of dependent reads ( 0.5 to 5 million cycles ). Launched without a read back: the grid is what the card holds, the
+/// count is read on the card.
+///
+/// THIRD PASS: the vertices in SHARED memory, `shared_cap< TK >()` per warp ( 48 KB per block of four warps ).
+/// FOURTH PASS ( `spill != nullptr` ): the vertices in GLOBAL memory, one slot of `cap` vertices per warp of the grid
+/// ( `WarpCell::bytes_for( cap )` bytes each ); what does not fit there is not lost, it is REPORTED ( see the header ).
 template<class TK>
 constexpr int shared_cap() { return sizeof( TK ) == 4 ? 384 : 256; }
 
-template<class TK,int CAP>
-constexpr int warp_bytes() { return ( BLOCK / 32 ) * CAP * int( 5 * sizeof( TK ) + 2 * sizeof( int ) ); }
+template<class TK,class TR,int CAP>
+constexpr int warp_bytes() { return ( BLOCK / 32 ) * int( WarpCell<TK,TR>::bytes_for( CAP ) ); }
 
-template<class Pb,int CAP>
-__global__ void __launch_bounds__( BLOCK ) warp_pass( Pb pb, const int *list, const int *count, int *ovf_list, int *ovf_count ) {
+template<class Pb,class EB>
+__global__ void __launch_bounds__( BLOCK ) warp_pass( Pb pb, const typename Pb::TR *list, int in_list, typename Pb::TR *ovf_list,
+                                                     unsigned char *spill, int cap, int max_vertices, EB errors ) {
     using TK = typename Pb::TK;
+    using TR = typename Pb::TR;
     extern __shared__ __align__( 16 ) unsigned char shared_bytes_[];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    TK  *ts = reinterpret_cast<TK *>( shared_bytes_ ) + warp * 5 * CAP;                       // x0 x1 y0 y1 s
-    int *cs = reinterpret_cast<int *>( shared_bytes_ + ( BLOCK / 32 ) * 5 * CAP * sizeof( TK ) ) + warp * 2 * CAP;
-    const int m = *count;
-    for ( int i = ( blockIdx.x * blockDim.x + threadIdx.x ) / 32; i < m; i += gridDim.x * blockDim.x / 32 ) {
-        const int k = list[ i ];
+    const SI  gwarp = ( SI( blockIdx.x ) * blockDim.x + threadIdx.x ) / 32;
+    unsigned char *mine = spill ? spill + gwarp * WarpCell<TK,TR>::bytes_for( cap )
+                                : shared_bytes_ + SI( warp ) * WarpCell<TK,TR>::bytes_for( cap );
+    const unsigned long long m = pb.counters->ovf[ in_list ];
+    for ( unsigned long long i = gwarp; i < m; i += SI( gridDim.x ) * blockDim.x / 32 ) {
+        const TR k = list[ i ];
         Frame<TK> f;
         TK b[ 4 ];
         start_of( pb, k, f, b );
-        WarpCell<TK> cell;
-        for ( int q = 0; q < 2; ++q ) {
-            cell.x[ q ] = ts + q * CAP;
-            cell.y[ q ] = ts + ( 2 + q ) * CAP;
-            cell.c[ q ] = cs + q * CAP;
-        }
-        cell.s = ts + 4 * CAP;
-        cell.cap = CAP;
+        WarpCell<TK,TR> cell;
+        cell.attach( mine, cap );
         cell.lane = lane;
         cell.init( b[ 0 ], b[ 1 ], b[ 2 ], b[ 3 ] );
         walk( pb, f, cell );
         if ( lane == 0 ) {
-            if ( cell.nb < 0 )
-                ovf_list[ atomicAdd( ovf_count, 1 ) ] = k;
-            else
-                pb.write( k, area_of( pb, k, cell ) );
+            if ( cell.nb >= 0 )
+                finish_cell( pb, k, cell );
+            else if ( ! spill )                          // the shared pass: the global one has it
+                ovf_list[ atomicAdd( &pb.counters->ovf[ 2 ], 1ull ) ] = k;
+            else if ( cap < max_vertices ) {             // the global pass: more room is needed, loom gives it
+                finish_failed( pb, k, SPILL_CAPACITY );
+                atomicMax( &pb.counters->spill_need, ( unsigned long long ) min( 2 * cap, max_vertices ) );
+            } else {                                     // past the hard limit: a failure, said as such
+                finish_failed( pb, k, TOO_MANY_VERTICES );
+                if ( atomicAdd( &pb.counters->nb_failed, 1ull ) == 0 )
+                    errors.record( ERROR_KIND_FAILURE, FAIL_TOO_MANY_VERTICES, pb.user( k ) );
+            }
         }
         __syncwarp();
     }
 }
 
-/// FOURTH PASS: what is left, in global memory, `cap` vertices per cell; `m` is known on the host
-template<class Pb>
-__global__ void __launch_bounds__( BLOCK ) memory_pass( Pb pb, const int *list, int m, int cap, typename Pb::TK *xs, typename Pb::TK *ys, int *cs,
-                                                       int *ovf_list, int *ovf_count, bool last ) {
-    using TK = typename Pb::TK;
-    const int j = ( blockIdx.x * blockDim.x + threadIdx.x ) / 32;   // one cell per warp, see `warp_pass`
-    if ( threadIdx.x % 32 || j >= m )
-        return;
-    const int k = list[ j ];
-    Frame<TK> f;
-    TK b[ 4 ];
-    start_of( pb, k, f, b );
-    MemCell<TK> cell;
-    const SI rows = SI( cap ) * m;
-    cell.x[ 0 ] = xs + j; cell.x[ 1 ] = xs + rows + j;
-    cell.y[ 0 ] = ys + j; cell.y[ 1 ] = ys + rows + j;
-    cell.c[ 0 ] = cs + j; cell.c[ 1 ] = cs + rows + j;
-    cell.stride = m;
-    cell.cap = cap;
-    cell.init( b[ 0 ], b[ 1 ], b[ 2 ], b[ 3 ] );
-    walk( pb, f, cell );
-    if ( cell.nb < 0 ) {
-        if ( last )                                      // no room left to grow: say it rather than lie
-            pb.write( k, __longlong_as_double( 0x7ff8000000000000ll ) );
-        else
-            ovf_list[ atomicAdd( ovf_count, 1 ) ] = k;
-        return;
-    }
-    pb.write( k, area_of( pb, k, cell ) );
-}
-
 /// THE KERNEL'S TREE, from the tree's tensors ( one thread per node ). In float the box is rounded OUTWARD and
 /// the majorant constant UP: a pruning made on the rounded node is still a pruning of the true one.
-template<class TK,bool W,class TB,class TI>
-__global__ void __launch_bounds__( BLOCK ) make_nodes( int nb_nodes, Strided<TB,3> box, Strided<TB,2> wa, Strided<TB,1> wb,
-                                                      Strided<TI,1> beg, Strided<TI,1> end, Node<float,W> *out ) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+template<bool W,class TR,class TB,class TJ>
+__global__ void __launch_bounds__( BLOCK ) make_nodes( SI nb_nodes, Strided<TB,3> box, Strided<TB,2> wa, Strided<TB,1> wb,
+                                                      Strided<TJ,1> beg, Strided<TJ,1> end, Node<W,TR> *out ) {
+    const SI i = SI( blockIdx.x ) * blockDim.x + threadIdx.x;
     if ( i >= nb_nodes )
         return;
-    auto down = []( TB v ) -> TK { if constexpr ( std::is_same_v<TK,float> && ! std::is_same_v<TB,float> ) return __double2float_rd( v ); else return TK( v ); };
-    auto up   = []( TB v ) -> TK { if constexpr ( std::is_same_v<TK,float> && ! std::is_same_v<TB,float> ) return __double2float_ru( v ); else return TK( v ); };
-    Node<float,W> nd;
+    auto down = []( TB v ) -> float { if constexpr ( ! std::is_same_v<TB,float> ) return __double2float_rd( v ); else return v; };
+    auto up   = []( TB v ) -> float { if constexpr ( ! std::is_same_v<TB,float> ) return __double2float_ru( v ); else return v; };
+    Node<W,TR> nd;
     for ( int d = 0; d < 2; ++d ) {
         nd.lo[ d ] = down( box( i, 0, d ) );
         nd.hi[ d ] = up  ( box( i, 1, d ) );
     }
     if constexpr ( W ) {
-        nd.a[ 0 ] = TK( wa( i, 0 ) );
-        nd.a[ 1 ] = TK( wa( i, 1 ) );
+        // the slopes are only used to bound: rounded, they give another valid majorant once the constant is
+        // taken above it -- the constant already carries a margin far above these roundings
+        nd.a[ 0 ] = float( wa( i, 0 ) );
+        nd.a[ 1 ] = float( wa( i, 1 ) );
         nd.b = up( wb( i ) );
     }
-    nd.beg = int( beg( i ) );
-    nd.end = int( end( i ) );
+    nd.beg = TR( beg( i ) );
+    nd.end = TR( end( i ) );
     out[ i ] = nd;
 }
 
 /// THE KERNEL'S SEEDS: two floats per coordinate ( and per weight ) for the float kernel, the doubles as such for
 /// the double one
 template<class TK,bool W,class TF>
-__global__ void __launch_bounds__( BLOCK ) pack_seeds( int n, Strided<TF,2> pos, Strided<TF,1> w,
+__global__ void __launch_bounds__( BLOCK ) pack_seeds( SI n, Strided<TF,2> pos, Strided<TF,1> w,
                                                       typename KernelSeeds<TK>::Pos *pos_out, typename KernelSeeds<TK>::Wt *w_out ) {
-    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    const SI k = SI( blockIdx.x ) * blockDim.x + threadIdx.x;
     if ( k >= n )
         return;
     const double x = double( pos( k, 0 ) ), y = double( pos( k, 1 ) );
@@ -1125,7 +1263,13 @@ __global__ void __launch_bounds__( BLOCK ) pack_seeds( int n, Strided<TF,2> pos,
     }
 }
 
-// ---- the handler -------------------------------------------------------------------------------------------
+/// `count` into a loom ShapeVar ( on the card: the capacity check and the error record are the ShapeVar's own )
+template<class SV>
+__global__ void report_count( SV sv, const unsigned long long *count, unsigned long long factor ) {
+    sv.set( SI( *count * factor ) );
+}
+
+// ---- the host side -----------------------------------------------------------------------------------------
 
 /// `nb_bytes` of the call's pool, 16-byte aligned ( `nullptr` if the pool said no: the handler reports it )
 inline void *take( auto &allocator, SI nb_bytes ) {
@@ -1136,59 +1280,85 @@ inline void *take( auto &allocator, SI nb_bytes ) {
     return reinterpret_cast<void *>( ( p + 15 ) & ~std::uintptr_t( 15 ) );
 }
 
-/// `true` if this call can take the dedicated path ( checked again by the caller, `PowerDiagram_Bsp.py` )
-inline bool supports_depth( int depth ) { return depth <= MAX_DEPTH; }
+inline int blocks_for( SI n ) { return int( ( n + BLOCK - 1 ) / BLOCK ); }
 
-/// THE MEASURES OF `pd` INTO `res`, on the call's stream. `TK`: the kernel's float.
-template<class TK>
-void measures( const CudaQueue &queue, const auto &pd, auto &&res, auto &allocator ) {
-    using PD = std::decay_t<decltype( pd )>;
-    using TF = typename PD::TF;
-    using TI = std::remove_const_t<typename std::decay_t<decltype( pd.tree.seed_indices )>::TF>;
-    constexpr bool W = PD::has_weights;
-    static_assert( PD::ct_dim == 2, "the dedicated GPU cell is 2D" );
-    using Pb  = Problem<TK,TF,TI,W>;
+/// THE DIAGRAM ON THE CARD, for one call: the kernel's tree and seeds, the lists and counters of the passes, the
+/// global-memory slots of the fourth pass. `prepare` takes it all from the call's allocator and fills the tree and
+/// the seeds; `run` launches the passes -- everything `pb` points to ( the outputs ) is the caller's. Nothing is read
+/// back ( but with `SDOT_CARD_STATS=1` ). This is the object a solver keeps across its diagrams ( `SdotPlanNd`, step 2 ):
+/// `prepare` again when the weights change ( it rebuilds the nodes from the tree's majorants ), `run` per diagram.
+template<class V,bool W,unsigned OUT,class TF,class TI>
+struct Card {
+    using Pb  = Problem<V,TF,TI,W,OUT>;
+    using TK  = typename V::TK;
+    using TR  = typename V::TR;
     using Pos = typename Pb::Pos;
     using Wt  = typename Pb::Wt;
 
-    const int n = int( pd.nb_seeds() );
-    const int nb_nodes = int( pd.tree.node_begin.shape( 0 ) );
-    if ( n == 0 )
-        return;
-    int depth = 0;
-    for ( int m = nb_nodes; m; m >>= 1 )
-        ++depth;
+    Pb             pb{};
+    TR            *lists = nullptr;                      ///< two lists of `n` ranks
+    Counters      *counters = nullptr;
+    Deferred<TR>   deferred{};
+    unsigned char *spill = nullptr;
+    int            spill_cap = 0, spill_warps = 0, max_vertices = 0;
+    SI             nb_nodes = 0;
 
-    // what the call allocates: the kernel's tree and seeds, two lists of ranks, the counters
-    Pb pb{};
-    auto *nodes = static_cast<Node<float,W> *>( take( allocator, SI( sizeof( Node<float,W> ) ) * nb_nodes ) );
-    auto *pos   = static_cast<Pos *>( take( allocator, SI( sizeof( Pos ) ) * n ) );
-    Wt   *w     = nullptr;
-    if constexpr ( W )
-        w = static_cast<Wt *>( take( allocator, SI( sizeof( Wt ) ) * n ) );
-    int *lists    = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * 2 * n ) );
-    int *counters = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * 64 ) );
-    if ( ! nodes || ! pos || ( W && ! w ) || ! lists || ! counters )
-        return;                                          // the pool said no: `allocator.failed` is reported
+    /// `spill_cap`: vertices per cell of the fourth pass ( a loom capacity: `min( it, max_vertices )` is used );
+    /// `spill_warps`: how many cells the fourth pass holds at once ( its grid ). `false`: the pool said no.
+    bool prepare( const CudaQueue &queue, const auto &pd, auto &allocator, int spill_cap_, int spill_warps_, int max_vertices_ ) {
+        static_assert( std::decay_t<decltype( pd )>::ct_dim == 2, "the dedicated GPU cell is 2D" );
+        const SI n = SI( pd.nb_seeds() );
+        nb_nodes = SI( pd.tree.node_begin.shape( 0 ) );
+        int depth = 0;
+        for ( SI m = nb_nodes; m; m >>= 1 )
+            ++depth;
+        if ( depth > V::MAX_HEIGHT || ( std::is_same_v<typename V::TN,int> && nb_nodes > SI( 0x7fffffff ) )
+                                   || ( std::is_same_v<TR,int> && n > SI( 0x7fffffff ) - 8 ) )
+            throw std::runtime_error( "sdot::gpu2d: the variant chosen does not hold this tree ( see `PowerDiagram_Bsp._card_variant` )" );
+        max_vertices = max_vertices_;
+        spill_cap    = std::max( 4, std::min( spill_cap_, max_vertices ) );
+        spill_warps  = ( std::max( 1, spill_warps_ ) + BLOCK / 32 - 1 ) / ( BLOCK / 32 ) * ( BLOCK / 32 );   // whole blocks
 
-    pb.nodes   = nodes;
-    pb.pos     = pos;
-    pb.w       = w;
-    pb.pos64   = strided( pd.sorted_positions );
-    if constexpr ( W )
-        pb.w64 = strided( pd.sorted_weights );
-    pb.box_min = strided( pd.box_min );
-    pb.box_max = strided( pd.box_max );
-    pb.ids     = strided( pd.tree.seed_indices );
-    pb.res     = reinterpret_cast<char *>( res.data().raw );
-    pb.res_stride = SI( res._strides[ Ct<int,0>() ] );
-    pb.n       = n;
-    pb.depth   = depth;
+        auto *nodes = static_cast<Node<W,TR> *>( take( allocator, SI( sizeof( Node<W,TR> ) ) * nb_nodes ) );
+        auto *pos   = static_cast<Pos *>( take( allocator, SI( sizeof( Pos ) ) * n ) );
+        Wt   *w     = nullptr;
+        if constexpr ( W )
+            w = static_cast<Wt *>( take( allocator, SI( sizeof( Wt ) ) * n ) );
+        lists    = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * 2 * n ) );
+        counters = static_cast<Counters *>( take( allocator, SI( sizeof( Counters ) ) ) );
+        spill    = static_cast<unsigned char *>( take( allocator, WarpCell<TK,TR>::bytes_for( spill_cap ) * spill_warps ) );
+        if ( ! nodes || ! pos || ( W && ! w ) || ! lists || ! counters || ! spill )
+            return false;
+        deferred = Deferred<TR>{ nullptr, nullptr, nullptr, nullptr, n };
+        if constexpr ( std::is_same_v<TK,float> ) {
+            deferred.x  = static_cast<float *>( take( allocator, SI( sizeof( float ) ) * RD * n ) );
+            deferred.y  = static_cast<float *>( take( allocator, SI( sizeof( float ) ) * RD * n ) );
+            deferred.c  = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * RD * n ) );
+            deferred.nb = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * n ) );
+            if ( ! deferred.x || ! deferred.y || ! deferred.c || ! deferred.nb )
+                return false;
+        }
 
-    zero_fill( queue, counters, SI( sizeof( int ) ) * 64 );
+        pb.nodes   = nodes;
+        pb.pos     = pos;
+        pb.w       = w;
+        pb.pos64   = strided( pd.sorted_positions );
+        if constexpr ( W )
+            pb.w64 = strided( pd.sorted_weights );
+        pb.box_min = strided( pd.box_min );
+        pb.box_max = strided( pd.box_max );
+        pb.ids     = strided( pd.tree.seed_indices );
+        pb.n       = TR( n );
+        pb.depth   = depth;
+        pb.rho     = 1;
+        pb.user_order = true;
+        pb.counters = counters;
+        refresh( queue, pd );
+        return true;
+    }
 
-    // the tree and the seeds in the kernel's form
-    {
+    /// the kernel's tree and seeds from the diagram's tensors ( again after the weights changed )
+    void refresh( const CudaQueue &queue, const auto &pd ) {
         using TB = std::remove_const_t<typename std::decay_t<decltype( pd.tree.node_box )>::TF>;
         using TJ = std::remove_const_t<typename std::decay_t<decltype( pd.tree.node_begin )>::TF>;
         static_assert( std::is_same_v<TB,TF>, "the tree's boxes and the positions share the driver's float" );
@@ -1197,59 +1367,133 @@ void measures( const CudaQueue &queue, const auto &pd, auto &&res, auto &allocat
         if constexpr ( W ) {
             wa = strided( pd.tree.node_wa );
             wb = strided( pd.tree.node_wb );
+            pb.w64 = strided( pd.sorted_weights );
         }
-        launch_kernel( queue, &make_nodes<float,W,TB,TJ>, ( nb_nodes + BLOCK - 1 ) / BLOCK, BLOCK, 0,
-                       nb_nodes, strided( pd.tree.node_box ), wa, wb, strided( pd.tree.node_begin ), strided( pd.tree.node_end ), nodes );
-        launch_kernel( queue, &pack_seeds<TK,W,TF>, ( n + BLOCK - 1 ) / BLOCK, BLOCK, 0, n, pb.pos64, pb.w64, pos, w );
+        launch_kernel( queue, &make_nodes<W,TR,TB,TJ>, blocks_for( nb_nodes ), BLOCK, 0,
+                       nb_nodes, strided( pd.tree.node_box ), wa, wb, strided( pd.tree.node_begin ), strided( pd.tree.node_end ),
+                       const_cast<Node<W,TR> *>( pb.nodes ) );
+        launch_kernel( queue, &pack_seeds<TK,W,TF>, blocks_for( SI( pb.n ) ), BLOCK, 0, SI( pb.n ), pb.pos64, pb.w64,
+                       const_cast<Pos *>( pb.pos ), const_cast<Wt *>( pb.w ) );
     }
 
-    // first pass, second pass ( no read back between them )
-    int *list1 = lists, *list2 = lists + n;
-    Deferred deferred{ nullptr, nullptr, nullptr, nullptr, n };
-    if constexpr ( std::is_same_v<TK,float> ) {
-        deferred.x  = static_cast<float *>( take( allocator, SI( sizeof( float ) ) * RD * n ) );
-        deferred.y  = static_cast<float *>( take( allocator, SI( sizeof( float ) ) * RD * n ) );
-        deferred.c  = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * RD * n ) );
-        deferred.nb = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * n ) );
-        if ( ! deferred.x || ! deferred.y || ! deferred.c || ! deferred.nb )
+    /// THE PASSES. `errors`: the kernel form of loom's error buffer ( what a failure is recorded in ).
+    template<class EB>
+    void run( const CudaQueue &queue, const EB &errors ) {
+        const SI n = SI( pb.n );
+        zero_fill( queue, counters, SI( sizeof( Counters ) ) );
+        if ( pb.status )
+            zero_fill( queue, pb.status, SI( sizeof( int ) ) * n );
+        if ( n == 0 )
             return;
+
+        // first pass, second pass ( no read back between them )
+        TR *list1 = lists, *list2 = lists + n;
+        launch_kernel( queue, &first_pass<Pb>, blocks_for( n ), BLOCK, 0, pb, list1, deferred );
+        static const int grid2 = resident_grid( &second_pass<Pb>, BLOCK );
+        launch_kernel( queue, &second_pass<Pb>, grid2, BLOCK, 0, pb, list1, list2, deferred );
+
+        // third pass, one warp per cell in shared memory ( its overflow goes to `list1`, free again )
+        constexpr int CAP = shared_cap<TK>();
+        auto *k3 = &warp_pass<Pb,EB>;
+        constexpr int bytes3 = warp_bytes<TK,TR,CAP>();
+        static const int grid3 = [&] {
+            cuda_check( cudaFuncSetAttribute( k3, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes3 ), "shared memory of the warp pass" );
+            return resident_grid( k3, BLOCK, bytes3 );
+        }();
+        launch_kernel( queue, k3, grid3, BLOCK, bytes3, pb, list2, 1, list1, ( unsigned char * ) nullptr, CAP, max_vertices, errors );
+
+        if constexpr ( deferring<Pb>() )
+            launch_kernel( queue, &finish_pass<Pb>, blocks_for( n ), BLOCK, 0, pb, deferred );
+
+        // fourth pass, one warp per cell in global memory, `spill_warps` at once: launched whatever the count ( it
+        // reads it ), it costs a launch when there is nothing to do
+        launch_kernel( queue, k3, ( spill_warps * 32 + BLOCK - 1 ) / BLOCK, BLOCK, 0, pb, list1, 2, list2, spill, spill_cap, max_vertices, errors );
+
+        static const bool stats = std::getenv( "SDOT_CARD_STATS" ) && *std::getenv( "SDOT_CARD_STATS" ) != '0';
+        if ( stats ) {                                   // how many cells each pass left over ( a diagnosis: a read back )
+            Counters c;
+            read_back( queue, &c, counters, 1 );
+            std::printf( "[card cells] n %lld, over %d registers %llu ( %.2f %% ), over %d registers %llu ( %.3f %% ), over %d shared %llu, "
+                         "spill capacity %d asked %llu, failed %llu, facets %llu\n",
+                         ( long long ) n, R1, c.ovf[ 0 ], 100.0 * c.ovf[ 0 ] / n, R2, c.ovf[ 1 ], 100.0 * c.ovf[ 1 ] / n, CAP, c.ovf[ 2 ],
+                         spill_cap, c.spill_need, c.nb_failed, c.nb_facets );
+        }
     }
-    launch_kernel( queue, &first_pass<Pb>, ( n + BLOCK - 1 ) / BLOCK, BLOCK, 0, pb, list1, counters + 0, deferred );
-    // second pass, `R2` registers, without a read back
-    static const int grid2 = resident_grid( &second_pass<Pb>, BLOCK );
-    launch_kernel( queue, &second_pass<Pb>, grid2, BLOCK, 0, pb, list1, counters + 0, list2, counters + 1, deferred );
 
-    // third pass, one warp per cell
-    auto *k3 = &warp_pass<Pb,shared_cap<TK>()>;
-    static const int grid3 = resident_grid( k3, BLOCK, warp_bytes<TK,shared_cap<TK>()>() );
-    launch_kernel( queue, k3, grid3, BLOCK, warp_bytes<TK,shared_cap<TK>()>(), pb, list2, counters + 1, list1, counters + 2 );
-
-    if constexpr ( std::is_same_v<TK,float> )
-        launch_kernel( queue, &finish_pass<Pb>, ( n + BLOCK - 1 ) / BLOCK, BLOCK, 0, pb, deferred );
-
-    // fourth pass, as long as something overflows: the count is read back, the rows sized on it
-    int m = 0;
-    read_back( queue, &m, counters + 2, 1 );
-    static const bool stats = std::getenv( "SDOT_CARD_STATS" ) && *std::getenv( "SDOT_CARD_STATS" ) != '0';
-    if ( stats ) {                                       // how many cells each pass left over ( a diagnosis )
-        int c[ 2 ] = { 0, 0 };
-        read_back( queue, c, counters + 0, 2 );
-        std::printf( "[card cells] n %d, over %d registers %d ( %.2f %% ), over %d registers %d ( %.3f %% ), over %d shared %d\n",
-                     n, R1, c[ 0 ], 100.0 * c[ 0 ] / n, R2, c[ 1 ], 100.0 * c[ 1 ] / n, shared_cap<TK>(), m );
+    /// what the passes ask of loom's capacities, written into their ShapeVars ON THE CARD ( `set` checks the capacity
+    /// and records the overflow: loom runs the call again with more room )
+    void report_spill( const CudaQueue &queue, const auto &sv ) const {
+        launch_kernel( queue, &report_count<std::decay_t<decltype( sdot::kernel_form( queue, MutList(), sv ) )>>, 1, 1, 0,
+                       sdot::kernel_form( queue, MutList(), sv ), &counters->spill_need, 1ull );
     }
-    int *in = list1, *out = list2;
-    for ( int round = 0, cap = 4 * shared_cap<TK>(); m > 0; ++round, cap *= 4 ) {
-        const bool last = round == 4;                    // 2^18 or 2^19 vertices
-        auto *xs = static_cast<TK *>( take( allocator, SI( sizeof( TK ) ) * 2 * cap * m ) );
-        auto *ys = static_cast<TK *>( take( allocator, SI( sizeof( TK ) ) * 2 * cap * m ) );
-        auto *cs = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * 2 * cap * m ) );
-        if ( ! xs || ! ys || ! cs )
+    void report_facets( const CudaQueue &queue, const auto &sv, unsigned long long factor ) const {
+        launch_kernel( queue, &report_count<std::decay_t<decltype( sdot::kernel_form( queue, MutList(), sv ) )>>, 1, 1, 0,
+                       sdot::kernel_form( queue, MutList(), sv ), &counters->nb_facets, factor );
+    }
+};
+
+/// the types a diagram's tensors give
+template<class PD> using TFOf = typename PD::TF;
+template<class PD> using TIOf = std::remove_const_t<typename std::decay_t<decltype( std::declval<PD>().tree.seed_indices )>::TF>;
+
+/// how many cells the fourth pass holds at once ( its slots ): few, they are rare and big
+constexpr int SPILL_WARPS = 64;
+
+/// the constant density: a number, or a 0-d tensor of the call ( read on the card: its value is not a compile-time
+/// constant of the kernel )
+template<class Pb>
+void set_density( Pb &pb, const auto &density ) {
+    if constexpr ( requires { density.data().raw; } ) {
+        pb.rho_dev = reinterpret_cast<decltype( pb.rho_dev )>( density.data().raw );
+        pb.rho = 1;
+    } else {
+        pb.rho_dev = nullptr;
+        pb.rho = double( density );
+    }
+}
+
+// ---- the entry points of the loom calls ( `PowerDiagram_Bsp.py` ) -------------------------------------------------
+
+/// THE MEASURES ( and the per-cell status ) of `pd` on the call's stream. `work.nb_spill`: the capacity of the fourth
+/// pass ( a loom ShapeVar ); `rho`: the constant density.
+template<class V>
+void measures( const CudaQueue &queue, const auto &pd, auto &&res, auto &&work, const auto &errors, auto &allocator, const auto &rho, int max_vertices ) {
+    using PD = std::decay_t<decltype( pd )>;
+    Card<V,PD::has_weights,MEASURES,TFOf<PD>,TIOf<PD>> card;
+    if ( ! card.prepare( queue, pd, allocator, int( std::min<SI>( work.nb_spill.max, max_vertices ) ), SPILL_WARPS, max_vertices ) )
+        return;                                          // the pool said no: `allocator.failed` is reported
+    set_density( card.pb, rho );
+    card.pb.res    = strided_out<TFOf<PD>,1>( res );
+    card.pb.status = reinterpret_cast<int *>( work.status.data().raw );
+    card.run( queue, sdot::kernel_form( queue, MutList(), errors ) );
+    card.report_spill( queue, work.nb_spill );
+}
+
+/// THE ADJOINT OF THE MEASURES: `grad_res` ( user order ) -> the gradients of the sorted positions and weights. A
+/// backward cannot run again with more room: its fourth pass is given the hard limit ( on fewer warps ).
+template<class V>
+void measures_vjp( const CudaQueue &queue, const auto &pd, const auto &grad_res, auto &&grad_pos, auto &&grad_w, const auto &errors,
+                   auto &allocator, const auto &rho, int max_vertices ) {
+    using PD = std::decay_t<decltype( pd )>;
+    using TF = TFOf<PD>;
+    constexpr bool W = PD::has_weights;
+    constexpr bool has_gp = requires { grad_pos.data().raw; }, has_gw = requires { grad_w.data().raw; };
+    if constexpr ( ! has_gp && ! has_gw ) {
+        return;
+    } else if constexpr ( ! requires { grad_res.data().raw; } ) {
+        // a symbolic zero cotangent: zero gradients ( loom seeds the outputs, but say it rather than assume it )
+        if constexpr ( has_gp ) zero_fill( queue, const_cast<void *>( ( const void * ) grad_pos.data().raw ), SI( sizeof( TF ) ) * 2 * SI( pd.nb_seeds() ) );
+        if constexpr ( has_gw ) zero_fill( queue, const_cast<void *>( ( const void * ) grad_w.data().raw ), SI( sizeof( TF ) ) * SI( pd.nb_seeds() ) );
+    } else {
+        Card<V,W,VJP,TF,TIOf<PD>> card;
+        if ( ! card.prepare( queue, pd, allocator, max_vertices, 8, max_vertices ) )
             return;
-        launch_kernel( queue, &memory_pass<Pb>, ( 32 * m + BLOCK - 1 ) / BLOCK, BLOCK, 0, pb, in, m, cap, xs, ys, cs, out, counters + 3 + round, last );
-        if ( last )
-            break;
-        read_back( queue, &m, counters + 3 + round, 1 );
-        std::swap( in, out );
+        set_density( card.pb, rho );
+        card.pb.g        = strided( grad_res );
+        card.pb.grad_pos = strided_out<TF,2>( grad_pos );
+        if constexpr ( W )
+            card.pb.grad_w = strided_out<TF,1>( grad_w );
+        card.run( queue, sdot::kernel_form( queue, MutList(), errors ) );
     }
 }
 

@@ -104,6 +104,9 @@ errand -k bench --env lmo-jax bench_diagram --case=uniform --dim=3 --kernel=floa
 errand -k bench --env lmo-jax bench_diagram --case=planes_voronoi,planes_equal --kernel=float,double
 ```
 
+On the 2D card kernel, `--output=facets` times the measures AND the laplacian's CSR (Newton's iteration), `--output=vjp`
+the adjoint alone (the pullback), `--output=moments` measures + barycentres + costs.
+
 The first run compiles every kernel with `nvcc` (minutes each). Results: `bench/calibration_lmo_today.md`, section GPU.
 
 ### Threads

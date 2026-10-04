@@ -62,7 +62,11 @@ if p := bench( "diagram",
                reps      = Param( 0, help = "timed repetitions, we keep the minimum ( 0: 3 on the CPU, 10 on a GPU )" ),
                warmup    = Param( 0.3, help = "GPU: seconds of `measures` in a loop before the timed runs ( the old GPU bench: 0.3 )" ),
                accuracy  = Param( "auto", choices = [ "auto", "yes", "no" ], help = "compare with a `double` kernel run of the same diagram ( auto: on a GPU, for --kernel=float )" ),
-               seed      = Param( 0, help = "seed of the uniform draw" ) ):
+               seed      = Param( 0, help = "seed of the uniform draw" ),
+               output    = Param( "measures", choices = [ "measures", "facets", "vjp", "moments" ],
+                                  help = "GPU, 2D card kernel: what one call computes -- `measures`; `facets`: the measures AND the laplacian's CSR "
+                                         "( Newton's turn: `_card_cells`, cells + COO + assembly ); `vjp`: the adjoint of the measures alone "
+                                         "( the pullback, wrt the weights, or the positions without weights ); `moments`: measures + barycentres + costs" ) ):
     benchlib.set_threads( p.threads, p.pin )          # BEFORE the first kernel: the pool reads them once
     benchlib.set_kernel_timing()                      # BEFORE the first kernel too: each library reads it once
     from sdot import AaBsp, PowerDiagram, box_half_spaces
@@ -95,16 +99,41 @@ if p := bench( "diagram",
     print( f"  positions as { benchlib.dtype_of( pd.sorted_positions ) } ( TF ), kernel { kernel }" )
 
     timing = benchlib.KernelTiming() if on_gpu else None
+    if p.output != "measures" and not ( on_gpu and d == 2 and pd._card_variant() is not None ):
+        raise ValueError( f"--output={ p.output }: the 2D card kernel only ( a CUDA device, 2D )" )
+    pullback = None
+    if p.output == "vjp":                             # the forward once: what is timed is the pullback
+        import jax
+        if unweighted:
+            def fwd( x ):
+                return PowerDiagram( x, boundaries = box_half_spaces( [ 0 ] * d, [ 1 ] * d ), accelerator = bsp,
+                                     kernel_dtype = kernel ).measures.value
+            _, pullback = jax.vjp( fwd, pos )
+        else:
+            def fwd( x ):
+                pd.weights = x
+                return pd.measures.value
+            _, pullback = jax.vjp( fwd, w )
+        cot = numpy.random.default_rng( 1 ).normal( size = n )
+
+    def call():
+        if p.output == "measures":
+            return pd.measures.value                  # the cells: what the old `diagramme` times
+        if p.output == "vjp":
+            return pullback( cot )[ 0 ]
+        out = pd._card_cells( facets = p.output == "facets", moments = p.output == "moments" )
+        benchlib.block_until_ready( out[ "val" ].raw if p.output == "facets" else out[ "cost" ].raw )
+        return out[ "measures" ].value
 
     def once():
         t0 = time.perf_counter()
-        if not unweighted:
+        if not unweighted and p.output != "vjp":
             pd.weights = w
         t1 = time.perf_counter()
         if timing:
             timing.reset()                            # waits for what is in flight ( the weights ) and zeroes
             t1 = time.perf_counter()
-        meas = pd.measures.value                      # the cells: what the old `diagramme` times
+        meas = call()
         benchlib.block_until_ready( meas )            # a GPU result is asynchronous: the wall time waits for it
         t2 = time.perf_counter()
         k = timing.read() if timing else None
@@ -133,7 +162,7 @@ if p := bench( "diagram",
 
     # -- the accuracy, against a double kernel on the same tree
     acc = None
-    if p.accuracy == "yes" or ( p.accuracy == "auto" and on_gpu and p.kernel == "float" ):
+    if p.output == "measures" and ( p.accuracy == "yes" or ( p.accuracy == "auto" and on_gpu and p.kernel == "float" ) ):
         if p.kernel == "double":
             print( "  accuracy: the kernel is already double ( it is the reference )" )
         else:
@@ -159,6 +188,7 @@ if p := bench( "diagram",
     p.results[ "t_ctor" ] = t_ctor
     p.results[ "sum_of_measures" ] = float( m.sum() )
     p.results[ "reps" ] = reps
+    p.results[ "output" ] = p.output
     if acc:
         for key, v in acc.items():
             p.results[ f"acc_{ key }" ] = v
@@ -199,12 +229,14 @@ if p := bench( "diagram",
             for key in ( "regs", "local_bytes", "static_shared", "block", "grid", "blocks_per_sm", "occupancy", "count" ):
                 p.results[ f"main_{ key }" ] = main[ key ]
             p.results[ "nb_launches" ] = kernels[ "count" ]
+        if p.output != "measures":
+            ref = acc_ref = cpu_ref = None            # the old numbers are for the measures
         if ref and ns_k is not None:
             p.results[ "ref_ns_per_seed" ] = ref[ "ns_per_seed" ]
             p.results[ "ratio_new_old" ] = ns_k / ref[ "ns_per_seed" ]
 
         header = [ "case", "n", "kernel", "kernel ns/seed", "wall ns/seed", "regs", "occup.", "local B", "old ns/seed", "new/old", "old = " ]
-        row = [ name + ( f" w~{ p.wscale }h2" if p.wscale else "" ), n, p.kernel,
+        row = [ name + ( f" w~{ p.wscale }h2" if p.wscale else "" ) + ( "" if p.output == "measures" else f" [{ p.output }]" ), n, p.kernel,
                 "-" if ns_k is None else f"{ ns_k :.1f}", f"{ ns :.1f}",
                 main[ "regs" ] if main else "-",
                 f"{ main[ 'occupancy' ] * 100 :.0f} % ( { main[ 'blocks_per_sm' ] } x { main[ 'block' ] } )" if main else "-",

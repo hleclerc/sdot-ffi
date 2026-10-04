@@ -527,3 +527,79 @@ CPU unchanged (`lmo-numpy`, 8 pinned threads, double, min of 3, same session): 2
 * The double kernel prunes in float with a margin of 1e-6 of the terms: conservative by construction, measured equal to
   the generic double path to 1e-11-1e-9 (`test_CardCells`).
 * The fourth pass and the overflow statistics read a count back (a stream synchronization per call).
+
+# GPU step 3: what Newton needs per iteration on the card -- facets ( Hessian ), adjoint, moments ( 2026-10-04 )
+
+Code: `include/sdot/gpu/Cell2D.cuh` ( header comment = the design ) and the new `include/sdot/gpu/Laplacian2D.cuh`;
+Python `PowerDiagram_Bsp._card_variant / _card_call / _card_cells` and the module functions `card_variant_for`,
+`card_nnz_capacity`; loom: `ErrorKind::failure` ( `ErrorBuffer.h` ), `KernelFailure` + `failures = { code: message }` on
+`driver.call` ( `CallArg_Errors.py`, the three drivers, the traced check of `JaxDriver` ). Tests: `tests/test_CardCells.py`
+( 14 entries ) and `loom/tests/test_call.py::a_failure_record_raises_with_the_message_of_the_call`.
+
+What one walk of a cell now gives, chosen at compile time ( `Out` ): MEASURES; FACETS = the COO of the UPPER facets
+( rank i < rank j, `c_ij = rho |facet| / ( 2 |p_i - p_j| )` ) that `Laplacian2D.cuh` turns into the symmetric CSR of the
+Laguerre laplacian ( count / scan / fill / per-row sort / diagonal as the row sum: `L = L^T` and `L 1 = 0` to the bit, the
+old campaign's `Hess2D.cuh` ); VJP = the adjoint of the measures as a GATHER over the cell's own facets
+( `grad_w_i = sum_j c_ij ( g_i - g_j )`, `grad_p_i = sum_j 2 c_ij ( g_i - g_j ) ( x_ij - p_i )`, no atomic );
+MOMENTS = barycentre and `rho int |x - p_i|^2` ( the cost; its position gradient is the envelope formula ). All on the
+re-solved double vertices for the float kernel.
+
+The four fixes: (1) the card path is no longer bypassed by traced / differentiated inputs: an ffi call with its own
+backward ( `measures_vjp` ); (2) no read back: per-cell STATUS output, the fourth pass is a warp cell in GLOBAL memory with
+a capacity `nb_spill` chosen by Python ( loom ShapeVar, 1024 vertices ), grown by loom's retry through the error buffer
+( eager ) or raised ( traced: `jax.debug.callback`, ~1-2 ms per call ); (3) the walk's stack is indexed by HEIGHT ( one
+pending node per height, a bit mask, the top = lowest bit ): no packing, no depth limit; rank / node index types and the
+stack size are template parameters chosen by Python ( `Variant< TK, TR, TN, MAX_HEIGHT >`: int / long long, 32 / 64 );
+(4) past `card_max_vertices` ( 32768 ) a cell is a `KernelFailure` with the seed's index, never a NaN.
+
+## Protocol
+
+As before: `bench_diagram` on `lmo-jax` through the exclusive queue, kernel only = sum of all launches of the call, min of
+10. New `--output=measures|facets|vjp|moments`: `facets` = `_card_cells( facets = True )` ( cells + COO + CSR assembly:
+Newton's iteration ), `vjp` = the pullback alone ( wrt the weights, or the positions without weights ). Runs
+`runs/bench_diagram/diagram/2026-10-04_*` ( this session ).
+
+## Table ( kernel-only ns/seed; in brackets: ms per call )
+
+| case | kernel | measures ( before this step ) | measures + facets + CSR | adjoint ( pullback ) |
+|---|---|---|---|---|
+| 2D uniform 1e6 | float | **9.1** ( 9.3 ) | **12.4** ( 12.4 ms ) | 12.1 |
+| 2D uniform 1e6 | double | **57.0** ( 57.0 ) | **60.1** ( 60.1 ms ) | 58.0 |
+| lines Voronoi 1e5 | float | 24.8 ( 25.1 ) | 29.3 | 26.6 |
+| lines Voronoi 1e5 | double | 81.8 ( 80.1 ) | 89.0 | 84.7 |
+| lines equal 1e5 | float | 51.2 ( 52.0 ) | 55.9 | 53.5 |
+| lines equal 1e5 | double | 292.7 ( 289.0 ) | 290.9 | 290.5 |
+
+* The measures did not move ( the height stack is as fast as the packed one; float P1 64 regs / 100 %, double 96 / 62 % ).
+* Facets: uniform float +3.3 ms = finish +1.2 ( the edge terms in double ) + assembly 1.8 ( fill 1.16 with its atomics,
+  sort 0.41, count + scan 0.2 ); double +3.1 ms = P1 +1.2 ( 96 -> 122 regs, 62 -> 50 % ) + assembly 2.3. The first
+  per-row sort was in place in global memory: 2.8 ms; in registers ( odd-even network, rows <= 16 ) 0.41 ms.
+* THE OLD CAMPAIGN'S NEWTON TURN ( doc/06 l.225-239, double, 1e6: 101 ms = 96 measures + 5 assembly ): **60.1 ms** here for
+  the same cells + CSR ( x0.60 ), majorants not included on either side ( see below ).
+* Adjoint: a walk again ( loom's design: nothing of the forward is kept ), plus the gathered facet terms: +3 ms float,
+  +1 ms double at 1e6.
+* Wall ( eager, 1e6 float ): 23.5 ns/seed, 7 ms more than before -- loom's Python per call ( the custom_vjp wrapping now
+  that the call has a backward: +2.3 ms, the source rendering and the analysis of the two aggregates ); under `jax.jit`
+  the call is 11.7 ms wall for 9-10 ms of kernels ( weighted ), 62.6 for 57-60 in double, the error check included.
+* Accuracy against the generic double path ( `test_CardCells` ): laplacian entries median 1e-14, max 2.6e-10 relative
+  ( small facets, floor 1e-3 of the median entry ), same graph on uniform / lines / weighted lines / ring of 300, float and
+  double kernels alike; adjoint max gap 1e-14 of the largest entry; barycentres 4e-14 h ( 6e-10 h weighted ), costs 4e-12.
+
+CPU unchanged: `bench_newton --env lmo-numpy --case=uniform --dim=2 --threads=8`: total 1.067 s ( old 1.10 ).
+
+## Findings on the way ( not fixed here )
+
+* `pd.weights = w` ( `AaBsp.refresh_weight_majorants` ) costs **676 ms at 1e6 on the card** ( host copies of the slices +
+  one batched loom call ): 10x a Newton turn. Step 2 must refresh the majorants in its own kernel ( e.g. in `make_nodes`,
+  from the node's slice ), not through Python.
+* The GENERIC GPU path gives NaN measures and facets on a few cells of the rings ( 2 of the ring of 300, 8 of the ring of
+  3000 ); the card does not ( the tests exclude those rows from the comparison ).
+
+## Risks
+
+* The float facets come from the float topology: a sliver seen from the higher rank only is dropped ( none on the test
+  clouds; the old campaign counted ~10 per million ).
+* A backward cannot run again: its fourth pass is sized on `card_max_vertices` ( 8 warps x 32768 vertices, 12.6 MB in
+  double ).
+* `__activemask` and CUB / cooperative groups do not compile with the pinned `nvcc` ( headers mismatch ): the reservation
+  of the COO and the scan are hand-written ( inline PTX `activemask` ).
