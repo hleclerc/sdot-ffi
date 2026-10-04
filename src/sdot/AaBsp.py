@@ -167,7 +167,10 @@ class AaBsp( SpatialAccelerator ):
         # readable on the host side, even under a `jit` ), and the majorant is redone afterwards, in a kernel
         # that accepts tracers ( `refresh_weight_majorants` )
         traced_w = w is not None and driver.is_traced( w )
-        tree = _build_in_kernel( pos, None if traced_w else w, int( max_seeds_per_leaf ) )
+        # the positions are concrete: the construction is EVALUATED even under a trace ( `driver.concrete_eval`: its calls
+        # read each level back, which a trace cannot do ), so a solve inside `jax.jit` still gets its tree
+        with driver.concrete_eval():
+            tree = _build_in_kernel( pos, None if traced_w else w, int( max_seeds_per_leaf ) )
 
         # the depth, which is EXACTLY `max_depth_for( n, leaf )`: the tree now has the
         # fixed shape that this majorant described (see `_build_in_kernel`). It is what sizes
@@ -489,7 +492,57 @@ def _build_in_kernel( pos, w, leaf_size ):
 
     begs, ends, boxes, was, wbs = [], [], [], [], []
 
-    for level in range( depth ):
+    # ON A CARD, THE TOP LEVELS ON THE HOST. A level runs one work item per node: the first levels are a handful of work
+    # items each sweeping ( and selecting in ) a large part of the cloud -- on a GPU thread that is seconds at 1e6 seeds
+    # ( 4.5 to 5.7 s measured on the RTX 2080 Ti, against 0.15 s for the whole tree on the CPU ). Those levels are done here
+    # by numpy, with the same rule ( the box, the longest axis, the median by rank, propagation when nothing can be cut, the
+    # majorant of `_weight_majorant` ); the levels where the nodes are many and small stay in the kernel. The halves of a
+    # cut are not ordered the same way as the kernel's selection would order them, which no property of the tree depends on.
+    host_levels = 0
+    if getattr( driver.device, "is_cuda_gpu", False ) and not driver.is_traced( pos ) and n > 64 * leaf_size:
+        host_levels = min( depth, 10 )
+    if host_levels:
+        P = np.array( np.asarray( pos ), dtype = np.float64 )
+        W = None if w is None else np.array( np.asarray( w ), dtype = np.float64 ).reshape( -1 )
+        order = np.arange( n, dtype = np.int64 )
+        for level in range( host_levels ):
+            nb = len( beg )
+            mid = end.copy()
+            box = np.zeros( ( nb, 2, d ) )
+            wa = np.zeros( ( nb, d ) )
+            wb = np.zeros( nb )
+            for j in range( nb ):
+                b, e = int( beg[ j ] ), int( end[ j ] )
+                if e <= b:
+                    continue
+                p = P[ b:e ]
+                lo, hi = p.min( axis = 0 ), p.max( axis = 0 )
+                box[ j, 0 ], box[ j, 1 ] = lo, hi
+                if W is not None:
+                    wa[ j ], wb[ j ] = _weight_majorant( p, W[ b:e ] )
+                ax = int( np.argmax( hi - lo ) )
+                if e - b > leaf_size and hi[ ax ] > lo[ ax ]:
+                    m = b + ( e - b ) // 2
+                    idx = np.argpartition( p[ :, ax ], m - b )
+                    P[ b:e ] = p[ idx ]
+                    order[ b:e ] = order[ b:e ][ idx ]
+                    if W is not None:
+                        W[ b:e ] = W[ b:e ][ idx ]
+                    mid[ j ] = m
+            begs.append( beg )
+            ends.append( end )
+            boxes.append( box )
+            if w is not None:
+                was.append( wa )
+                wbs.append( wb )
+            nb_ = np.empty( 2 * nb, dtype = np.int64 )
+            ne_ = np.empty( 2 * nb, dtype = np.int64 )
+            nb_[ 0::2 ], nb_[ 1::2 ] = beg, mid
+            ne_[ 0::2 ], ne_[ 1::2 ] = mid, end
+            beg, end = nb_, ne_
+        src = _BspCloud( nb_dims = d, positions = P, order = order, **( {} if W is None else { "weights": W } ) )
+
+    for level in range( host_levels, depth ):
         # the output cloud SHARES the points axis (hence its count) with the input: it is the
         # same permutation, rearranged.
         dst = _BspCloud( nb_dims = d, num_point = src.num_point )

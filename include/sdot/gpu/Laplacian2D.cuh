@@ -108,16 +108,25 @@ __global__ void __launch_bounds__( BLOCK ) scan_add( T *out, const T *sums, SI n
         out[ i ] += sums[ i / SCAN_TILE ];
 }
 
-/// `out[ i ] = in[ 0 ] + ... + in[ i - 1 ]`, on the call's stream; `false` if the pool said no
+/// the tiles' totals a scan of `n` values needs
+inline SI scan_sums_size( SI n ) { return std::max<SI>( ( n + SCAN_TILE - 1 ) / SCAN_TILE, 1 ); }
+
+/// `out[ i ] = in[ 0 ] + ... + in[ i - 1 ]`, on the call's stream, `sums` holding `scan_sums_size( n )` values
 template<class T>
-bool exclusive_scan( const CudaQueue &queue, auto &allocator, const T *in, T *out, SI n ) {
+void exclusive_scan( const CudaQueue &queue, T *sums, const T *in, T *out, SI n ) {
     const SI nb_tiles = ( n + SCAN_TILE - 1 ) / SCAN_TILE;
-    T *sums = static_cast<T *>( take( allocator, SI( sizeof( T ) ) * std::max<SI>( nb_tiles, 1 ) ) );
-    if ( ! sums )
-        return false;
     launch_kernel( queue, &scan_tiles<T>, int( nb_tiles ), BLOCK, 0, in, out, sums, n );
     launch_kernel( queue, &scan_sums<T>, 1, BLOCK, 0, sums, nb_tiles );
     launch_kernel( queue, &scan_add<T>, blocks_for( n ), BLOCK, 0, out, sums, n );
+}
+
+/// the same, the tiles' totals taken from the call's pool; `false` if the pool said no
+template<class T>
+bool exclusive_scan( const CudaQueue &queue, auto &allocator, const T *in, T *out, SI n ) {
+    T *sums = static_cast<T *>( take( allocator, SI( sizeof( T ) ) * scan_sums_size( n ) ) );
+    if ( ! sums )
+        return false;
+    exclusive_scan( queue, sums, in, out, n );
     return true;
 }
 
@@ -201,24 +210,41 @@ __global__ void __launch_bounds__( BLOCK ) lap_sort( const TP *row, TC *col, TV 
     dia[ i ] = d > 0 ? d : TV( 1 );
 }
 
+/// what the assembly works in: two arrays of `n + 1` counters and the scan's tiles ( taken once by a solver that
+/// assembles at every iteration: the call's pool frees nothing before the call returns )
+template<class TP>
+struct LapWork {
+    TP *cnt = nullptr, *at = nullptr, *sums = nullptr;
+
+    bool take_from( auto &allocator, SI n ) {
+        cnt  = static_cast<TP *>( take( allocator, SI( sizeof( TP ) ) * ( n + 1 ) ) );
+        at   = static_cast<TP *>( take( allocator, SI( sizeof( TP ) ) * ( n + 1 ) ) );
+        sums = static_cast<TP *>( take( allocator, SI( sizeof( TP ) ) * scan_sums_size( n + 1 ) ) );
+        return cnt && at && sums;
+    }
+};
+
 /// THE CSR of the laplacian from the COO of the upper facets that a `Card` with `FACETS` filled ( `card.pb.fi / fj /
-/// fc`, `card.counters` ). `row`: `n + 1` entries of `TP`; `col` / `val`: `2 * card.pb.fcap` entries at least. `false`
-/// if the pool said no.
+/// fc`, `card.counters` ). `row`: `n + 1` entries of `TP`; `col` / `val`: `2 * card.pb.fcap` entries at least.
+template<class CardT,class TP,class TC,class TV>
+void assemble_laplacian_in( const CudaQueue &queue, const CardT &card, const LapWork<TP> &ws, TP *row, TC *col, TV *val, TV *dia ) {
+    const SI n = SI( card.pb.n );
+    zero_fill( queue, ws.cnt, SI( sizeof( TP ) ) * ( n + 1 ) );
+    static const int grid = resident_grid( &lap_count<typename CardT::TR,TP>, BLOCK );
+    launch_kernel( queue, &lap_count<typename CardT::TR,TP>, grid, BLOCK, 0, card.pb.fi, card.pb.fj, card.counters, card.pb.fcap, ws.cnt );
+    exclusive_scan( queue, ws.sums, static_cast<const TP *>( ws.cnt ), row, n + 1 );
+    cuda_check( cudaMemcpyAsync( ws.at, row, sizeof( TP ) * n, cudaMemcpyDeviceToDevice, queue.stream ), "copy of the row starts" );
+    launch_kernel( queue, &lap_fill<typename CardT::TR,TP,TC,TV>, grid, BLOCK, 0, card.pb.fi, card.pb.fj, card.pb.fc, card.counters, card.pb.fcap, ws.at, col, val );
+    launch_kernel( queue, &lap_sort<TP,TC,TV>, blocks_for( n ), BLOCK, 0, row, col, val, dia, n );
+}
+
+/// the same, its workspace taken from the call's pool; `false` if the pool said no
 template<class CardT,class TP,class TC,class TV>
 bool assemble_laplacian( const CudaQueue &queue, const CardT &card, auto &allocator, TP *row, TC *col, TV *val, TV *dia ) {
-    const SI n = SI( card.pb.n );
-    TP *cnt = static_cast<TP *>( take( allocator, SI( sizeof( TP ) ) * ( n + 1 ) ) );
-    TP *at  = static_cast<TP *>( take( allocator, SI( sizeof( TP ) ) * ( n + 1 ) ) );
-    if ( ! cnt || ! at )
+    LapWork<TP> ws;
+    if ( ! ws.take_from( allocator, SI( card.pb.n ) ) )
         return false;
-    zero_fill( queue, cnt, SI( sizeof( TP ) ) * ( n + 1 ) );
-    static const int grid = resident_grid( &lap_count<typename CardT::TR,TP>, BLOCK );
-    launch_kernel( queue, &lap_count<typename CardT::TR,TP>, grid, BLOCK, 0, card.pb.fi, card.pb.fj, card.counters, card.pb.fcap, cnt );
-    if ( ! exclusive_scan( queue, allocator, static_cast<const TP *>( cnt ), row, n + 1 ) )
-        return false;
-    cuda_check( cudaMemcpyAsync( at, row, sizeof( TP ) * n, cudaMemcpyDeviceToDevice, queue.stream ), "copy of the row starts" );
-    launch_kernel( queue, &lap_fill<typename CardT::TR,TP,TC,TV>, grid, BLOCK, 0, card.pb.fi, card.pb.fj, card.pb.fc, card.counters, card.pb.fcap, at, col, val );
-    launch_kernel( queue, &lap_sort<TP,TC,TV>, blocks_for( n ), BLOCK, 0, row, col, val, dia, n );
+    assemble_laplacian_in( queue, card, ws, row, col, val, dia );
     return true;
 }
 

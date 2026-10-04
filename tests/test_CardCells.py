@@ -47,10 +47,13 @@ def _rel( m, ref ):
     return numpy.abs( m[ ok ] - ref[ ok ] ) / numpy.maximum( ref[ ok ], floor )
 
 
-def _check( pos, w = None, mi = ( 0, 0 ), ma = ( 1, 1 ), tol64 = 1e-9, tol32_med = 1e-11, tol32_max = 1e-6, label = "" ):
-    """the card ( float and double kernels ) against the generic double path, on the same tree"""
+def _check( pos, w = None, mi = ( 0, 0 ), ma = ( 1, 1 ), tol64 = 1e-9, tol32_med = 1e-11, tol32_max = 1e-6, label = "", plain = False ):
+    """the card ( float and double kernels ) against the generic double path, on the same tree -- or, `plain`, on the plain
+    storage ( every seed cuts every cell: exact, and blind to the tree; the generic BSP path gets a few cells of the rings
+    wrong on the card, NaN or a wrong area depending on how the tree orders its halves -- a defect of that path, not
+    fixed here )"""
     tree = AaBsp( pos, w )
-    ref = _m( _pd( pos, w, "FP64", False, mi, ma, tree ) )
+    ref = _m( _pd( pos, w, "FP64", False, mi, ma, "plain" if plain else tree ) )
     for kernel in ( "FP64", "FP32" ):
         pd = _pd( pos, w, kernel, True, mi, ma, tree )
         assert pd._card_variant() is not None, ( label, "the dedicated path did not take the call" )
@@ -139,12 +142,12 @@ if test( "the_card_cells_overflow_into_the_later_passes" ):
         rng = numpy.random.default_rng( 2 )
         for k in ( 12, 40, 100, 300 ):
             pos = _ring( k, rng )
-            ref = _check( pos, label = f"ring of { k }" )
+            ref = _check( pos, label = f"ring of { k }", plain = True )
             assert abs( ref[ 0 ] - k * 0.1 ** 2 * numpy.tan( numpy.pi / k ) ) < 0.2 * ref[ 0 ]   # ~ the k-gon of apothem 0.1
         # and weighted: the central seed heavier, its k-gon wider
         w = numpy.zeros( len( pos ) )
         w[ 0 ] = 0.03
-        _check( pos, w, label = "heavy centre" )
+        _check( pos, w, label = "heavy centre", plain = True )
 
 if test( "the_card_cells_small_and_degenerate_clouds" ):
     if not _GPU:

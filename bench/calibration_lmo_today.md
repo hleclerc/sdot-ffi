@@ -603,3 +603,166 @@ CPU unchanged: `bench_newton --env lmo-numpy --case=uniform --dim=2 --threads=8`
   double ).
 * `__activemask` and CUB / cooperative groups do not compile with the pinned `nvcc` ( headers mismatch ): the reservation
   of the COO and the scan are hand-written ( inline PTX `activemask` ).
+
+# GPU step 4: SdotPlanNd ( 2026-10-04 )
+
+`SdotPlanNd` solves on the card: on a CUDA driver, a 2D problem in a box against a CONSTANT density ( no density, or an
+`Image` whose values are all equal on exactly the box ) is solved end to end on the card, in ONE ffi call whose handler (
+host code ) drives the Newton loop on the call's stream -- so the same call runs eagerly and under `jax.jit`. Anything else
+raises `NotImplementedError` on a card ( the CPU solves it ).
+
+Code:
+
+* `include/sdot/gpu/Newton2D.cuh` ( header comment = the design ): the solver -- start ( given weights / Voronoi /
+  similarity, as `Solve.h` ), target rescaled to the domain mass, the log residual then lin ( `switch_residual` ), the KMT
+  damping ( `t_min`, `max_backtracks`, the strict decrease ), TRIALS ( `mult_ok`, as the CPU ) and LIMITS ( see below ), the
+  history, the stats, the moments at the fitted weights ( a last walk ), the diagram's weights and majorants written back.
+  Two SLOTS of everything a diagram writes ( measures, COO of the facets, counters, edges ), swapped on acceptance. MIXED
+  precision: the float kernel, then the double one from the first float step that stagnates ( `stats[ "it_double" ]` ).
+* `include/sdot/gpu/Majorant2D.cuh`: the tree's weight majorants redone on the card ( up the tree level by level with the
+  parallel-axis combination of the children's centred moments, the spread of the residuals by a root-to-leaf walk per seed
+  with a segmented warp reduction and one ordered-integer atomic min / max per node and warp, then the node records ).
+* `include/sdot/gpu/Linear2D.cuh`: the card's linear solvers -- Jacobi CG, and the old campaign's multigrid ( tree
+  aggregation `rank >> 2`, unsmoothed Galerkin by a merge of the packet's sorted rows, Chebyshev degree 1 fused, K-cycle on
+  levels 1-2, exact dense bottom <= 64 unknowns, recycling, flexible CG outside, every iteration replayed from CUDA graphs );
+  and the host route ( the CSR copied to the host, a CPU solver of `Linear.cpp`, `d` copied back ).
+* `include/sdot/gpu/Reduce.cuh`: deterministic reductions ( fixed grid, fixed pairing ): two runs of a solve are identical
+  to the bit ( the jit test compares jitted and eager weights with `== 0` ).
+* `Cell2D.cuh`: `Out::EDGES` ( the cuts of each cell in polygon order, for the step's polynomials ); `Laplacian2D.cuh`: the
+  assembly with a preallocated workspace ( a solver assembles every iteration and the call's pool frees nothing before it
+  returns ); `sdotplan/Report.h`: the stats / history layout shared by the CPU and card solvers ( + `IT_DOUBLE` ).
+* Python: `SdotPlanNd._build_card` ( the options as ONE real tensor, the variants chosen per input: `card_variant_for`,
+  float / double / mixed ), `Tuning( linear_host, mg_kcycle, mg_precision )`, `Iterative( precision = "mixed" )` ( the card's
+  `auto` ), `AaBsp`: the TOP 10 LEVELS OF THE TREE ON THE HOST on a card ( numpy median splits, same rule ), the rest in the
+  per-level kernel; `driver.concrete_eval()` ( loom ) so that the tree, the diagram and the normalized density are
+  EVALUATED under `jax.jit` when their inputs are concrete.
+* loom: `concrete_eval` on the three drivers ( jax: `ensure_compile_time_eval` ); `launch_graph` and a timed launch that
+  skips its events while the stream is captured ( `CudaQueue.h` ); nvcc's link brings OpenMP when the host flags have it
+  ( the `.cpp` units of `sources`, `Linear.cpp` here, are compiled with `-fopenmp`: `undefined symbol GOMP_critical_end` ).
+* bench: `bench_newton` on the card ( `--jit=no|yes|both`, kernel-only time, `--linear-host`, `--mg-*`, `--kernel=mixed`,
+  `--card-graphs=no --all-slots=yes`, `--save-weights` / `--compare`, `--trace` ).
+* tests: `test_SdotPlanNd` ( 5 card entries: the plan of 8 variants -- step, linear solver, host solvers, kernel float,
+  mixed, float levels -- against the generic double measures and against each other; the majorants bound the fitted weights;
+  jit = eager to the bit; a ring of 2000 with a spill capacity too small ( loom reruns ); the refusals ), skipped without
+  CUDA; `test_CardCells`: the rings compared with the PLAIN storage ( see "Findings" ).
+
+## THE STEP ON THE CARD ( `step = limits`, the 2D default )
+
+The old campaign's exact step ( `gpu_des_familles/src/gpu/Alpha2D.cuh`, doc/06 l.808-835 ) with the CPU's correction
+rounds. Along `w + t d` the area of a cell is a polynomial of degree 2 as long as its edges do not change; its edges are
+those of the accepted diagram ( `EDGES` ), so `alpha* = min_i` first root of `mass_i( t ) = eps` costs a fraction of a
+diagram and no walk. The trial is `t = 1` if `alpha* >= 1`, else `factor alpha*` ( `factor = 0.9` ); if the trial diagram
+still has cells under the floor, their polynomials IN THE TRIAL DIAGRAM give where they crossed it going back,
+`t = factor min`, eight rounds at most; then the same KMT damping as TRIALS. It is not the CPU's `limits` ( a first trial
+`beta` grown by `mult_lim`, exact local limits of the bad cells only ): the counts differ ( below ), the plan does not.
+TRIALS are the CPU's exactly, and give the CPU's counts.
+
+## Protocol
+
+`bench_newton` on `lmo-jax` ( RTX 2080 Ti ), through the exclusive queue, min of 2-3 reps after a warm-up solve on a 2000-seed
+prefix. JIT WALL: `jax.jit` of `masses -> ( weights, stats )`, called once to trace and compile, then timed ( no tracing,
+no tree build: the positions are constants of the trace ). KERNELS: the kernel-only time of the call ( `LOOM_KERNEL_TIMING=1`;
+the multigrid's graphs are timed as launches ). Stage times are the solver's: `t_maj`, `t_diag`, `t_asm`, `t_lim` are CUDA
+events around those stages, `t_lin` the wall time of the linear solves ( they read residuals back ). CPU references:
+`bench_newton` on `lmo-numpy`, 8 pinned threads, double, the same session ( AMGCL + OpenMP, `linear_solver = auto` ).
+Plans: `--save-weights` on the CPU, `--compare` on the card: max | w - w_cpu | after the gauge, times n ( the weights scale
+is `1 / n` ). Runs: `runs/bench_newton/newton/2026-10-04_*` ( this session ).
+
+## Final table ( jit wall = what a jitted call costs; seconds )
+
+| case | kernel | step | it / diag ( backtracks ) | t_maj | t_diag | t_asm | t_lin | t_lim | **jit wall** ( kernels ) | eager wall | CPU ( lmo-numpy, 8 thr ) | old GPU | plan vs CPU |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| uniform 1e6 | float | limits | 5 / 6 ( 0 ) | 0.016 | 0.069 | 0.009 | 0.652 | 0.013 | **0.777** ( 0.767 ) | 2.00 | - | 2.52 ( float, alpha*, 13 diag ) | - |
+| uniform 1e6 | float | trials | 6 / 9 ( 2 ) | 0.024 | 0.105 | 0.011 | 0.753 | - | **0.913** ( 0.901 ) | 2.17 | - | 2.79 ( float, 18 diag ) | - |
+| uniform 1e6 | double | limits | 5 / 6 ( 0 ) | 0.017 | 0.432 | 0.011 | 0.661 | 0.013 | **1.181** ( 1.171 ) | 2.45 | - | - | - |
+| uniform 1e6 | double | trials | 6 / 9 ( 2 ) | 0.024 | 0.624 | 0.013 | 0.756 | - | **1.499** ( 1.488 ) | 2.73 | - | 4.24 ( 18 diag ) | - |
+| uniform 1e6 | mixed ( auto ) | limits | 5 / 6 ( 0 ) | 0.016 | 0.070 | 0.009 | 0.656 | 0.013 | **0.843** ( 0.833 ) | 2.04 | - | - | - |
+| uniform 1e5 | float | limits | 5 / 6 ( 0 ) | 0.002 | 0.011 | 0.001 | 0.116 | 0.002 | **0.119** ( 0.113 ) | 0.36 | 1.054 ( 6 / 7 ) | - | 3.2e-9 |
+| uniform 1e5 | double | limits | 5 / 6 ( 0 ) | 0.002 | 0.038 | 0.001 | 0.102 | 0.001 | **0.154** ( 0.148 ) | 0.35 | 1.054 ( 6 / 7 ) | - | 3.2e-9 |
+| uniform 1e5 | float | trials | 6 / 8 ( 1 ) | 0.003 | 0.012 | 0.001 | 0.116 | - | **0.137** ( 0.129 ) | 0.35 | 1.066 ( 6 / 8, 1 ) | - | 4.5e-10 |
+| uniform 1e5 | double | trials | 6 / 8 ( 1 ) | 0.003 | 0.051 | 0.001 | 0.116 | - | **0.182** ( 0.175 ) | 0.39 | 1.066 ( 6 / 8, 1 ) | - | 5.1e-10 |
+| lines voronoi | float | limits | 12 / 13 ( 0 ) | 0.005 | 0.061 | 0.003 | 0.437 | 0.004 | **0.517** ( 0.499 ) | 0.75 | 3.527 ( 12 / 19 ) | - | 2.4e-7 |
+| lines voronoi | double | limits | 12 / 13 ( 0 ) | 0.004 | 0.311 | 0.003 | 0.438 | 0.004 | **0.793** ( 0.775 ) | 1.03 | 3.527 ( 12 / 19 ) | - | 2.4e-7 |
+| lines voronoi | mixed | limits | 12 / 13 ( 0 ) | 0.005 | 0.060 | 0.003 | 0.437 | 0.004 | **0.542** ( 0.525 ) | - | 3.527 | - | - |
+| lines voronoi | float | trials | 14 / 32 ( 17 ) | 0.011 | 0.158 | 0.003 | 0.508 | - | **0.686** ( 0.666 ) | 0.94 | 5.129 ( 14 / 32, 17 ) | - | 5.8e-9 |
+| lines voronoi | double | trials | 14 / 32 ( 17 ) | 0.011 | 0.825 | 0.003 | 0.507 | - | **1.385** ( 1.364 ) | 1.62 | 5.129 ( 14 / 32, 17 ) | - | 5.8e-9 |
+| lines equal | double | limits | 13 / 47 ( 34 ), STAGNATION 3.05e-6 | 0.016 | 1.307 | 0.003 | 0.709 | 0.004 | **2.067** ( 2.043 ) | 2.31 | 6.488 ( 13 / 53, STAGNATION 2.35e-6 ) | - | 2.1e-7 |
+| lines equal | mixed ( auto ) | limits | 16 / 65 ( 49 ), STAGNATION 2.35e-6, double from it 2 | 0.022 | 1.360 | 0.004 | 0.772 | 0.005 | **2.201** ( 2.174 ) | - | 6.488 | - | - |
+| lines equal | double | trials | 16 / 67 ( 51 ), STAGNATION 3.05e-6 | 0.023 | 1.843 | 0.004 | 0.858 | - | **2.764** ( 2.736 ) | 3.02 | 7.949 ( 16 / 67, 51 ) | - | 3.0e-10 |
+| lines equal | float | limits / trials | 3 / 18, 2 / 38: STAGNATION at 1.5e3 | | | | | | 0.16 / 0.20 | | | | 1e4 ( wrong ) |
+
+( lines equal: the old campaign's float alpha* converged to 7.5e-8 in 33 it / 71 diag, 3.09 s; its trials did not converge. Both
+solvers here stagnate at 2.35e-6 - 3.05e-6, the floor of the double weights on this cloud -- `solvers_des_familles` § 23.11,
+what the aggregation of step 7 is for. )
+
+* **Against the CPU solve** ( jit wall ): 2D uniform 1e5 **8.9x** ( float ) / 6.8x ( double ); lines voronoi **6.8x** / 4.4x;
+  lines equal 3.1x ( double ). Eager ( the tree built at each call, the Python of the call ): 3.0x / 3.4x-4.7x / 2.8x.
+* **Against the old GPU campaign**, uniform 1e6: float 0.78 s against 2.52 s ( alpha* ) / 2.79 ( trials ), double 1.18
+  ( limits ) / 1.50 ( trials ) against 4.24 s ( trials ). The NEWTON TURN without the linear solve ( majorants + cells +
+  facets + CSR ), double 1e6: 2.8 + 72 + 2 = **77 ms** against 101 + 3.3 ms; float 1e6: **16 ms**.
+* **Same counts as the CPU** for the same options with `trials`, on the three cases ( iterations, diagrams, backtracks ), and the
+  same plan to 5e-10 - 6e-9 ( x n ). `limits` differs BY DESIGN ( the polynomial step over every cell, see above ): fewer
+  diagrams than the CPU's `limits` ( 6 / 13 / 47 against 7 / 19 / 53 ), the same plan to the Newton tolerance ( 2.4e-7 x n on
+  the lines, where both solves stop at different residuals under `rtol = 1e-6` ).
+* **The linear solve is now 80-97 % of the solve** on the card ( 0.65 of 0.78 s at 1e6, 0.116 of 0.119 at 1e5 ): ~49 FCG
+  iterations per solve at 1e6 and ~70 on the lines, 2.7 ms / 0.6 ms per iteration at 1e6 / 1e5.
+* The weight majorants: **2.7 ms** per refresh at 1e6 ( 0.016 s for 6 ) against 676 ms through `AaBsp.refresh_weight_majorants`.
+* The tree ( built once per solve, before it ): 4.5 - 5.7 s at 1e6 on the card -> **0.85 s** with the top 10 levels on the host
+  ( 0.12 s at 1e5 ); the CPU builds it in 0.15 s. It is most of the eager wall at 1e6 ( 2.0 s eager vs 0.78 jitted ).
+* Float vs double kernel: the same iterations, diagrams and final residual on uniform and lines voronoi ( the float kernel's
+  measures are re-solved in double ); the cells cost 5-6x less. On lines equal the float kernel stagnates at once ( the float
+  sliver of step 2 ) -- hence `mixed`, the card's `auto`: float, then double from the first stagnating float step ( uniform and
+  lines voronoi never switch; lines equal switches at iteration 2 and ends like the double kernel ).
+
+## The linear solver ( 2D uniform, float kernel, limits, jit wall unless said )
+
+| # | change | 1e5 | 1e6 | notes |
+|---|---|---|---|---|
+| 0 | the chain complete: card multigrid as the old one ( one-block Jacobi bottom, 60 sweeps, coarsest <= 1000 ), plain launches | 0.36 s ( lin 0.34 ) | - | bottom x772 launches = 184 ms |
+| 0b | the alternatives at 1e5: card CG ( Jacobi, tol 1e-6 ) | 0.53 s, 6432 it | | |
+| 0c | host route: CPU multigrid / AMGCL / Cholesky on a copy of the CSR | 0.42 / 0.42 / 1.30 s | | 138 / 95 / - it; copies included |
+| 1 | exact dense bottom ( <= 64 unknowns, `( A + c 1 1^T )^-1` in one block ) | 0.242 | | |
+| 2 | every iteration replayed from CUDA graphs ( ~150 launches each ) | 0.167 | 1.318 ( double 1.722 ) | old GPU: 2.52 / 4.24 |
+| 3 | restriction one thread per fine row + shuffles; coarse assembly as a merge of sorted rows ( no sort ) | | 0.859 ( 1.260 ) | restriction 455 -> 172 ms, assembly 196 -> 35 ms |
+| 4 | degree-1 smoother fused ( pre: `x = M b / theta`; post out of place ) | | 0.807 | |
+| 5 | levels in float ( outer FCG in double ) | | 0.80 = | REJECTED as default ( no gain; 1.04 with 6 ) |
+| 6 | four lanes per CSR row | | 0.869 | REJECTED ( slower: the coarse levels pay 4x the threads ) |
+| - | sweeps at 1e6 ( trials ): coarsest 64 / 256 / 1000, K on 2 / 3 levels, Chebyshev degree 1 / 2 | | 1.52 - 2.61 | best: 64, K on 2, degree 1 ( the defaults ); iterations 204 - 281 whatever the setting |
+| - | recycling 0 / 2 | same iterations | | the successive Newton directions share little |
+
+What remains in it: ~49 iterations per solve with unsmoothed aggregation + K-cycle ( the CPU's smoothed aggregation needs ~28,
+AMGCL ~19 ) and a cycle bound by its ~150 small dependent kernels, not by bytes.
+
+## Findings on the way
+
+* The GENERIC GPU path ( BSP ) gets a few cells of the rings wrong: NaN before, a wrong area now ( cell 227 of the ring of 300:
+  5.4e-5 against 6.0e-4 ), depending on how the tree orders its halves; the card's cells agree with the PLAIN storage to 7e-13.
+  `test_CardCells` now checks the rings against the plain storage ( exact, tree-blind ). Not fixed ( generic path ).
+* `AaBsp` on a card: the per-level kernel's top levels ( one work item over the whole cloud ) took seconds; built on the host now.
+* `jax.jit` of a solve needs the tree, the diagram and the density's values CONCRETE at trace time ( they are host-built or
+  host-read ): `driver.concrete_eval()` evaluates them when their inputs are concrete ( a traced target or traced positions
+  still cannot be solved under a trace: the tree needs the positions ).
+* nvcc's link did not bring OpenMP for `sources` compiled with `-fopenmp` ( `undefined symbol: GOMP_critical_end` ): fixed in loom.
+
+## What remains
+
+* The linear solver ( 80-97 % of the card's solve ): smoothed aggregation on the card ( the CPU's `Multigrid.h`: truncated
+  `P = ( I - w D^-1 A ) P0`, Galerkin triple product -- ~2x fewer iterations ), or fewer / fused levels in the cycle.
+* Densities on the card: an `Image` ( the cell clipped by the pixels, per-pixel constants: measures, facets with the density
+  integrated along them, moments ), gaussians ( quadrature ), and the width continuation that needs them ( `Convolved` ).
+  The solver itself does not depend on the density ( it reads masses and facet coefficients ): only `Cell2D.cuh::finish_cell`
+  and the step's polynomials ( exact for a constant only: a bisection of the mass, as `Bounds.h` does, otherwise ) change.
+* 3D ( warp per cell, `doc/05-profils.md` ), other domains than a box, the neighbour memory.
+* The tree on the card end to end ( the top levels are on the host: 0.85 s at 1e6, most of an eager call ).
+
+## Risks
+
+* `step = limits` on the card is not the CPU's `limits`: same options, other counts ( said above ); `trials` is the CPU's.
+* The float kernel can stagnate on degenerate clouds ( lines equal ): `auto` is `mixed` on the card, `fp32` alone is not safe there.
+* A capacity overflow ( spill vertices, COO of the facets ) stops the solve, and loom runs the whole call again ( eager ) or
+  raises ( traced ); the first guesses ( 1024 vertices, `3 n + 512` facets ) are far from what the campaign's clouds need.
+* The handler reads back after every diagram and every FCG iteration ( stream synchronizations inside the call ): fine under
+  `jit`, but the call holds the stream for the whole solve.
+* Memory per solve ~1 GB at 1e6 from XLA's pool ( two cards in mixed, two slots of cells, the CSR, the levels ): ~1e7 seeds on
+  the 11 GB card.
+* Under `jax.jit` the tree is built at TRACE time: a function retraced per call ( new positions ) pays it each time.

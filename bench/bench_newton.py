@@ -29,6 +29,16 @@ HOW THE OPTIONS MAP onto the old ones ( more in `bench/README.md` ):
   `--newton-tol 1e-6` ( relative )                   --rtol=1e-6 --tol=0
   `--newton-max`                                     --max-iter
   `--kernel double | float`                          --kernel=double | float  ( no `mixte` )
+
+ON THE CARD ( `lmo-jax`, a CUDA device: `SdotPlanNd` solves on the card, `gpu/Newton2D.cuh` ): the same solve, in ONE ffi call.
+`--jit=no|yes|both` times it eager and / or under `jax.jit` ( the compiled function called again: no tracing, no Python
+per call ); the KERNEL-ONLY time of the solve ( `LOOM_KERNEL_TIMING=1`, every launch of the call between CUDA events ) is
+printed next to the wall time, and the stages are the card's: `t_maj` ( the weight majorants ), `t_diag` ( the cells ),
+`t_asm` ( right-hand side + laplacian CSR ), `t_lin` ( the linear solve, wall: it reads residuals back ), `t_lim` ( the
+polynomial passes of `step = limits` ). `t_tree` is the BSP tree, built before the solve ( host-driven, per level ).
+`--linear-host=yes` solves the linear systems with the CPU solver named by `--linear-solver` on a copy of the laplacian.
+`--save-weights=f.npy` / `--compare=f.npy`: the weights of the solve, saved / compared ( after the gauge ) with another
+run's -- the CPU's plan against the card's.
 """
 
 import numpy
@@ -46,7 +56,7 @@ if p := bench( "newton",
                n             = Param( 0, help = "number of seeds ( 0: the case of the campaign: 1e5 for the uniform ones, the file's size otherwise )" ),
                threads       = Param( 0, help = "workers ( 0: all the cores; the campaign: 8 )" ),
                pin           = Param( "yes", choices = [ "yes", "no", "env" ], help = "pin worker w to core w ( SDOT_PIN_THREADS ); `env`: leave the variable alone" ),
-               kernel        = Param( "double", choices = [ "double", "float" ], help = "the kernel float type ( the campaign: double )" ),
+               kernel        = Param( "double", choices = [ "double", "float", "mixed" ], help = "the kernel float type ( the campaign: double; mixed: the card's float then double )" ),
                step          = Param( "trials", choices = [ "trials", "limits", "auto" ], help = "trials = KMT damping ( the old base ), limits = the limits step ( 2D ), auto = the library's choice" ),
                linear_solver = Param( "auto", choices = [ "auto", "cholesky", "amg", "cg", "mg" ], help = "the linear solver ( mg: the in-house multigrid, `sdotplan/Multigrid.h` )" ),
                residual      = Param( "log", choices = [ "log", "lin", "power" ], help = "the residual of the direction and of the merit: log + switch to lin ( the old default ), lin ( KMT ), power ( g_p )" ),
@@ -69,8 +79,21 @@ if p := bench( "newton",
                start         = Param( "zero", choices = [ "zero", "file" ], help = "weights 0 ( Voronoi ) or the weights of the file ( the `equal` ones are the solution: 0 iterations )" ),
                ref           = Param( "", help = "variant of reference_lmo.NEWTON to compare with ( kmt, kmt_log, best, model; default: kmt for trials, best for limits )" ),
                reps          = Param( 3, help = "repetitions ( we keep the fastest )" ),
-               seed          = Param( 0, help = "seed of the uniform draw" ) ):
+               seed          = Param( 0, help = "seed of the uniform draw" ),
+               jit           = Param( "both", choices = [ "no", "yes", "both" ], help = "ON THE CARD: time the eager solve, the jitted one, or both" ),
+               linear_host   = Param( "no", choices = [ "no", "yes" ], help = "ON THE CARD: the linear solver on the host ( the CPU's, through a copy )" ),
+               mg_precision  = Param( "auto", choices = [ "auto", "float", "double" ], help = "ON THE CARD: the precision of the multigrid's levels" ),
+               mg_kcycle     = Param( -1, help = "ON THE CARD: levels accelerated by the K-cycle ( -1: the default, 2 )" ),
+               trace         = Param( "no", choices = [ "no", "yes" ], help = "print the solver's trace ( per iteration, per linear solve )" ),
+               card_graphs   = Param( "yes", choices = [ "yes", "no" ], help = "ON THE CARD: the linear solver's iterations replayed from CUDA graphs ( no: plain launches, every kernel timed )" ),
+               all_slots     = Param( "no", choices = [ "no", "yes" ], help = "ON THE CARD: print every timed kernel slot ( index, ms, launches, registers )" ),
+               save_weights  = Param( "", help = "save the final weights ( .npy )" ),
+               compare       = Param( "", help = "compare the final weights with a saved .npy ( max |w - w_ref| after the gauge, relative to 1 / n )" ) ):
     benchlib.set_threads( p.threads, p.pin )          # BEFORE the first kernel: the pool reads them once
+    benchlib.set_kernel_timing()                      # ( the card only: events around each launch, read once per library )
+    if p.card_graphs == "no":
+        import os
+        os.environ[ "SDOT_CARD_GRAPHS" ] = "0"
     if p.openmp >= 0:
         benchlib.set_openmp( p.openmp )
     import time
@@ -88,7 +111,7 @@ if p := bench( "newton",
 
     def settings( n_points, max_iter ):
         return Iterative( tol = p.tol, max_iter = max_iter, continuation = p.continuation,
-                          precision = "fp64" if p.kernel == "double" else "fp32",
+                          precision = { "double": "fp64", "float": "fp32", "mixed": "mixed" }[ p.kernel ],
                           weights0 = w_file[ :n_points ] if p.start == "file" else None,
                           aggregate = False,            # not wired yet in the C++ ( see README, gap list )
                           tuning = Tuning( step = p.step, linear_solver = p.linear_solver, mass_rtol = p.rtol,
@@ -96,26 +119,82 @@ if p := bench( "newton",
                                            restart_factor = p.restart_factor, amg_variant = p.amg_variant, linear_tol = p.linear_tol or None,
                                            mg_pack = p.mg_pack or None, mg_recycle = None if p.mg_recycle < 0 else p.mg_recycle,
                                            mg_rebuild = p.mg_rebuild or None, mg_stop = p.mg_stop or None, mg_nu = p.mg_nu or None,
+                                           mg_kcycle = None if p.mg_kcycle < 0 else p.mg_kcycle,
+                                           mg_precision = None if p.mg_precision == "auto" else p.mg_precision, linear_host = p.linear_host == "yes",
                                            memory = None if p.memory < 0 else p.memory ) )
 
     # warm-up on a small prefix: the first solve of the process compiles the kernels
     m = min( n, 2000 )
     OtProblem( SumOfDiracs( pos[ :m ] ), target() ).solve( settings( m, 3 ) )
 
+    from loom.drivers.driver import driver
+    on_card = bool( getattr( driver.device, "is_cuda_gpu", False ) )
+    kt = benchlib.KernelTiming() if on_card else None
+    from sdot import AaBsp
+    t = time.perf_counter()
+    AaBsp( pos )
+    t_tree = time.perf_counter() - t
+
     best = None
-    for _ in range( p.reps ):
-        t = time.perf_counter()
-        sol = OtProblem( SumOfDiracs( pos ), target() ).solve( settings( n, p.max_iter ) )
-        wall = time.perf_counter() - t
-        if best is None or wall < best[ 0 ]:
-            best = ( wall, sol )
-    wall, sol = best
-    st = sol.stats
+    if not on_card or p.jit in ( "no", "both" ):
+        for _ in range( p.reps ):
+            if kt: kt.reset()
+            t = time.perf_counter()
+            sol = OtProblem( SumOfDiracs( pos ), target() ).solve( settings( n, p.max_iter ), verbose = p.trace == "yes" )
+            benchlib.block_until_ready( sol.weights.raw )
+            wall = time.perf_counter() - t
+            k = kt.read() if kt else None
+            if best is None or wall < best[ 0 ]:
+                best = ( wall, sol, k )
+    wall, sol, kern = best if best else ( None, None, None )
+    st = sol.stats if sol else None
+
+    # UNDER `jax.jit`: the solve of a function of the target masses ( the positions are constants of the trace: the tree is
+    # built when tracing ); the first call traces and compiles, the next ones only run
+    jit_wall = jit_kern = None
+    if on_card and p.jit in ( "yes", "both" ):
+        import jax
+        def solve_masses( masses ):
+            plan = OtProblem( SumOfDiracs( pos, masses ), target() ).solve( settings( n, p.max_iter ), verbose = p.trace == "yes" )
+            from sdot.SdotPlanNd import _STATS
+            return plan.weights.raw, { k: plan.stats[ k ] for k in _STATS }
+        f = jax.jit( solve_masses )
+        masses = numpy.ones( n )
+        out = f( masses )
+        benchlib.block_until_ready( out[ 0 ] )
+        for _ in range( p.reps ):
+            kt.reset()
+            t = time.perf_counter()
+            out = f( masses )
+            benchlib.block_until_ready( out[ 0 ] )
+            wj = time.perf_counter() - t
+            kj = kt.read()
+            if jit_wall is None or wj < jit_wall:
+                jit_wall, jit_kern, jit_out = wj, kj, out
+        if sol is None:                                # the stats of the jitted solve, read now that it ran
+            from sdot.SdotPlanNd import _STATUS, _START
+            raw = { k: float( numpy.asarray( v ) ) for k, v in jit_out[ 1 ].items() if not isinstance( v, str ) }
+            st = dict( raw )
+            st[ "status" ] = _STATUS.get( int( raw[ "status" ] ), "?" )
+            st[ "start" ] = _START.get( int( raw[ "start" ] ), "?" )
+            for key in ( "nb_iter", "nb_diag", "nb_backtracks", "lin_nb_iter", "lin_nb_hierarchies", "it_switch", "nb_limit_rounds", "it_double" ):
+                st[ key ] = int( raw[ key ] )
+            wall = jit_wall
+        final_w = numpy.asarray( jit_out[ 0 ] ).reshape( -1 )
+    else:
+        final_w = numpy.asarray( sol.weights ).reshape( -1 )
+
+    if p.save_weights:
+        numpy.save( p.save_weights, final_w )
+    w_gap = None
+    if p.compare:
+        ref_w = numpy.load( p.compare ).reshape( -1 )
+        w_gap = float( numpy.abs( ( final_w - final_w[ 0 ] ) - ( ref_w - ref_w[ 0 ] ) ).max() * n )
 
     # the witness: the file's weights ( the `equal` ones ), up to the gauge ( ours: w[ 0 ] = 0 )
     witness = None
     if p.case.endswith( "_equal" ) and n == len( w_file ):
-        got = numpy.asarray( sol.weights ).reshape( -1 )
+        got = final_w
         witness = float( numpy.abs( ( got - got[ 0 ] ) - ( w_file - w_file[ 0 ] ) ).max() )
 
     # -- the old numbers to compare with
@@ -128,11 +207,18 @@ if p := bench( "newton",
     res_rel = st[ "residual" ] * n                    # max|a - nu| / nu, with nu = 1 / n
     p.results.update( n = n, dim = d, threads = benchlib.nb_threads(), kernel = p.kernel, step = p.step,
                       residual = p.residual, linear_solver = p.linear_solver, amg_variant = p.amg_variant, linear_tol = p.linear_tol,
-                      it_switch = st[ "it_switch" ], lin_nb_hierarchies = st[ "lin_nb_hierarchies" ], status = st[ "status" ], converged = int( sol.converged ),
+                      it_switch = st[ "it_switch" ], lin_nb_hierarchies = st[ "lin_nb_hierarchies" ], status = st[ "status" ], converged = int( st[ "status" ] == "converged" ),
                       iterations = st[ "nb_iter" ], diagrams = st[ "nb_diag" ], backtracks = st[ "nb_backtracks" ],
                       t_total_wall = wall, t_total_cpp = st[ "t_total" ], t_diag = st[ "t_diag" ], t_majorant = st[ "t_majorant" ],
                       t_asm = st[ "t_asm" ], t_lin = st[ "t_lin" ], t_lim = st[ "t_lim" ],
-                      residual_rel = res_rel, start = st[ "start" ], lin_nb_iter = st[ "lin_nb_iter" ] )
+                      residual_rel = res_rel, start = st[ "start" ], lin_nb_iter = st[ "lin_nb_iter" ],
+                      on_card = int( on_card ), t_tree = t_tree, nb_limit_rounds = st[ "nb_limit_rounds" ] )
+    if on_card:
+        p.results.update( linear_host = p.linear_host, jit = p.jit,
+                          t_eager_wall = best[ 0 ] if best else None, t_eager_kernels = kern[ "ms" ] / 1e3 if kern else None,
+                          t_jit_wall = jit_wall, t_jit_kernels = jit_kern[ "ms" ] / 1e3 if jit_kern else None )
+    if w_gap is not None:
+        p.results[ "weights_gap_vs_ref" ] = w_gap
     if witness is not None:
         p.results[ "witness_max_abs_weights" ] = witness
     if ref:
@@ -146,6 +232,20 @@ if p := bench( "newton",
             f( st[ "t_lin" ] ), f( st[ "t_lim" ] ), f( st[ "t_majorant" ] ), f( wall ),
             "-" if not ref else f"{ ref[ 'seconds' ] :.2f}", benchlib.ratio( wall, ref and ref[ "seconds" ] ) ]
     print( benchlib.table( header, [ row ] ) )
+    if on_card:
+        f3 = lambda x: "-" if x is None else f"{ x :.3f}"
+        print( f"  card: eager wall { f3( best[ 0 ] if best else None ) } s ( kernels { f3( kern[ 'ms' ] / 1e3 if kern else None ) } s ), "
+               f"jit wall { f3( jit_wall ) } s ( kernels { f3( jit_kern[ 'ms' ] / 1e3 if jit_kern else None ) } s ); tree { t_tree :.3f} s "
+               f"( built before the solve, host-driven ); limit rounds { st[ 'nb_limit_rounds' ] }; double kernel from it { st[ 'it_double' ] }" )
+        k = jit_kern or kern
+        if k:
+            top = sorted( k[ "all" ], key = lambda r: -r[ "ms" ] )[ :8 ]
+            if p.all_slots == "yes":
+                for r in sorted( k[ "all" ], key = lambda r: r[ "slot" ] ):
+                    print( f"    slot { r[ 'slot' ] :3d}  { r[ 'ms' ] :9.2f} ms  x{ r[ 'count' ] :6d}  regs { r[ 'regs' ] }  grid { r[ 'grid' ] }  block { r[ 'block' ] }" )
+            print( "  heaviest kernel slots: " + "; ".join( f"{ r[ 'code_name' ] }#{ r[ 'slot' ] } { r[ 'ms' ] :.1f} ms x{ r[ 'count' ] }" for r in top ) )
+    if w_gap is not None:
+        print( f"  weights vs { p.compare }: max gap { w_gap :.2e} ( x n, after the gauge )" )
     print( f"  min of { p.reps } ( warm-up apart ); residual max|a-nu|/nu = { res_rel :.2e}; start { st[ 'start' ] }; switch at it { st[ 'it_switch' ] }; backtracks { st[ 'nb_backtracks' ] }; "
            f"linear iterations { st[ 'lin_nb_iter' ] }; C++ total { st[ 't_total' ] :.3f} s"
            + ( f"; witness { witness :.1e}" if witness is not None else "" ) )

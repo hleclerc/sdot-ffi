@@ -497,6 +497,174 @@ if test( "the_multigrid_without_a_tree_order_and_the_unknown_solver" ):
         raise AssertionError( "an unknown linear_solver must be refused" )
 
 
+# -- ON THE CARD ( `gpu/Newton2D.cuh` ) ------------------------------------------------------------
+#
+# On a CUDA device, a 2D transport in a box against a constant density is solved by the card's Newton ( the
+# majorants, the cells, the laplacian, the linear solver, the step: all on the card, one ffi call ). These tests
+# skip themselves without a CUDA device. The plan is checked against what does not depend on the solver: the
+# measures of its cells through the GENERIC path of the diagram ( double, `use_card_cells = False` ), and the plans
+# of the other variants ( step, linear solver, kernel float ) -- the CPU's own plans are compared by the bench
+# ( `bench_newton --save-weights` on both environments ).
+
+def _card():
+    from loom import driver
+    return bool( getattr( driver.device, "is_cuda_gpu", False ) )
+
+
+def _box_target():
+    return Image( values = numpy.ones( ( 1, 1 ) ), origin = [ 0.0, 0.0 ], frame = numpy.eye( 2 ) )
+
+
+def _generic_measures( pos, w ):
+    """the measures of the cells of `( pos, w )` through the generic double path ( not the card's kernel )"""
+    pd = PowerDiagram( pos, numpy.asarray( w, dtype = float ).reshape( -1 ), boundaries = box_half_spaces( [ 0, 0 ], [ 1, 1 ] ),
+                       kernel_dtype = "FP64" )
+    pd.use_card_cells = False
+    return numpy.asarray( pd.measures.value ).reshape( -1 )
+
+
+if test( "the_card_solves_the_transport" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    rng = numpy.random.default_rng( 101 )
+    n = 4000
+    pos = rng.uniform( 0.001, 0.999, size = ( n, 2 ) )
+    nu = rng.uniform( 0.5, 1.5, n )
+    nu /= nu.sum()
+    plans = {}
+    for name, precision, tuning in ( ( "limits mg double", "fp64", Tuning( step = "limits" ) ),
+                                     ( "trials mg double", "fp64", Tuning( step = "trials" ) ),
+                                     ( "limits cg double", "fp64", Tuning( step = "limits", linear_solver = "cg", linear_tol = 1e-8 ) ),
+                                     ( "limits host cholesky", "fp64", Tuning( step = "limits", linear_solver = "cholesky" ) ),
+                                     ( "limits host mg", "fp64", Tuning( step = "limits", linear_solver = "mg", linear_host = True ) ),
+                                     ( "limits mg float", "fp32", Tuning( step = "limits" ) ),
+                                     ( "limits mixed ( auto )", "auto", Tuning( step = "limits" ) ),
+                                     ( "limits mg float levels", "fp64", Tuning( step = "limits", mg_precision = "float" ) ) ):
+        plan = OtProblem( SumOfDiracs( pos, nu ), _box_target() ).solve( Iterative( tol = 1e-10 / n, max_iter = 60, precision = precision, tuning = tuning ) )
+        assert plan.converged, ( name, plan.stats )
+        w = numpy.asarray( plan.weights ).reshape( -1 )
+        assert w[ 0 ] == 0, name                                       # the gauge
+        m = numpy.asarray( plan.cell_masses ).reshape( -1 )
+        assert numpy.abs( m - nu ).max() < 1e-10 / n, ( name, numpy.abs( m - nu ).max() * n )
+        # the cells of these weights, measured by the generic path, are the targets
+        g = _generic_measures( pos, w )
+        assert numpy.abs( g - nu ).max() < 1e-8 / n, ( name, numpy.abs( g - nu ).max() * n )
+        assert not numpy.asarray( plan.card_status.raw ).any(), name
+        # the moments: barycentres inside the box, the cost positive, the history readable
+        bary = numpy.asarray( plan.barycenters )
+        assert bary.min() > 0 and bary.max() < 1 and float( plan.cost ) > 0, name
+        assert plan.history[ -1 ][ "max_abs_residual" ] == plan.stats[ "residual" ], name
+        plans[ name ] = w
+        assert plan.stats[ "it_double" ] == ( -1 if precision == "auto" else 0 ), ( name, plan.stats[ "it_double" ] )   # ( no switch here )
+        print( f"  { name }: { plan.stats[ 'nb_iter' ] } it, { plan.stats[ 'nb_diag' ] } diagrams, { plan.stats[ 'lin_nb_iter' ] } linear it, "
+               f"residual { plan.stats[ 'residual' ] * n :.1e} ( relative ), limits rounds { plan.stats[ 'nb_limit_rounds' ] }" )
+    ref = plans[ "limits mg double" ]
+    for name, w in plans.items():
+        assert numpy.abs( w - ref ).max() < 1e-9 / n, ( name, numpy.abs( w - ref ).max() * n )
+
+
+if test( "the_card_majorants_bound_the_weights" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    # the tree the solve leaves behind carries the majorants of the FITTED weights, redone on the card ( `Majorant2D.cuh` ):
+    # each node bounds the weights of its seeds, `w( y ) <= a . y + b`, and the affine ones are tight
+    rng = numpy.random.default_rng( 102 )
+    n = 6000
+    pos = rng.uniform( 0.001, 0.999, size = ( n, 2 ) )
+    nu = 1 + 0.8 * numpy.sin( 6 * pos[ :, 0 ] ) * numpy.cos( 5 * pos[ :, 1 ] )        # a smooth target: weights with a slope
+    plan = OtProblem( SumOfDiracs( pos, nu ), _box_target() ).solve( Iterative( tol = 1e-10 / n, max_iter = 60 ) )
+    assert plan.converged, plan.stats
+    pd = plan._pd
+    tree = pd.tree
+    w = numpy.asarray( plan.weights ).reshape( -1 )[ numpy.asarray( tree.seed_indices ).reshape( -1 ) ]
+    p = pos[ numpy.asarray( tree.seed_indices ).reshape( -1 ) ]
+    beg, end = numpy.asarray( tree.node_begin ).reshape( -1 ), numpy.asarray( tree.node_end ).reshape( -1 )
+    wa, wb = numpy.asarray( tree.node_wa ).reshape( -1, 2 ), numpy.asarray( tree.node_wb ).reshape( -1 )
+    nb_affine = 0
+    for i in range( len( beg ) ):
+        if end[ i ] <= beg[ i ]:
+            continue
+        sl = slice( beg[ i ], end[ i ] )
+        bound = p[ sl ] @ wa[ i ] + wb[ i ]
+        assert ( w[ sl ] <= bound ).all(), ( i, ( w[ sl ] - bound ).max() )
+        nb_affine += bool( wa[ i ].any() )
+        spread = w[ sl ].max() - w[ sl ].min()
+        assert ( bound - w[ sl ] ).min() <= spread + 1e-5 * ( abs( wb[ i ] ) + spread + 1e-300 ), i
+    assert nb_affine > 0.3 * len( beg ), nb_affine                   # the smooth potential: most nodes keep their slope
+
+
+if test( "the_card_solve_runs_under_jit" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    import jax
+    rng = numpy.random.default_rng( 103 )
+    n = 3000
+    pos = rng.uniform( 0.001, 0.999, size = ( n, 2 ) )
+    nu = rng.uniform( 0.5, 1.5, n )
+
+    def solve( masses ):
+        plan = OtProblem( SumOfDiracs( pos, masses ), _box_target() ).solve( Iterative( tol = 1e-10 / n, max_iter = 60 ) )
+        return plan.weights.raw, plan.cell_masses.raw, plan.stats[ "nb_diag" ]
+
+    we, me, de = solve( nu )
+    wj, mj, dj = jax.jit( solve )( nu )
+    assert numpy.abs( numpy.asarray( wj ) - numpy.asarray( we ) ).max() == 0, numpy.abs( numpy.asarray( wj ) - numpy.asarray( we ) ).max()
+    assert numpy.abs( numpy.asarray( mj ) - numpy.asarray( me ) ).max() == 0
+    assert float( dj ) == float( de ), ( dj, de )
+    # a second call of the compiled function: the same numbers ( a solve that is the same at every run )
+    wj2, _, _ = jax.jit( solve )( nu )
+    assert numpy.array_equal( numpy.asarray( wj2 ), numpy.asarray( wj ) )
+
+
+if test( "the_card_solve_grows_its_capacities_on_rings" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    # a seed in the middle of a ring of 2000 ( its cell has 2000 vertices: the fourth pass of the cells, in global memory ),
+    # with a capacity too small for it: the solve asks loom for more ( eagerly: the call runs again ), and converges
+    import sys
+    bsp = sys.modules[ "sdot.PowerDiagram_Bsp" ]
+    rng = numpy.random.default_rng( 104 )
+    k = 2000
+    a = 2 * numpy.pi * ( numpy.arange( k ) + rng.uniform( -0.1, 0.1, k ) ) / k
+    ring = 0.5 + 0.2 * numpy.stack( [ numpy.cos( a ), numpy.sin( a ) ], axis = 1 )
+    back = rng.uniform( 0.001, 0.999, size = ( 3000, 2 ) )
+    back = back[ numpy.linalg.norm( back - 0.5, axis = 1 ) > 0.3 ]
+    pos = numpy.concatenate( [ [ [ 0.5, 0.5 ] ], ring, back ] )
+    n = len( pos )
+    original = bsp.PowerDiagram_Bsp.card_spill_capacity
+    try:
+        bsp.PowerDiagram_Bsp.card_spill_capacity = 256
+        for precision in ( "fp64", "fp32" ):
+            plan = OtProblem( SumOfDiracs( pos ), _box_target() ).solve( Iterative( tol = 1e-9 / n, max_iter = 100, precision = precision ) )
+            assert plan.converged, ( precision, plan.stats )
+            w = numpy.asarray( plan.weights ).reshape( -1 )
+            g = _generic_measures( pos, w )
+            ok = ~numpy.isnan( g )                                # ( the generic path's NaN cells on rings, see `test_CardCells` )
+            assert numpy.abs( g[ ok ] - 1 / n ).max() < 1e-7 / n, ( precision, numpy.abs( g[ ok ] - 1 / n ).max() * n )
+    finally:
+        bsp.PowerDiagram_Bsp.card_spill_capacity = original
+
+
+if test( "the_card_refuses_what_it_does_not_solve" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    rng = numpy.random.default_rng( 105 )
+    pos = rng.uniform( 0.2, 0.8, size = ( 50, 2 ) )
+    for dst in ( _overlapping_target( 2, 2, seed = 3 ),
+                 Image( values = 1 + rng.random( ( 4, 4 ) ), origin = [ 0.0, 0.0 ], frame = [ [ 0.25, 0 ], [ 0, 0.25 ] ] ) ):
+        try:
+            OtProblem( SumOfDiracs( pos ), dst ).solve()
+        except NotImplementedError as e:
+            assert "constant" in str( e ) or "density" in str( e ), str( e )
+        else:
+            raise AssertionError( "a density that is not a constant must be refused on the card" )
+
+
 # -- what we LOOK AT -------------------------------------------------------------------------
 #
 #   ./run experiment test_SdotPlanNd

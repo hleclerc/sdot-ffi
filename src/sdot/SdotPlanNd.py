@@ -25,6 +25,13 @@ the problem and reads what comes out. That is what the `solvers_des_familles` be
     saved in the linear phase ); in 2D, the LIMITS of the cells being crushed along the
     direction replace blind trials ( `sdotplan/Bounds.h` ).
 
+= On a CUDA card
+
+The same solve, in ONE ffi call too, whose handler drives the Newton loop on the call's stream ( `gpu/Newton2D.cuh`, see
+`_build_card` ): the tree's majorants, the cells, the laplacian, the linear solver ( the card's multigrid ) and the step all
+run on the card, and the host only reads back the scalars it decides on -- so the solve runs under `jax.jit` as well. It
+takes 2D problems in a box against a CONSTANT density; anything else raises on a card ( the CPU solves it ).
+
 = The starting point
 
 Newton needs an ADMISSIBLE start ( no empty cell ). Voronoi is one as soon as the diracs are in
@@ -74,10 +81,11 @@ from .PowerDiagram import PowerDiagram
 # what `stats` carries, in the order of `sdotplan/Solve.h::Stat`
 _STATS = [ "status", "residual", "residual0", "nb_iter", "nb_diag", "nb_backtracks", "t_majorant", "t_diag", "t_asm", "t_lin", "t_lim", "eps",
            "domain_mass", "nb_overflowed", "nb_cell_lim", "nb_limit_rounds", "lin_nb_hierarchies", "lin_nb_iter", "lin_worst", "start", "t_total",
-           "nb_continuation_steps", "min_start_mass", "it_switch" ]
+           "nb_continuation_steps", "min_start_mass", "it_switch", "it_double" ]
 # one row of `history`, in the order of `sdotplan/Solve.h::Hist`
 _HISTORY = [ "step", "t", "residual_l2", "min_measure", "max_abs_residual", "nb_diag", "nb_evals", "s" ]
-_STATUS = { 0: "running", 1: "converged", 2: "max iterations", 3: "stagnation", 4: "linear solver failure" }
+_STATUS = { 0: "running", 1: "converged", 2: "max iterations", 3: "stagnation", 4: "linear solver failure", 5: "card capacity",
+            6: "failure" }
 _START = { 0: "weights0", 1: "voronoi", 2: "similarity" }
 _LIN = { "auto": 0, "cholesky": 1, "amg": 2, "cg": 3, "mg": 4 }
 _AMG_VARIANT = { "auto": -1, "sa_spai0": 0, "sa_gs": 1, "rs_gs": 2 }
@@ -124,6 +132,33 @@ class _Options( Aggregate ):
     continuation   : IntTensor
     cap0           : IntTensor
     kernel_fp_size : CtShapeVar
+
+
+#: the card solver's options, ONE real tensor ( `gpu/Newton2D.cuh::Opt`, same order )
+_CARD_OPTIONS = [ "tol_abs", "tol_rel", "t_min", "mult_ok", "factor", "maxit", "max_backtracks", "step", "residual", "power", "switch",
+                  "lin", "host_method", "lin_tol", "amg_variant", "mg_shift", "mg_recycle", "mg_rebuild", "mg_stop", "mg_nu", "mg_kcycle",
+                  "lin_maxit", "trace", "mg_float" ]
+
+
+#: the precision of the card multigrid's levels by default ( the outer flexible CG is in double either way )
+_CARD_MG_PRECISION = "double"
+
+
+def card_facet_capacity( nb_seeds ):
+    """the first guess of the upper facets of a 2D diagram ( a planar graph: at most `3 n - 6` edges, and a margin for the
+    slivers of a float topology ); loom grows it if a diagram wants more"""
+    return 3 * int( nb_seeds ) + 512
+
+
+class _CardSolveWork( Aggregate ):
+    """what the card's solve writes besides its results: the STATUS of each cell at the last diagram ( 0 = done,
+    `Cell2D.cuh::Status` ), and two capacities that a diagram may ask loom to grow ( `nb_spill`: vertices per cell of the
+    fourth pass; `nb_facets`: the upper facets of a diagram )"""
+    status    : IntTensor[ "num_point", dict( size = 32 ) ]
+    num_point : Axis[ "nb_points" ]
+    nb_points : ShapeVar
+    nb_spill  : ShapeVar
+    nb_facets : ShapeVar
 
 
 class _History( Aggregate ):
@@ -175,12 +210,14 @@ class SdotPlanNd:
     # -- what the call does -------------------------------------------------------------------
 
     def _build( self, problem, settings, verbose, warm = None ):
-        # the solver is HOST code on the CPU queue ( `sdotplan/Sweep.h` ): a driver whose device
-        # is a GPU cannot call it today -- `LOOM_DEVICE=cpu`, or a CPU driver
-        if not driver.device.is_cpu:
-            raise NotImplementedError( "SdotPlanNd: the solver runs on the CPU for now ( the sweeps and the "
-                                       "linear solver are host code ); choose the CPU device ( LOOM_DEVICE=cpu )" )
+        # two solvers: the CPU's ( `sdotplan/Solve.h`, host code on the CPU queue ) and, on a CUDA device, the card's
+        # ( `gpu/Newton2D.cuh`: 2D, a box, a constant density -- see `_build_card` ); any other device is refused
+        on_card = bool( getattr( driver.device, "is_cuda_gpu", False ) )
+        if not driver.device.is_cpu and not on_card:
+            raise NotImplementedError( f"SdotPlanNd: no solver for the device { driver.device } ( the CPU, or a CUDA card in 2D )" )
         tun = settings.tuning
+        if settings.precision == "mixed" and not on_card:
+            raise ValueError( "precision = 'mixed' ( the float kernel, then the double one ) is the card's: on the CPU, 'fp64' or 'fp32'" )
         #: the problem this is the solution of
         self.problem = problem
         src_dist, dst_dist = problem.source, problem.target
@@ -219,16 +256,31 @@ class SdotPlanNd:
 
         # THE diagram, built once on the positions ( see the module docstring ); the weights it
         # carries at a given moment are the last ones set
-        self._pd = PowerDiagram( src_dist.positions,
-                                 RealTensor[ src_dist.num_dirac ].full( 0.0 ) if w0_given is None else w0_given,
-                                 accelerator = tun.accelerator, kernel_dtype = settings.kernel_dtype,
-                                 distribution = dst_dist, memory = tun.memory,
-                                 scratch_capacity = tun.scratch_capacity )
+        # Under a trace ( `jax.jit` ) the weights may be tracers, and a diagram with traced weights falls back on the
+        # plain storage. The zeros of a cold start are made on the host ( a constant ); given traced weights, the TREE is
+        # built on the positions alone ( it only depends on them ) and the weights enter its majorants ( a kernel )
+        accelerator = tun.accelerator
+        pos_raw = getattr( src_dist.positions, "raw", src_dist.positions )
+        if w0_given is not None and accelerator is None and not driver.is_traced( pos_raw ) \
+                and driver.is_traced( getattr( w0_given, "raw", w0_given ) ):
+            from .AaBsp import AaBsp
+            accelerator = AaBsp( pos_raw )
+        # ( and what is concrete is EVALUATED under the trace: the domain, the tree, the density's values stay readable )
+        import numpy as np
+        with driver.concrete_eval():
+            self._pd = PowerDiagram( src_dist.positions,
+                                     np.zeros( int( src_dist.nb_diracs.value ) ) if w0_given is None else w0_given,
+                                     accelerator = accelerator, kernel_dtype = settings.kernel_dtype,
+                                     distribution = dst_dist, memory = tun.memory,
+                                     scratch_capacity = tun.scratch_capacity )
         pd = self._pd
         n = int( pd.nb_points.value )
 
         #: the target masses, indexed like the cells
         self._masses = RealTensor[ pd.num_point ]( src_dist.weights.raw )
+
+        if on_card:
+            return self._build_card( pd, settings, step, verbose )
 
         options = _Options(
             mass_tol = float( settings.tol ), mass_rtol = float( tun.mass_rtol ), t_min = float( tun.t_min ),
@@ -327,6 +379,120 @@ class SdotPlanNd:
         self._read_stats( stats, settings )
         self._read_history( history, settings, pd )
 
+    def _build_card( self, pd, settings, step, verbose ):
+        """THE CARD'S SOLVE ( `include/sdot/gpu/Newton2D.cuh` ): the same Newton, the same options and outputs as the CPU's, in
+        ONE ffi call whose handler drives the loop on the call's stream -- so it runs under `jax.jit` too. Taken in 2D, with
+        the BSP tree, a box domain and a CONSTANT density ( `PowerDiagram_Bsp._card_variant` ); anything else is refused
+        here rather than solved on another path: an `Image` or gaussians need the card's cells to integrate a density,
+        which they do not do yet.
+
+        What differs from the CPU ( said in `Newton2D.cuh` ): `step = "limits"` is the exact step of the area polynomials
+        ( all the cells, from the accepted diagram's edges ) checked by the trial diagram, not the CPU's local limits with a
+        first trial `beta`; the linear solver is the card's multigrid ( `"auto"`, `"mg"` ) or CG ( `"cg"` ), or the CPU's
+        through a copy of the laplacian ( `"cholesky"`, `"amg"`, or `Tuning( linear_host = True )` ); there is no width
+        continuation ( `"always"` is refused, `"auto"` proceeds without )."""
+        import numpy as np
+        tun = settings.tuning
+        reason = None
+        if pd.dim_count != 2:
+            reason = "the card solves in 2D only ( 3D: the CPU )"
+        elif settings.continuation == "always":
+            reason = "the width continuation needs a convolved density, which the card does not integrate yet"
+        variant = pd._card_variant() if reason is None else None
+        if reason is None and variant is None:
+            reason = ( "the card's cells take a box domain, a CONSTANT density ( no density, or an `Image` with all its "
+                       "values equal on exactly the box ), the BSP tree and no neighbour memory -- an `Image` / gaussian "
+                       "density on the card is not there yet" )
+        if reason is not None:
+            raise NotImplementedError( f"SdotPlanNd on a CUDA device: { reason }. Use the CPU device ( LOOM_DEVICE=cpu ) "
+                                       "for this problem." )
+        variant, rho = variant
+        n = int( pd.nb_points.value )
+        # THE KERNEL'S FLOAT, chosen here: `fp64` / `fp32` one kernel; `auto` / `mixed` the float kernel, then the double one
+        # from the iteration where a float step stagnates ( `Newton2D.cuh`: a cut decided in float on a degenerate cloud stops
+        # the merit from decreasing -- the lines with equal areas -- while elsewhere the float kernel's measures, re-solved in
+        # double, reach the double's residual for a fifth of its time )
+        from .PowerDiagram_Bsp import card_variant_for
+        nodes = int( pd.tree.nb_bsp_nodes.value )
+        if settings.precision in ( "auto", "mixed" ):
+            variant = f"{ card_variant_for( 32, n, nodes ) }, { card_variant_for( 64, n, nodes ) }"
+        else:
+            variant = card_variant_for( 32 if settings.precision == "fp32" else 64, n, nodes )
+
+        # the linear solver: the card's ( `Linear2D.cuh` ), or a CPU one of `Linear.cpp` on a copy of the laplacian
+        lin_name = tun.linear_solver
+        if getattr( tun, "linear_host", False ) or lin_name in ( "cholesky", "amg" ):
+            lin_kind = 2
+        else:
+            lin_kind = 0 if lin_name == "cg" else 1
+        pack = int( tun.mg_pack or 0 )
+        if pack and ( pack & ( pack - 1 ) ):
+            raise ValueError( f"mg_pack must be a power of two ( got { pack } )" )
+        opts = [ 0.0 ] * len( _CARD_OPTIONS )
+        def put( name, v ):
+            opts[ _CARD_OPTIONS.index( name ) ] = float( v )
+        put( "tol_abs", settings.tol ); put( "tol_rel", tun.mass_rtol ); put( "t_min", tun.t_min ); put( "mult_ok", tun.restart_factor )
+        put( "factor", 0.9 ); put( "maxit", settings.max_iter ); put( "max_backtracks", tun.max_backtracks ); put( "step", _STEP[ step ] )
+        put( "residual", _RESIDUAL[ tun.residual ] ); put( "power", tun.residual_power ); put( "switch", tun.residual_switch )
+        put( "lin", lin_kind ); put( "host_method", _LIN[ lin_name ] ); put( "lin_tol", tun.linear_tol or 0.0 )
+        put( "amg_variant", _AMG_VARIANT[ tun.amg_variant ] ); put( "mg_shift", pack.bit_length() - 1 if pack else 0 )
+        put( "mg_recycle", -1 if tun.mg_recycle is None else tun.mg_recycle ); put( "mg_rebuild", tun.mg_rebuild or 0 )
+        put( "mg_stop", tun.mg_stop or 0 ); put( "mg_nu", tun.mg_nu or 0 )
+        put( "mg_kcycle", -1 if getattr( tun, "mg_kcycle", None ) is None else tun.mg_kcycle )
+        put( "lin_maxit", 0 ); put( "trace", int( bool( verbose ) ) )
+        mg_precision = getattr( tun, "mg_precision", None ) or _CARD_MG_PRECISION
+        if mg_precision not in ( "float", "double" ):
+            raise ValueError( f"mg_precision: 'float' or 'double' ( got { mg_precision !r } )" )
+        put( "mg_float", int( mg_precision == "float" ) )
+        options = RealTensor[ Axis( ShapeVar( len( _CARD_OPTIONS ) ), name = "num_card_opt" ) ]( np.asarray( opts, dtype = np.float64 ) )
+
+        weights = RealTensor[ pd.num_point ]()
+        history = _History( nb_hist = len( _HISTORY ), nb_points = n )
+        cell_masses = RealTensor[ pd.num_point ]()
+        barycenters = RealTensor[ pd.num_point, pd.dim ]()
+        cost        = RealTensor()
+        stats = RealTensor[ Axis( ShapeVar( len( _STATS ) ), name = "num_stat" ) ]()
+        w0 = RealTensor[ pd.num_point ]( pd.weights.raw )
+        work = _CardSolveWork( nb_points = n )
+        pd_expr, pd_kwargs, pd_produced = pd._solver_weights_call()
+        maxv = int( pd.card_max_vertices )
+
+        loom.ffi_call(
+            "sdotplan_solve_card_2d",
+            FfiCode.inline(
+                f"sdot::gpu2d::solve<{ variant }>( queue, args.inputs.power_diagram, args.inputs.nu, args.inputs.w0, args.inputs.options, "
+                "args.outputs.weights, args.outputs.history, args.outputs.stats, args.outputs.cell_masses, args.outputs.barycenters, "
+                "args.outputs.cost, args.outputs.sorted_weights_out, args.outputs.node_wa_out, args.outputs.node_wb_out, args.outputs.work, "
+                f"args.errors, args.allocator, args.inputs.density, { maxv } );",
+                includes = [ "sdot/gpu/Newton2D.cuh" ], sources = [ "sdot/sdotplan/Linear.cpp" ], allocator = True ),
+            failures = pd._card_failures(),
+            power_diagram = pd,
+            nu = self._masses,
+            w0 = w0,
+            options = options,
+            density = RealTensor( np.float64( rho ) ),
+            weights = loom.out( weights ),
+            history = loom.out( history, writes = ( [ "rows", "nb_steps", "weights" ] if settings.keep_weights
+                                                    else [ "rows", "nb_steps" ] ),
+                                capacities = { "nb_steps": int( settings.max_iter ) + 1 } ),
+            stats = loom.out( stats ),
+            cell_masses = loom.out( cell_masses ),
+            barycenters = loom.out( barycenters ),
+            cost = loom.out( cost ),
+            work = loom.out( work, capacities = { "nb_spill": int( pd.card_spill_capacity ), "nb_facets": card_facet_capacity( n ) } ),
+            **pd_kwargs,
+        )
+        pd._solver_weights_after( pd_produced )
+        if not driver.is_traced( work.status.raw ):
+            #: the per-cell status of the last diagram of the card's solve ( 0: done, `Cell2D.cuh::Status` )
+            self.card_status = work.status
+        self.weights = weights
+        self.cell_masses = cell_masses
+        self.barycenters = barycenters
+        self.cost = cost
+        self._read_stats( stats, settings )
+        self._read_history( history, settings, pd )
+
     @staticmethod
     def _start_from_plan( plan, src_dist, impose ):
         """What a previous PLAN provides as a start: `( weights0, what_was_taken_back )`.
@@ -354,9 +520,16 @@ class SdotPlanNd:
     def _read_stats( self, stats, settings ):
         #: what the solver reports ( see `sdotplan/Solve.h::Stat` ), plus `status` and `start` spelled out
         st = stats.raw
+        if driver.is_traced( st ):
+            # under a trace ( `jax.jit` ): the numbers are tracers, kept as such -- nothing is read on the host
+            self.stats = { name: st[ k ] for k, name in enumerate( _STATS ) }
+            self.stats[ "aggregation" ] = "requested, not wired yet ( step 7 )" if settings.aggregate else "not requested"
+            self.stats[ "warm_start" ] = self._warm_start
+            return
         self.stats = { name: float( st[ k ] ) for k, name in enumerate( _STATS ) }
         self.stats[ "status" ] = _STATUS.get( int( self.stats[ "status" ] ), "?" )
         self.stats[ "it_switch" ] = int( self.stats[ "it_switch" ] )
+        self.stats[ "it_double" ] = int( self.stats[ "it_double" ] )
         self.stats[ "start" ] = _START.get( int( self.stats[ "start" ] ), "?" )
         for name in ( "nb_iter", "nb_diag", "nb_backtracks", "nb_overflowed", "nb_cell_lim", "nb_limit_rounds",
                       "lin_nb_hierarchies", "lin_nb_iter", "nb_continuation_steps" ):
@@ -373,6 +546,9 @@ class SdotPlanNd:
         #: one dict per ACCEPTED step -- `step = 0` is the starting point: `t`, `residual_l2`,
         #: `min_measure`, `max_abs_residual`, `nb_diag` ( cumulative ), `nb_evals` ( the diagrams of
         #: this step ), and `weights` if `keep_weights`
+        if driver.is_traced( history.rows.raw ):
+            self.history = None                      # under a trace: not read ( it would be a host read of a tracer )
+            return
         nb_steps = int( history.nb_steps.value )
         rows = history.rows.raw[ :nb_steps ]
         self.history = []

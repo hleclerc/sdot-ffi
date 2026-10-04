@@ -53,7 +53,7 @@ measured.** `residu = log` wins on direct solves and breaks continuation in dens
 import numpy as np                  # the only host arrays in here : the few planes of the domain
 
 
-_PRECISIONS = { "auto": "FP64", "fp64": "FP64", "fp32": "FP32" }
+_PRECISIONS = { "auto": "FP64", "fp64": "FP64", "fp32": "FP32", "mixed": "FP32" }
 
 
 class Tuning:
@@ -73,6 +73,12 @@ class Tuning:
                   # `None`: 8 ), solutions kept for the start by projection ( `None`: 2 ), solves per hierarchy ( `None`: 4 ),
                   # coarsening stops under that many unknowns ( `None`: 1000 )
                   mg_pack = None, mg_recycle = None, mg_rebuild = None, mg_stop = None, mg_nu = None,
+                  # ON A CUDA CARD ( `gpu/Linear2D.cuh` ): the levels accelerated by the K-cycle ( `None`: 2 ), and
+                  # `linear_host = True` to solve on the host with the CPU solver named by `linear_solver` ( a copy of the
+                  # laplacian each way ) instead of the card's multigrid / CG; the card's multigrid defaults are those of
+                  # the old GPU campaign ( packets of 4, Chebyshev degree 1, recycling 2, a hierarchy per solve ); `mg_precision`
+                  # ( `"float"` / `"double"`, `None`: double -- float measured slower ) the precision of its levels, the outer iteration being in double
+                  mg_kcycle = None, linear_host = False, mg_precision = None,
                   # the scale of the width continuation ( § 9.2 : the ratio sqrt( 2 ) is measured )
                   conv_start = None, conv_ratio = 2 ** 0.5, conv_min = None, conv_threshold = 1e-2,
                   # the damping safeguards ( § 3 : `restart_factor = 4` is measured )
@@ -94,6 +100,9 @@ class Tuning:
         self.mg_rebuild        = mg_rebuild
         self.mg_stop           = mg_stop
         self.mg_nu             = mg_nu
+        self.mg_kcycle         = mg_kcycle
+        self.linear_host       = bool( linear_host )
+        self.mg_precision      = mg_precision
         self.conv_start        = conv_start
         self.conv_ratio        = conv_ratio
         self.conv_min          = conv_min
@@ -137,7 +146,10 @@ class Iterative:
     direct Newton STAGNATES -- § 9.1 ). `"auto"` triggers it when the starting point leaves a cell
     without mass ; `"always"` / `"never"`.
 
-    `precision` : the float in which the geometry is cut. `"auto"` is `FP64` : the bench measured it
+    `precision` : the float in which the geometry is cut. `"mixed"` ( and `"auto"` ON A CUDA CARD ) : the float kernel, then the
+    double one from the first float step that stagnates -- the card's float kernel re-solves its vertices in double, so it
+    reaches the double's residual on regular clouds for a fraction of its cost; the CPU has no such switch ( `"mixed"` is
+    refused there ). On the CPU, `"auto"` is `FP64` : the bench measured it
     ( § 4 ), damping requires a strict decrease of the residual that the noise of an area in `float`
     refuses well before the tolerance. The `fp32 -> fp64` switch is STRUCTURAL
     ( § 19.10 ) and therefore belongs to the C++, not to the caller.
@@ -243,7 +255,11 @@ class OtProblem:
     def target( self, target ):
         if target is None:
             raise ValueError( "OtProblem : a target is needed -- it is what gives the domain" )
-        self._target = target.normalized_version()
+        # evaluated when the target is concrete, even under a trace ( `jax.jit` ): its values stay readable on the host,
+        # which is how a solver knows a constant density ( `PowerDiagram_Bsp._card_density` ); traced values stay traced
+        from loom.drivers.driver import driver
+        with driver.concrete_eval():
+            self._target = target.normalized_version()
 
     # -- what can be READ off the inputs ------------------------------------------------------
 

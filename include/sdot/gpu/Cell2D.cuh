@@ -22,6 +22,9 @@
 //               written by cell `i` alone from its own facets ( no atomic, the same order at every run );
 //   * MOMENTS   the barycentre and `rho int |x - p_k|^2` ( the transport cost of the cell, whose sum is
 //               differentiated by the envelope theorem: `d cost / d p_k = 2 m_k ( p_k - b_k )` ).
+//   * EDGES     the cuts of the cell's edges IN POLYGON ORDER ( rank of the neighbour, or a side of the box ), at most
+//               `EDGE_CAP` ( more: the count is `-1` ): what the step of Newton's `Newton2D.cuh` rebuilds the cell from,
+//               as an area polynomial along the direction, without a walk.
 //
 // = HOW A CELL IS BUILT
 //
@@ -83,7 +86,11 @@ constexpr double DET_MIN    = 1e-6;                      ///< under this relativ
 constexpr bool   EXACT_VERTICES = false;
 
 /// WHAT A CELL GIVES ( see the header ): a bit set, a template parameter of everything below
-enum Out : unsigned { MEASURES = 1, FACETS = 2, VJP = 4, MOMENTS = 8 };
+enum Out : unsigned { MEASURES = 1, FACETS = 2, VJP = 4, MOMENTS = 8, EDGES = 16 };
+
+/// EDGES: the edges kept per cell ( SoA, `edges[ q * n + k ]` ); a cell with more says `-1` ( a hundredth of a percent of
+/// the uniform cells, a tenth on the lines: the step treats them as unknown )
+constexpr int EDGE_CAP = 16;
 
 /// WHY A CELL WAS NOT DONE ( the per-cell status, 0 = done )
 enum Status : int {
@@ -349,6 +356,8 @@ struct Problem {
     StridedOut<TF,1>  grad_w;                            ///< ... -> the weights, rank order ( may be null )
     StridedOut<TF,2>  bary;                              ///< MOMENTS: the barycentre ( the seed if empty )
     StridedOut<TF,1>  cost;                              ///< ... and `rho int_cell |x - p|^2`
+    TR               *edges;                             ///< EDGES: the cuts in polygon order, `edges[ q * n + rank ]`
+    int              *nb_edges;                          ///< ... their number per rank ( `-1`: more than `EDGE_CAP` )
 
     __device__ __forceinline__ double density() const { return rho_dev ? double( *rho_dev ) : rho; }
     __device__ __forceinline__ Wt weight( TR q ) const { if constexpr ( W ) return w[ q ]; else return Wt{}; }
@@ -983,6 +992,15 @@ __device__ __forceinline__ void finish_cell( const Pb &pb, typename Pb::TR k, co
     double gk = 0;
     if constexpr ( bool( OUT & VJP ) )
         gk = double( pb.g( SI( pb.ids( k ) ) ) );
+    if constexpr ( bool( OUT & EDGES ) ) {
+        const SI n = SI( pb.n );
+        int ne = cell.nb < 3 ? 0 : cell.nb;
+        if ( ne > EDGE_CAP )
+            ne = -1;
+        else
+            cell.for_each_vertex( [&]( int i, auto, auto, TR c ) { pb.edges[ SI( i ) * n + SI( k ) ] = c; } );
+        pb.nb_edges[ k ] = ne;
+    }
 
     double a2 = 0, m1x = 0, m1y = 0, m2 = 0, gw = 0, gpx = 0, gpy = 0;
     unsigned t = 0;
@@ -1048,6 +1066,8 @@ __device__ __forceinline__ void finish_failed( const Pb &pb, typename Pb::TR k, 
     pb.set_status( k, st );
     if constexpr ( bool( OUT & MEASURES ) )
         pb.res( pb.user( k ) ) = TF( 0 );
+    if constexpr ( bool( OUT & EDGES ) )
+        pb.nb_edges[ k ] = -1;
     if constexpr ( bool( OUT & VJP ) ) {
         if ( pb.grad_pos.p ) { pb.grad_pos( SI( k ), 0 ) = TF( 0 ); pb.grad_pos( SI( k ), 1 ) = TF( 0 ); }
         if constexpr ( Pb::W ) if ( pb.grad_w.p ) pb.grad_w( SI( k ) ) = TF( 0 );
