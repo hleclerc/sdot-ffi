@@ -49,8 +49,9 @@
 //
 // = Failures
 //
-// Per-cell status ( `Cell2D.cuh::Status`, the `status` output in user order ) and loom's error buffer: a cell past
-// `max_vertices` is a `KernelFailure`; a capacity that was too small ( the fourth pass, the COO of the facets ) is written
+// Loom's error buffer: a cell past `max_vertices` is a `KernelFailure` naming its seed ( eager and traced ), and the solve
+// stops at once with `status = failure`. The cells' fourth pass has a FIXED budget ( `Cell2D.cuh::Overflow`, taken once
+// and shared by every card of the solve ): it never asks for room. The one capacity left is the COO of the facets, written
 // into its ShapeVar, which records the overflow: loom runs the call again with more ( eagerly ) or raises ( traced ), and
 // the solve stops at once with `status = capacity`.
 // =====================================================================================
@@ -137,16 +138,14 @@ struct CentredG2 {
 struct Report {
     DiagRed d;
     double  g2c;
-    unsigned long long nb_facets, spill_need, nb_failed, pad;
+    unsigned long long nb_facets, nb_failed;
 };
 
 __global__ void gather_report( Report *rep, const DiagRed *d, const Sum1 *g2, const Counters *c ) {
     rep->d = *d;
     rep->g2c = g2->s;
-    rep->nb_facets  = c ? c->nb_facets : 0;
-    rep->spill_need = c ? c->spill_need : 0;
-    rep->nb_failed  = c ? c->nb_failed : 0;
-    rep->pad = 0;
+    rep->nb_facets = c ? c->nb_facets : 0;
+    rep->nb_failed = c ? c->nb_failed : 0;
 }
 
 /// the merit of the damping ( `Newton.h::merit` ) from a report
@@ -193,12 +192,6 @@ template<class TF,class TI>
 __global__ void __launch_bounds__( BLOCK ) scatter_ranks( SI n, const double *src, Strided<TI,1> ids, StridedOut<TF,1> dst ) {
     const SI k = SI( blockIdx.x ) * BLOCK + threadIdx.x;
     if ( k < n ) dst( SI( ids( k ) ) ) = TF( src[ k ] );
-}
-
-template<class TI>
-__global__ void __launch_bounds__( BLOCK ) scatter_status( SI n, const int *src, Strided<TI,1> ids, int *dst ) {
-    const SI k = SI( blockIdx.x ) * BLOCK + threadIdx.x;
-    if ( k < n ) dst[ SI( ids( k ) ) ] = src[ k ];
 }
 
 /// a row of the weights history: `dst( row, ids( k ) ) = w[ k ]`
@@ -448,18 +441,18 @@ struct Slot {
     Counters *counters = nullptr;
     TR       *edges = nullptr;                           ///< `EDGE_CAP x n`
     int      *nb_edges = nullptr;
-    int      *status = nullptr;
     Report    rep{};                                     ///< its last report ( host )
 };
 
 /// THE SOLVE ( see the header ). `pd`: the diagram ( its tree, its positions; its weights are not read ); `nu_in`, `w0_in`:
 /// user order; `opts_in`: `NB_OPTS` reals. Outputs as `sdotplan::solve`, plus the diagram's `sorted_weights_out`,
-/// `node_wa_out`, `node_wb_out` and `work` ( `status`, the capacities `nb_spill` and `nb_facets` ).
+/// `node_wa_out`, `node_wb_out` and `work` ( the capacity `nb_facets` ). `max_vertices`, `overflow_warps`: the cells' fourth
+/// pass ( `Cell2D.cuh::Overflow` ).
 template<class V,class VD = V>
 void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const auto &w0_in, const auto &opts_in,
             auto &&weights, auto &&hist, auto &&stats, auto &&masses, auto &&bary, auto &&cost,
             auto &&sorted_weights_out, auto &&node_wa_out, auto &&node_wb_out, auto &&work,
-            const auto &errors_, auto &allocator, const auto &rho_in, int max_vertices ) {
+            const auto &errors_, auto &allocator, const auto &rho_in, int max_vertices, int overflow_warps ) {
     using PD = std::decay_t<decltype( pd )>;
     using TF = TFOf<PD>;
     using TI = TIOf<PD>;
@@ -497,9 +490,17 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     const int lin_kind = int( o[ O_LIN ] );
     const bool trace = o[ O_TRACE ] != 0;
 
+    // ---- the fourth pass's slots, ONE budget for every card of the solve ( they run one after the other ), sized for the
+    // largest cell form ( the double kernel's, MIXED )
+    Overflow overflow = Overflow::sized( n, overflow_warps, max_vertices );
+    overflow.bytes = std::max( overflow.template bytes_for<typename V::TK,TR>(), overflow.template bytes_for<typename VD::TK,TR>() );
+    overflow.slots = static_cast<unsigned char *>( take( allocator, overflow.bytes ) );
+    if ( ! overflow.slots )
+        return;
+
     // ---- the card's diagram, its two slots, the majorants
     CardT card;
-    if ( ! card.prepare( queue, pd, allocator, int( std::min<SI>( work.nb_spill.max, max_vertices ) ), SPILL_WARPS, max_vertices ) )
+    if ( ! card.prepare( queue, pd, allocator, overflow ) )
         return;
     set_density( card.pb, rho_in );
     double rho = 1;
@@ -517,7 +518,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     bool use_double = ! MIXED;
     int it_double = MIXED ? -1 : 0;
     if constexpr ( MIXED ) {
-        if ( ! cardd.prepare( queue, pd, allocator, int( std::min<SI>( work.nb_spill.max, max_vertices ) ), SPILL_WARPS, max_vertices ) )
+        if ( ! cardd.prepare( queue, pd, allocator, overflow ) )
             return;
         set_density( cardd.pb, rho_in );
         cardd.pb.user_order = false;
@@ -533,8 +534,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
         s.counters = static_cast<Counters *>( take( allocator, SI( sizeof( Counters ) ) ) );
         s.edges = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * EDGE_CAP * n ) );
         s.nb_edges = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * n ) );
-        s.status = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * n ) );
-        if ( ! s.a || ! s.fi || ! s.fj || ! s.fc || ! s.counters || ! s.edges || ! s.nb_edges || ! s.status )
+        if ( ! s.a || ! s.fi || ! s.fj || ! s.fc || ! s.counters || ! s.edges || ! s.nb_edges )
             return;
     }
     Slot<TR> *cur = &slots[ 0 ], *tri = &slots[ 1 ];
@@ -600,8 +600,9 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     tm_maj.init(); tm_diag.init(); tm_asm.init(); tm_lim.init();
     double t_lin = 0, t_lim_host = 0;
     int nb_diag = 0;
-    unsigned long long max_spill = 0, max_facets = 0;
+    unsigned long long max_facets = 0;
     bool stop_all = false;                               // a capacity or a failure: the call is run again ( or raises )
+    bool failed = false;                                 // ... a failure ( a cell past `max_vertices` )
     int res_cur = residual;
     double eps = 0;
 
@@ -630,7 +631,6 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
             tm_maj.stop( queue );
             c.pb.w64 = Strided<TF,1>{ reinterpret_cast<const char *>( wt ), { SI( sizeof( double ) ) } };
             c.pb.res = StridedOut<TF,1>{ reinterpret_cast<char *>( s.a ), { SI( sizeof( double ) ) } };
-            c.pb.status = s.status;
             c.pb.fi = s.fi; c.pb.fj = s.fj; c.pb.fc = s.fc;
             c.counters = s.counters; c.pb.counters = s.counters;
             c.pb.edges = s.edges; c.pb.nb_edges = s.nb_edges;
@@ -647,9 +647,9 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
         tm_maj.collect();
         tm_diag.collect();
         ++nb_diag;
-        max_spill = std::max( max_spill, s.rep.spill_need );
         max_facets = std::max( max_facets, s.rep.nb_facets );
-        if ( s.rep.nb_facets > ( unsigned long long ) fcap || s.rep.spill_need > 0 || s.rep.nb_failed > 0 )
+        failed = failed || s.rep.nb_failed > 0;
+        if ( s.rep.nb_facets > ( unsigned long long ) fcap || s.rep.nb_failed > 0 )
             stop_all = true;
     };
 
@@ -737,7 +737,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     int status = sp::S_RUNNING, nb_iter = 0, nb_backtracks = 0, it_switch = -1, nb_limit_rounds = 0;
     SI nb_cell_lim = 0;
     double residual0 = 0, residual_max = cur->rep.d.max_abs, t_last = 1;
-    if ( stop_all ) status = sp::S_CAPACITY;
+    if ( stop_all ) status = failed ? sp::S_FAILURE : sp::S_CAPACITY;
     after_step( 0, 0, 1 );
     for ( int it = 0; it < maxit && status == sp::S_RUNNING; ++it ) {
         const double worst = cur->rep.d.max_abs, worst_rel = cur->rep.d.max_rel;
@@ -857,7 +857,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
             std::printf( "\n" );
             std::fflush( stdout );
         }
-        if ( stop_all ) { status = sp::S_CAPACITY; break; }
+        if ( stop_all ) { status = failed ? sp::S_FAILURE : sp::S_CAPACITY; break; }
         if constexpr ( MIXED ) {
             if ( ! taken && ! use_double ) {
                 // THE FLOAT KERNEL STAGNATES ( a cut decided in float on a degenerate cloud: its merit stops decreasing ):
@@ -866,7 +866,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
                 it_double = it;
                 if ( trace ) std::printf( "      switch: kernel float -> double ( the float step stagnates )\n" );
                 diagram( w, *cur );
-                if ( stop_all ) { status = sp::S_CAPACITY; break; }
+                if ( stop_all ) { status = failed ? sp::S_FAILURE : sp::S_CAPACITY; break; }
                 continue;
             }
         }
@@ -886,8 +886,6 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     launch_kernel( queue, &scatter_ranks<TF,TI>, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, ids, strided_out<TF,1>( weights ) );
     launch_kernel( queue, &scatter_ranks<TF,TI>, blocks_for( n ), BLOCK, 0, n, ( const double * ) cur->a, ids, strided_out<TF,1>( masses ) );
     launch_kernel( queue, &write_strided<TF>, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, strided_out<TF,1>( sorted_weights_out ) );
-    launch_kernel( queue, &scatter_status<TI>, blocks_for( n ), BLOCK, 0, n, ( const int * ) cur->status, ids,
-                   reinterpret_cast<int *>( const_cast<void *>( ( const void * ) work.status.data().raw ) ) );
     maj.refresh( queue, pd, w, const_cast<Node<true,TR> *>( card.pb.nodes ), strided_out<TF,2>( node_wa_out ), strided_out<TF,1>( node_wb_out ) );
     CardD *cmom_p = nullptr;                             // the moments in the double kernel's form ( mixed ), or the one kernel's
     if constexpr ( MIXED ) cmom_p = &cardd; else cmom_p = &card;
@@ -898,29 +896,23 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     if ( ! stop_all ) {
         MomT mom;
         double *mres = vec( n ), *mcost = vec( n );
-        if ( mres && mcost && mom.prepare( queue, pd, allocator, int( std::min<SI>( work.nb_spill.max, max_vertices ) ), SPILL_WARPS, max_vertices ) ) {
+        if ( mres && mcost && mom.prepare( queue, pd, allocator, overflow ) ) {
             set_density( mom.pb, rho_in );
             mom.pb.nodes = card.pb.nodes;
             mom.pb.w = cmom.pb.w;
             mom.pb.w64 = Strided<TF,1>{ reinterpret_cast<const char *>( w ), { SI( sizeof( double ) ) } };
             mom.pb.user_order = true;
             mom.pb.res = StridedOut<TF,1>{ reinterpret_cast<char *>( mres ), { SI( sizeof( double ) ) } };
-            mom.pb.status = nullptr;
             mom.pb.bary = strided_out<TF,2>( bary );
             mom.pb.cost = StridedOut<TF,1>{ reinterpret_cast<char *>( mcost ), { SI( sizeof( double ) ) } };
             mom.run( queue, errors );
             reduce( queue, n, SumOf{ mcost }, red1.partials, red1.out );
             cuda_check( cudaMemcpyAsync( const_cast<void *>( ( const void * ) cost.data().raw ), red1.out, sizeof( double ),
                                          cudaMemcpyDeviceToDevice, queue.stream ), "copy of the cost" );
-            Counters mc;
-            read_back( queue, &mc, ( const Counters * ) mom.counters, 1 );
-            max_spill = std::max( max_spill, mc.spill_need );
         }
     }
 
-    // ---- the capacities ( written into their ShapeVars: past them, loom runs the call again or raises )
-    launch_kernel( queue, &set_shape_var<std::decay_t<decltype( sdot::kernel_form( queue, MutList(), work.nb_spill ) )>>, 1, 1, 0,
-                   sdot::kernel_form( queue, MutList(), work.nb_spill ), SI( max_spill ) );
+    // ---- the capacity of the facets ( written into its ShapeVar: past it, loom runs the call again or raises )
     launch_kernel( queue, &set_shape_var<std::decay_t<decltype( sdot::kernel_form( queue, MutList(), work.nb_facets ) )>>, 1, 1, 0,
                    sdot::kernel_form( queue, MutList(), work.nb_facets ), SI( max_facets ) );
 

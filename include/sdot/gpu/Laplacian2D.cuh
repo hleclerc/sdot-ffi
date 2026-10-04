@@ -249,22 +249,21 @@ bool assemble_laplacian( const CudaQueue &queue, const CardT &card, auto &alloca
 }
 
 /// THE CELLS AND WHAT IS MADE OF THEM, in one call ( `PowerDiagram_Bsp._card_cells`; what Newton's iteration asks for
-/// is `MEASURES | FACETS` ): the measures ( and the status ), and per `OUT` the laplacian's CSR ( `lap.row / col / val /
+/// is `MEASURES | FACETS` ): the measures, and per `OUT` the laplacian's CSR ( `lap.row / col / val /
 /// dia`, `lap.nb_nnz` the capacity of `col` and `val` ), the barycentres and the costs of the cells ( `mom.bary`,
 /// `mom.cost` ). What is not asked for can be anything ( `0` ).
 template<class V,unsigned OUT>
-void cells( const CudaQueue &queue, const auto &pd, auto &&res, auto &&work, auto &&lap, auto &&mom, const auto &errors, auto &allocator,
-            const auto &rho, int max_vertices ) {
+void cells( const CudaQueue &queue, const auto &pd, auto &&res, auto &&lap, auto &&mom, const auto &errors, auto &allocator,
+            const auto &rho, int max_vertices, int overflow_warps ) {
     using PD = std::decay_t<decltype( pd )>;
     using TF = TFOf<PD>;
     using CardT = Card<V,PD::has_weights,OUT | MEASURES,TF,TIOf<PD>>;
     using TR = typename CardT::TR;
     CardT card;
-    if ( ! card.prepare( queue, pd, allocator, int( std::min<SI>( work.nb_spill.max, max_vertices ) ), SPILL_WARPS, max_vertices ) )
+    if ( ! card.prepare( queue, pd, allocator, Overflow::sized( SI( pd.nb_seeds() ), overflow_warps, max_vertices ) ) )
         return;
     set_density( card.pb, rho );
-    card.pb.res    = strided_out<TF,1>( res );
-    card.pb.status = reinterpret_cast<int *>( work.status.data().raw );
+    card.pb.res = strided_out<TF,1>( res );
     if constexpr ( bool( OUT & FACETS ) ) {
         const SI cap = std::max<SI>( SI( lap.nb_nnz.max ) / 2, 1 );
         card.pb.fcap = cap;
@@ -279,7 +278,6 @@ void cells( const CudaQueue &queue, const auto &pd, auto &&res, auto &&work, aut
         card.pb.cost = strided_out<TF,1>( mom.cost );
     }
     card.run( queue, sdot::kernel_form( queue, MutList(), errors ) );
-    card.report_spill( queue, work.nb_spill );
     if constexpr ( bool( OUT & FACETS ) ) {
         using TP = std::remove_const_t<typename std::decay_t<decltype( lap.row )>::TF>;
         using TC = std::remove_const_t<typename std::decay_t<decltype( lap.col )>::TF>;

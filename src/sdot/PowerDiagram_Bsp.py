@@ -96,17 +96,24 @@ class PowerDiagram_Bsp( PowerDiagram ):
     # each cell, gathered ), so a traced or differentiated call takes it too. `use_card_cells = False` on a diagram,
     # or `SDOT_CARD_CELLS=0`, sends every call to the generic path ( the tests compare the two ).
     #
-    # NOTHING IS READ BACK in the normal case: the fourth pass ( global memory ) has a CAPACITY of vertices per cell,
-    # `card_spill_capacity`, a loom ShapeVar that the kernel asks to grow through the error buffer when a cell does
-    # not fit ( loom runs the call again eagerly, raises under a trace: give more then ). `card_max_vertices` is the
-    # hard limit: past it a cell is a `KernelFailure`, never a NaN. The per-cell status of the last eager call is
-    # `_card_status` ( 0 = done, see `Cell2D.cuh::Status` ).
+    # NOTHING IS READ BACK, NOTHING RUNS AGAIN: the fourth pass ( global memory ) works within a FIXED budget taken once
+    # per call, `card_overflow_warps_for` slots of `card_max_vertices` vertices ( the per-cell limit ), the cells that
+    # reach it going through the slots in successive batches ( `Cell2D.cuh::Overflow` ); the forward, the backward and
+    # the card's Newton use the same scheme. Past `card_max_vertices` a cell is a `KernelFailure` naming its seed ( eager
+    # and traced ), never a NaN.
 
     use_card_cells = True
-    #: vertices per cell of the fourth pass, a first guess ( grown by loom when a cell asks for more )
-    card_spill_capacity = 1024
-    #: the hard limit of vertices per cell ( the backward's fourth pass is sized on it: it cannot run again )
+    #: the hard limit of vertices per cell ( the size of a slot of the fourth pass )
     card_max_vertices = 1 << 15
+    #: how many cells the fourth pass holds at once ( its slots; fewer when the slots would exceed `card_overflow_bytes` )
+    card_overflow_warps = 64
+    #: the most memory the fourth pass's slots take from the call's pool
+    card_overflow_bytes = 256 << 20
+
+    def _card_overflow_warps( self, variant ):
+        """the slots of the fourth pass for this diagram and variant ( `card_overflow_warps_for` )"""
+        return card_overflow_warps_for( variant, int( self.nb_points.value ), int( self.card_max_vertices ),
+                                        int( self.card_overflow_warps ), int( self.card_overflow_bytes ) )
 
     def _card_failures( self ):
         """what the kernel's failure codes mean ( `Cell2D.cuh::Failure` )"""
@@ -164,9 +171,7 @@ class PowerDiagram_Bsp( PowerDiagram ):
         """the measures ( and per `facets` / `moments` the laplacian's CSR, the barycentres and costs ) on the card"""
         n = int( self.nb_points.value )
         res = RealTensor[ self.num_point ]()
-        work = _CardWork( nb_points = n )
-        kwargs = dict( power_diagram = self, density = RealTensor( np.float64( rho ) ), res = loom.out( res ),
-                       work = loom.out( work, capacities = { "nb_spill": int( self.card_spill_capacity ) } ) )
+        kwargs = dict( power_diagram = self, density = RealTensor( np.float64( rho ) ), res = loom.out( res ) )
         lap = mom = None
         if facets:
             lap = _CardLaplacian( nb_rows = n + 1, nb_points = n )
@@ -174,27 +179,24 @@ class PowerDiagram_Bsp( PowerDiagram ):
         if moments:
             mom = _CardMoments( nb_points = n, nb_dims = 2 )
             kwargs[ "mom" ] = loom.out( mom )
-        maxv = int( self.card_max_vertices )
+        limits = f"{ int( self.card_max_vertices ) }, { self._card_overflow_warps( variant ) }"
         includes = [ "sdot/gpu/Laplacian2D.cuh" if ( facets or moments ) else "sdot/gpu/Cell2D.cuh" ]
         if facets or moments:
             out = " | ".join( [ "sdot::gpu2d::MEASURES" ] + [ "sdot::gpu2d::FACETS" ] * facets + [ "sdot::gpu2d::MOMENTS" ] * moments )
-            fwd = ( f"sdot::gpu2d::cells<{ variant }, { out }>( queue, args.inputs.power_diagram, args.outputs.res, args.outputs.work, "
+            fwd = ( f"sdot::gpu2d::cells<{ variant }, { out }>( queue, args.inputs.power_diagram, args.outputs.res, "
                     f"{ 'args.outputs.lap' if facets else '0' }, { 'args.outputs.mom' if moments else '0' }, args.errors, args.allocator, "
-                    f"args.inputs.density, { maxv } );" )
+                    f"args.inputs.density, { limits } );" )
         else:
-            fwd = ( f"sdot::gpu2d::measures<{ variant }>( queue, args.inputs.power_diagram, args.outputs.res, args.outputs.work, "
-                    f"args.errors, args.allocator, args.inputs.density, { maxv } );" )
+            fwd = ( f"sdot::gpu2d::measures<{ variant }>( queue, args.inputs.power_diagram, args.outputs.res, "
+                    f"args.errors, args.allocator, args.inputs.density, { limits } );" )
         kernels = [ FfiCode.inline( fwd, includes = includes, allocator = True ) ]
         if with_vjp:
             kernels.append( FfiCode.inline(
                 f"sdot::gpu2d::measures_vjp<{ variant }>( queue, args.inputs.power_diagram, args.grad_of_outputs.res, "
                 "args.grad_of_inputs.power_diagram.sorted_positions, args.grad_of_inputs.power_diagram.sorted_weights, "
-                f"args.errors, args.allocator, args.inputs.density, { maxv } );",
+                f"args.errors, args.allocator, args.inputs.density, { limits } );",
                 includes = includes, allocator = True ) )
         loom.ffi_call( name, *kernels, failures = self._card_failures(), **kwargs )
-        # the status of the cells ( 0: done ), for a look after an eager call ( under a trace it is a tracer: not kept )
-        if not driver.is_traced( work.status.raw ):
-            self._card_status = work.status
         return res, lap, mom
 
     def _measures_on_card( self ):
@@ -322,20 +324,23 @@ def card_variant_for( kernel_fp_size, nb_seeds, nb_nodes ):
     return f"sdot::gpu2d::Variant<{ tk }, { tr }, { tn }, { height }>"
 
 
+def card_overflow_warps_for( variant, nb_seeds, max_vertices, warps = 64, max_bytes = 256 << 20 ):
+    """THE SLOTS OF THE FOURTH PASS ( `Cell2D.cuh::Overflow` ): `warps` cells at once, fewer when `warps` slots of the
+    per-cell limit would take more than `max_bytes` of the call's pool, at least one block of four. A slot holds
+    `min( max_vertices, n + 4 )` vertices ( a cell of `n` seeds in a box has at most `n + 3` ), each five reals of the
+    kernel and two cut identifiers ( `WarpCell::bytes_for` ); the cells past the slots wait for one to be free, so the
+    number of slots is a matter of speed on the rare cells that get there, never of correctness."""
+    tk, tr = variant.split( "<" )[ 1 ].split( "," )[ :2 ]
+    per_vertex = 5 * ( 4 if tk.strip() == "float" else 8 ) + 2 * ( 4 if tr.strip() == "int" else 8 )
+    cap = max( 4, min( int( max_vertices ), int( nb_seeds ) + 4 ) )
+    fit = int( max_bytes ) // ( cap * per_vertex )
+    return int( max( 4, min( int( warps ), fit ) ) )
+
+
 def card_nnz_capacity( nb_seeds ):
     """the first guess of the laplacian's entries: a planar graph has at most `3 n - 6` edges, each in two rows ( a
     float topology may add a few slivers: the margin, and loom grows it if it was not enough )"""
     return 6 * int( nb_seeds ) + 1024
-
-
-class _CardWork( Aggregate ):
-    """what the card's measures write besides them: the STATUS of each cell ( 0 = done, `Cell2D.cuh::Status` ), and
-    the capacity of the fourth pass ( `nb_spill`, vertices per cell: a count written by the kernel, which asks loom for
-    more through the error buffer when a cell does not fit )"""
-    status    : IntTensor[ "num_point", dict( size = 32 ) ]
-    num_point : Axis[ "nb_points" ]
-    nb_points : ShapeVar
-    nb_spill  : ShapeVar
 
 
 class _CardLaplacian( Aggregate ):

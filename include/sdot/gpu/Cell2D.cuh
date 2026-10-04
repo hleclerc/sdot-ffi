@@ -34,12 +34,12 @@
 //     whose length only the card knows ): the cells that needed more than `R1` vertices ( a tenth ) by a second pass
 //     with `R2 = 16` registers, what overflows that ( a thousandth ) by a third pass with ONE WARP PER CELL
 //     ( `WarpCell`, the vertices in shared memory ), and what overflows that ( none on the campaign's clouds ) by a
-//     fourth pass, the same warp cell in GLOBAL memory: one slot of `spill_cap` vertices per resident warp, the warps
-//     striding over the list. NOTHING IS READ BACK: `spill_cap` is a CAPACITY chosen ahead by Python ( the loom
-//     ShapeVar `nb_spill` ), and a cell that does not fit in it marks its STATUS and asks for more through loom's
-//     error buffer -- loom runs the call again with a larger capacity ( eager ), or raises ( under a trace ). Past
-//     `max_vertices` ( a hard limit, Python's too ) a cell is a FAILURE, reported as such: never a NaN.
-//   * PER-CELL STATUS ( `int` per cell, user order, 0 = done ): why a cell was not done ( `Status` ).
+//     fourth pass, the same warp cell in GLOBAL memory, within a FIXED BUDGET taken once per call ( `Overflow` ): a few
+//     slots ( `overflow_warps`, Python's choice ) of the per-cell vertex limit each ( `max_vertices`, bounded by
+//     `n + 4`: a cell cannot have more ), and a persistent grid of exactly that many warps striding over the list --
+//     the remaining cells go through in successive BATCHES, a warp taking its next cell into the slot it freed. No
+//     capacity to guess, no run again, no read back. Past `max_vertices` ( a hard limit, Python's ) a cell is a
+//     FAILURE, reported through loom's error buffer ( a `KernelFailure` naming the seed, eager or traced ): never a NaN.
 //   * THE FLOAT KERNEL'S FINISH IN A KERNEL OF ITS OWN ( `finish_pass` ): the cells of the first two passes are left in
 //     global memory and finished there -- the double arithmetic of the re-solve cost the walk half its occupancy.
 //   * THE TREE NODES as ONE aligned record in FLOAT ( `Node`: box rounded outward, majorant slopes and constant rounded
@@ -91,14 +91,6 @@ enum Out : unsigned { MEASURES = 1, FACETS = 2, VJP = 4, MOMENTS = 8, EDGES = 16
 /// EDGES: the edges kept per cell ( SoA, `edges[ q * n + k ]` ); a cell with more says `-1` ( a hundredth of a percent of
 /// the uniform cells, a tenth on the lines: the step treats them as unknown )
 constexpr int EDGE_CAP = 16;
-
-/// WHY A CELL WAS NOT DONE ( the per-cell status, 0 = done )
-enum Status : int {
-    DONE              = 0,
-    SPILL_CAPACITY    = 1,   ///< more vertices than the global-memory pass was given room for: loom runs again with more
-    TOO_MANY_VERTICES = 2,   ///< more than `max_vertices`: a failure ( the error buffer says which cell )
-    FACET_CAPACITY    = 3,   ///< the COO of the facets was full: loom runs again with more
-};
 
 /// what goes to loom's error buffer besides the capacities ( kind 2, `ErrorKind::failure`: `id` is the code below,
 /// `value` the user index of the cell ); the message is Python's ( `PowerDiagram_Bsp._CARD_FAILURES` )
@@ -313,9 +305,8 @@ StridedOut<T,N> strided_out( const View &v ) {
 struct Counters {
     unsigned long long ovf[ 3 ];                         ///< the lists of the second, third and fourth passes
     unsigned long long nb_facets;                        ///< the upper facets the cells WANTED ( maybe more than the COO holds )
-    unsigned long long spill_need;                       ///< the largest capacity a spilled cell asked for ( 0: none )
     unsigned long long nb_failed;                        ///< the cells past `max_vertices`
-    unsigned long long pad[ 2 ];
+    unsigned long long pad[ 3 ];
 };
 
 /// EVERYTHING A CELL READS AND WRITES, by value ( kernel parameters )
@@ -346,8 +337,7 @@ struct Problem {
 
     // ---- what the cells write ( see `Out` )
     StridedOut<TF,1>  res;                               ///< MEASURES
-    int              *status;                            ///< per cell, 0 = done ( may be null )
-    TR               *fi, *fj;                           ///< FACETS: the COO of the upper facets, in ranks
+    TR               *fi, *fj;                          ///< FACETS: the COO of the upper facets, in ranks
     double           *fc;
     unsigned long long fcap;                             ///< ... its capacity
     Counters         *counters;
@@ -362,7 +352,6 @@ struct Problem {
     __device__ __forceinline__ double density() const { return rho_dev ? double( *rho_dev ) : rho; }
     __device__ __forceinline__ Wt weight( TR q ) const { if constexpr ( W ) return w[ q ]; else return Wt{}; }
     __device__ __forceinline__ SI user( TR k ) const { return user_order ? SI( ids( k ) ) : SI( k ); }
-    __device__ __forceinline__ void set_status( TR k, int st ) const { if ( status ) status[ user( k ) ] = st; }
 };
 
 // ---- the cell in registers -------------------------------------------------------------------------------
@@ -985,9 +974,7 @@ __device__ __forceinline__ void finish_cell( const Pb &pb, typename Pb::TR k, co
         if ( cell.nb >= 3 )
             cell.for_each_vertex( [&]( int, auto, auto, TR c ) { nup += c > k; } );
         fbase = reserve( &pb.counters->nb_facets, nup );
-        fok = fbase + nup <= pb.fcap;
-        if ( ! fok )
-            pb.set_status( k, FACET_CAPACITY );
+        fok = fbase + nup <= pb.fcap;                    // else the count says it to loom ( `report_facets` )
     }
     double gk = 0;
     if constexpr ( bool( OUT & VJP ) )
@@ -1058,12 +1045,11 @@ __device__ __forceinline__ void finish_cell( const Pb &pb, typename Pb::TR k, co
     }
 }
 
-/// A CELL THAT COULD NOT BE DONE: zeros where it writes ( never a NaN: the status and the error buffer say why )
+/// A CELL THAT COULD NOT BE DONE: zeros where it writes ( never a NaN: the error buffer says why )
 template<class Pb>
-__device__ __forceinline__ void finish_failed( const Pb &pb, typename Pb::TR k, int st ) {
+__device__ __forceinline__ void finish_failed( const Pb &pb, typename Pb::TR k ) {
     using TF = std::remove_reference_t<decltype( pb.res( 0 ) )>;
     constexpr unsigned OUT = Pb::OUT;
-    pb.set_status( k, st );
     if constexpr ( bool( OUT & MEASURES ) )
         pb.res( pb.user( k ) ) = TF( 0 );
     if constexpr ( bool( OUT & EDGES ) )
@@ -1185,8 +1171,10 @@ __global__ void __launch_bounds__( BLOCK ) second_pass( Pb pb, const typename Pb
 /// count is read on the card.
 ///
 /// THIRD PASS: the vertices in SHARED memory, `shared_cap< TK >()` per warp ( 48 KB per block of four warps ).
-/// FOURTH PASS ( `spill != nullptr` ): the vertices in GLOBAL memory, one slot of `cap` vertices per warp of the grid
-/// ( `WarpCell::bytes_for( cap )` bytes each ); what does not fit there is not lost, it is REPORTED ( see the header ).
+/// FOURTH PASS ( `slots != nullptr` ): the vertices in GLOBAL memory, one slot of `cap` vertices ( the per-cell limit )
+/// per warp of the grid ( `WarpCell::bytes_for( cap )` bytes each, `Overflow` ), the grid being exactly the slots: each
+/// warp takes the cells `gwarp, gwarp + nb_warps, ...` one after the other in its slot -- batches of `nb_warps` cells,
+/// as many as the list needs. A cell that does not fit in its slot has more than the limit: a FAILURE.
 template<class TK>
 constexpr int shared_cap() { return sizeof( TK ) == 4 ? 384 : 256; }
 
@@ -1195,13 +1183,13 @@ constexpr int warp_bytes() { return ( BLOCK / 32 ) * int( WarpCell<TK,TR>::bytes
 
 template<class Pb,class EB>
 __global__ void __launch_bounds__( BLOCK ) warp_pass( Pb pb, const typename Pb::TR *list, int in_list, typename Pb::TR *ovf_list,
-                                                     unsigned char *spill, int cap, int max_vertices, EB errors ) {
+                                                     unsigned char *slots, int cap, EB errors ) {
     using TK = typename Pb::TK;
     using TR = typename Pb::TR;
     extern __shared__ __align__( 16 ) unsigned char shared_bytes_[];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const SI  gwarp = ( SI( blockIdx.x ) * blockDim.x + threadIdx.x ) / 32;
-    unsigned char *mine = spill ? spill + gwarp * WarpCell<TK,TR>::bytes_for( cap )
+    unsigned char *mine = slots ? slots + gwarp * WarpCell<TK,TR>::bytes_for( cap )
                                 : shared_bytes_ + SI( warp ) * WarpCell<TK,TR>::bytes_for( cap );
     const unsigned long long m = pb.counters->ovf[ in_list ];
     for ( unsigned long long i = gwarp; i < m; i += SI( gridDim.x ) * blockDim.x / 32 ) {
@@ -1217,15 +1205,12 @@ __global__ void __launch_bounds__( BLOCK ) warp_pass( Pb pb, const typename Pb::
         if ( lane == 0 ) {
             if ( cell.nb >= 0 )
                 finish_cell( pb, k, cell );
-            else if ( ! spill )                          // the shared pass: the global one has it
+            else if ( ! slots )                          // the shared pass: the global one has it
                 ovf_list[ atomicAdd( &pb.counters->ovf[ 2 ], 1ull ) ] = k;
-            else if ( cap < max_vertices ) {             // the global pass: more room is needed, loom gives it
-                finish_failed( pb, k, SPILL_CAPACITY );
-                atomicMax( &pb.counters->spill_need, ( unsigned long long ) min( 2 * cap, max_vertices ) );
-            } else {                                     // past the hard limit: a failure, said as such
-                finish_failed( pb, k, TOO_MANY_VERTICES );
+            else {                                       // the global pass: past the per-cell limit, a failure said as such
+                finish_failed( pb, k );
                 if ( atomicAdd( &pb.counters->nb_failed, 1ull ) == 0 )
-                    errors.record( ERROR_KIND_FAILURE, FAIL_TOO_MANY_VERTICES, pb.user( k ) );
+                    errors.record( ERROR_KIND_FAILURE, FAIL_TOO_MANY_VERTICES, SI( pb.ids( k ) ) );   // the user's index, whatever the order of the outputs
             }
         }
         __syncwarp();
@@ -1302,6 +1287,35 @@ inline void *take( auto &allocator, SI nb_bytes ) {
 
 inline int blocks_for( SI n ) { return int( ( n + BLOCK - 1 ) / BLOCK ); }
 
+/// THE FOURTH PASS'S BUDGET: `warps` slots of `cap` vertices in global memory, taken ONCE per call and reused by every
+/// diagram of the call ( the cards of a solve share it: they run one after the other on the stream ). `cap` is the
+/// per-cell limit, `warps` Python's choice ( `PowerDiagram_Bsp.card_overflow_warps_for` ): what does not fit in the slots
+/// at once waits for a slot to be free ( `warp_pass` ), it is never a reason to run again.
+struct Overflow {
+    unsigned char *slots = nullptr;
+    SI             bytes = 0;                            ///< what `slots` holds
+    int            cap = 0, warps = 0;
+
+    /// the slots' geometry for `n` seeds: `cap = min( max_vertices, n + 4 )` ( a cell of `n` seeds in a box has at most
+    /// `n + 3` vertices ), `warps` rounded up to whole blocks
+    static Overflow sized( SI n, int warps, int max_vertices ) {
+        Overflow o;
+        o.cap   = int( std::max<SI>( 4, std::min<SI>( max_vertices, n + 4 ) ) );
+        o.warps = ( std::max( 1, warps ) + BLOCK / 32 - 1 ) / ( BLOCK / 32 ) * ( BLOCK / 32 );
+        return o;
+    }
+    template<class TK,class TR>
+    SI bytes_for() const { return WarpCell<TK,TR>::bytes_for( cap ) * warps; }
+
+    /// room for the slots of a `< TK, TR >` cell from the pool ( `false`: the pool said no )
+    template<class TK,class TR>
+    bool take_from( auto &allocator ) {
+        bytes = bytes_for<TK,TR>();
+        slots = static_cast<unsigned char *>( take( allocator, bytes ) );
+        return slots != nullptr;
+    }
+};
+
 /// THE DIAGRAM ON THE CARD, for one call: the kernel's tree and seeds, the lists and counters of the passes, the
 /// global-memory slots of the fourth pass. `prepare` takes it all from the call's allocator and fills the tree and
 /// the seeds; `run` launches the passes -- everything `pb` points to ( the outputs ) is the caller's. Nothing is read
@@ -1319,13 +1333,13 @@ struct Card {
     TR            *lists = nullptr;                      ///< two lists of `n` ranks
     Counters      *counters = nullptr;
     Deferred<TR>   deferred{};
-    unsigned char *spill = nullptr;
-    int            spill_cap = 0, spill_warps = 0, max_vertices = 0;
+    Overflow       overflow{};                           ///< the fourth pass's slots
     SI             nb_nodes = 0;
 
-    /// `spill_cap`: vertices per cell of the fourth pass ( a loom capacity: `min( it, max_vertices )` is used );
-    /// `spill_warps`: how many cells the fourth pass holds at once ( its grid ). `false`: the pool said no.
-    bool prepare( const CudaQueue &queue, const auto &pd, auto &allocator, int spill_cap_, int spill_warps_, int max_vertices_ ) {
+    /// `overflow`: the slots of the fourth pass, already taken ( shared with another card of the call: they must hold
+    /// this card's cells, `bytes_for< TK, TR >` ), or only sized ( `slots == nullptr` ): taken here. `false`: the pool
+    /// said no.
+    bool prepare( const CudaQueue &queue, const auto &pd, auto &allocator, Overflow overflow_ ) {
         static_assert( std::decay_t<decltype( pd )>::ct_dim == 2, "the dedicated GPU cell is 2D" );
         const SI n = SI( pd.nb_seeds() );
         nb_nodes = SI( pd.tree.node_begin.shape( 0 ) );
@@ -1335,9 +1349,11 @@ struct Card {
         if ( depth > V::MAX_HEIGHT || ( std::is_same_v<typename V::TN,int> && nb_nodes > SI( 0x7fffffff ) )
                                    || ( std::is_same_v<TR,int> && n > SI( 0x7fffffff ) - 8 ) )
             throw std::runtime_error( "sdot::gpu2d: the variant chosen does not hold this tree ( see `PowerDiagram_Bsp._card_variant` )" );
-        max_vertices = max_vertices_;
-        spill_cap    = std::max( 4, std::min( spill_cap_, max_vertices ) );
-        spill_warps  = ( std::max( 1, spill_warps_ ) + BLOCK / 32 - 1 ) / ( BLOCK / 32 ) * ( BLOCK / 32 );   // whole blocks
+        overflow = overflow_;
+        if ( overflow.slots && overflow.bytes < overflow.template bytes_for<TK,TR>() )
+            throw std::runtime_error( "sdot::gpu2d: shared overflow slots too small for this card" );
+        if ( ! overflow.slots && ! overflow.template take_from<TK,TR>( allocator ) )
+            return false;
 
         auto *nodes = static_cast<Node<W,TR> *>( take( allocator, SI( sizeof( Node<W,TR> ) ) * nb_nodes ) );
         auto *pos   = static_cast<Pos *>( take( allocator, SI( sizeof( Pos ) ) * n ) );
@@ -1346,8 +1362,7 @@ struct Card {
             w = static_cast<Wt *>( take( allocator, SI( sizeof( Wt ) ) * n ) );
         lists    = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * 2 * n ) );
         counters = static_cast<Counters *>( take( allocator, SI( sizeof( Counters ) ) ) );
-        spill    = static_cast<unsigned char *>( take( allocator, WarpCell<TK,TR>::bytes_for( spill_cap ) * spill_warps ) );
-        if ( ! nodes || ! pos || ( W && ! w ) || ! lists || ! counters || ! spill )
+        if ( ! nodes || ! pos || ( W && ! w ) || ! lists || ! counters )
             return false;
         deferred = Deferred<TR>{ nullptr, nullptr, nullptr, nullptr, n };
         if constexpr ( std::is_same_v<TK,float> ) {
@@ -1401,8 +1416,6 @@ struct Card {
     void run( const CudaQueue &queue, const EB &errors ) {
         const SI n = SI( pb.n );
         zero_fill( queue, counters, SI( sizeof( Counters ) ) );
-        if ( pb.status )
-            zero_fill( queue, pb.status, SI( sizeof( int ) ) * n );
         if ( n == 0 )
             return;
 
@@ -1420,32 +1433,28 @@ struct Card {
             cuda_check( cudaFuncSetAttribute( k3, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes3 ), "shared memory of the warp pass" );
             return resident_grid( k3, BLOCK, bytes3 );
         }();
-        launch_kernel( queue, k3, grid3, BLOCK, bytes3, pb, list2, 1, list1, ( unsigned char * ) nullptr, CAP, max_vertices, errors );
+        launch_kernel( queue, k3, grid3, BLOCK, bytes3, pb, list2, 1, list1, ( unsigned char * ) nullptr, CAP, errors );
 
         if constexpr ( deferring<Pb>() )
             launch_kernel( queue, &finish_pass<Pb>, blocks_for( n ), BLOCK, 0, pb, deferred );
 
-        // fourth pass, one warp per cell in global memory, `spill_warps` at once: launched whatever the count ( it
-        // reads it ), it costs a launch when there is nothing to do
-        launch_kernel( queue, k3, ( spill_warps * 32 + BLOCK - 1 ) / BLOCK, BLOCK, 0, pb, list1, 2, list2, spill, spill_cap, max_vertices, errors );
+        // fourth pass, one warp per cell in global memory, a persistent grid of exactly the slots: launched whatever the
+        // count ( it reads it ), it costs a launch when there is nothing to do
+        launch_kernel( queue, k3, overflow.warps * 32 / BLOCK, BLOCK, 0, pb, list1, 2, list2, overflow.slots, overflow.cap, errors );
 
         static const bool stats = std::getenv( "SDOT_CARD_STATS" ) && *std::getenv( "SDOT_CARD_STATS" ) != '0';
         if ( stats ) {                                   // how many cells each pass left over ( a diagnosis: a read back )
             Counters c;
             read_back( queue, &c, counters, 1 );
-            std::printf( "[card cells] n %lld, over %d registers %llu ( %.2f %% ), over %d registers %llu ( %.3f %% ), over %d shared %llu, "
-                         "spill capacity %d asked %llu, failed %llu, facets %llu\n",
+            std::printf( "[card cells] n %lld, over %d registers %llu ( %.2f %% ), over %d registers %llu ( %.3f %% ), over %d shared %llu "
+                         "( %d slots of %d vertices ), failed %llu, facets %llu\n",
                          ( long long ) n, R1, c.ovf[ 0 ], 100.0 * c.ovf[ 0 ] / n, R2, c.ovf[ 1 ], 100.0 * c.ovf[ 1 ] / n, CAP, c.ovf[ 2 ],
-                         spill_cap, c.spill_need, c.nb_failed, c.nb_facets );
+                         overflow.warps, overflow.cap, c.nb_failed, c.nb_facets );
         }
     }
 
-    /// what the passes ask of loom's capacities, written into their ShapeVars ON THE CARD ( `set` checks the capacity
-    /// and records the overflow: loom runs the call again with more room )
-    void report_spill( const CudaQueue &queue, const auto &sv ) const {
-        launch_kernel( queue, &report_count<std::decay_t<decltype( sdot::kernel_form( queue, MutList(), sv ) )>>, 1, 1, 0,
-                       sdot::kernel_form( queue, MutList(), sv ), &counters->spill_need, 1ull );
-    }
+    /// the upper facets the cells wanted, times `factor`, written into a loom ShapeVar ON THE CARD ( `set` checks the
+    /// capacity and records the overflow: loom runs the call again with more room )
     void report_facets( const CudaQueue &queue, const auto &sv, unsigned long long factor ) const {
         launch_kernel( queue, &report_count<std::decay_t<decltype( sdot::kernel_form( queue, MutList(), sv ) )>>, 1, 1, 0,
                        sdot::kernel_form( queue, MutList(), sv ), &counters->nb_facets, factor );
@@ -1455,9 +1464,6 @@ struct Card {
 /// the types a diagram's tensors give
 template<class PD> using TFOf = typename PD::TF;
 template<class PD> using TIOf = std::remove_const_t<typename std::decay_t<decltype( std::declval<PD>().tree.seed_indices )>::TF>;
-
-/// how many cells the fourth pass holds at once ( its slots ): few, they are rare and big
-constexpr int SPILL_WARPS = 64;
 
 /// the constant density: a number, or a 0-d tensor of the call ( read on the card: its value is not a compile-time
 /// constant of the kernel )
@@ -1473,27 +1479,28 @@ void set_density( Pb &pb, const auto &density ) {
 }
 
 // ---- the entry points of the loom calls ( `PowerDiagram_Bsp.py` ) -------------------------------------------------
+//
+// `max_vertices` ( the per-cell limit ) and `overflow_warps` ( the fourth pass's slots ) are Python's constants
+// ( `card_max_vertices`, `card_overflow_warps_for` ): the forward and the backward use the same scheme.
 
-/// THE MEASURES ( and the per-cell status ) of `pd` on the call's stream. `work.nb_spill`: the capacity of the fourth
-/// pass ( a loom ShapeVar ); `rho`: the constant density.
+/// THE MEASURES of `pd` on the call's stream; `rho`: the constant density.
 template<class V>
-void measures( const CudaQueue &queue, const auto &pd, auto &&res, auto &&work, const auto &errors, auto &allocator, const auto &rho, int max_vertices ) {
+void measures( const CudaQueue &queue, const auto &pd, auto &&res, const auto &errors, auto &allocator, const auto &rho,
+               int max_vertices, int overflow_warps ) {
     using PD = std::decay_t<decltype( pd )>;
     Card<V,PD::has_weights,MEASURES,TFOf<PD>,TIOf<PD>> card;
-    if ( ! card.prepare( queue, pd, allocator, int( std::min<SI>( work.nb_spill.max, max_vertices ) ), SPILL_WARPS, max_vertices ) )
+    if ( ! card.prepare( queue, pd, allocator, Overflow::sized( SI( pd.nb_seeds() ), overflow_warps, max_vertices ) ) )
         return;                                          // the pool said no: `allocator.failed` is reported
     set_density( card.pb, rho );
-    card.pb.res    = strided_out<TFOf<PD>,1>( res );
-    card.pb.status = reinterpret_cast<int *>( work.status.data().raw );
+    card.pb.res = strided_out<TFOf<PD>,1>( res );
     card.run( queue, sdot::kernel_form( queue, MutList(), errors ) );
-    card.report_spill( queue, work.nb_spill );
 }
 
-/// THE ADJOINT OF THE MEASURES: `grad_res` ( user order ) -> the gradients of the sorted positions and weights. A
-/// backward cannot run again with more room: its fourth pass is given the hard limit ( on fewer warps ).
+/// THE ADJOINT OF THE MEASURES: `grad_res` ( user order ) -> the gradients of the sorted positions and weights. The
+/// same passes and the same fourth-pass budget as the forward.
 template<class V>
 void measures_vjp( const CudaQueue &queue, const auto &pd, const auto &grad_res, auto &&grad_pos, auto &&grad_w, const auto &errors,
-                   auto &allocator, const auto &rho, int max_vertices ) {
+                   auto &allocator, const auto &rho, int max_vertices, int overflow_warps ) {
     using PD = std::decay_t<decltype( pd )>;
     using TF = TFOf<PD>;
     constexpr bool W = PD::has_weights;
@@ -1506,7 +1513,7 @@ void measures_vjp( const CudaQueue &queue, const auto &pd, const auto &grad_res,
         if constexpr ( has_gw ) zero_fill( queue, const_cast<void *>( ( const void * ) grad_w.data().raw ), SI( sizeof( TF ) ) * SI( pd.nb_seeds() ) );
     } else {
         Card<V,W,VJP,TF,TIOf<PD>> card;
-        if ( ! card.prepare( queue, pd, allocator, max_vertices, 8, max_vertices ) )
+        if ( ! card.prepare( queue, pd, allocator, Overflow::sized( SI( pd.nb_seeds() ), overflow_warps, max_vertices ) ) )
             return;
         set_density( card.pb, rho );
         card.pb.g        = strided( grad_res );

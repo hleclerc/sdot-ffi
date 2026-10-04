@@ -940,3 +940,53 @@ hand-written Galerkin product, one warp per coarse row with fixed-point hashing:
 * Float levels: a preconditioner in float on a system that needs 1e-6; same counts as double on the four cases and the tests.
 * The stagnating case ( lines equal ) moves its counts with any change of the solver ( above ).
 * `lmo:/home/leclerc/lindump` ( 0.73 GB of dumped systems ) and `lmo:/home/leclerc/linbench` are left for further work.
+
+# GPU step 6: overflow passes ( 2026-10-04 )
+
+The fourth pass of the 2D card cells ( `gpu/Cell2D.cuh`, one warp per cell, vertices in global memory ) no longer has a
+CAPACITY. Before: a loom ShapeVar `nb_spill` ( vertices per cell, 1024 by default ), a cell that did not fit wrote a status
+and asked for more through the error buffer, and loom RAN THE WHOLE CALL AGAIN ( eager; raised under jit ) -- for the card's
+Newton, the whole solve. Now:
+
+* ONE FIXED BUDGET per call ( `Cell2D.cuh::Overflow` ): `warps` slots of `cap = min( card_max_vertices, n + 4 )` vertices
+  ( a cell of `n` seeds in a box has at most `n + 3` ), taken once from the call's pool. `warps` is Python's
+  ( `PowerDiagram_Bsp.card_overflow_warps_for`: 64, fewer if the slots would pass `card_overflow_bytes` = 256 MB, at least 4 ):
+  58.7 MB for the float / int variant at the default limit of 32768, 117 MB for double / long long, less on small `n`.
+* The fourth pass is a PERSISTENT grid of exactly the slots, striding over the list the third pass filled on the card: the
+  cells go through in batches of `warps`, a warp taking its next cell into the slot it freed. No estimate, no read back, no
+  second run, the same under jit.
+* The only loom interaction left is a FAILURE: a cell past the limit writes zeros and records `ErrorKind::failure` with the
+  seed's USER index ( also in Newton, whose outputs are in ranks ): `KernelFailure` "more than N vertices ( seed k )", eager
+  and traced; Newton stops at once with `status = failure` ( `S_FAILURE`, was `S_CAPACITY` ).
+* The forward, the backward ( `measures_vjp`, which had 8 slots of `max_vertices` ) and the card Newton use the same scheme;
+  the Newton takes ONE budget for its three cards ( float, double, moments ), sized on the widest.
+
+Removed: `nb_spill` ( C++, `_CardWork`, `_CardSolveWork` ), `card_spill_capacity`, `Card::report_spill`, `Counters::spill_need`,
+`SPILL_WARPS`, the per-cell `status` vector ( `Status` enum, `Problem::status`, `_card_status`, `SdotPlanNd.card_status`,
+`scatter_status` ): with no capacity left on the cells it only repeated what the error buffer raises ( the facets' COO overflow
+is told to loom by its own ShapeVar `nb_nnz` / `nb_facets` ), and dropping it saves a zero fill of `n` ints per diagram.
+
+Tests ( lmo-jax, green: `test_CardCells`, `test_SdotPlanNd`; local jax CPU `test_SdotPlanNd` green ):
+`the_card_fourth_pass_works_in_batches` ( 24 rings of 400 through 4 slots, six batches: the generic plain cells, and the same
+bits as 64 slots for the measures and the adjoint, both kernels ), `the_card_raises_past_the_vertex_limit` ( eager, jit, jit of
+a grad ), `the_card_solve_on_rings_in_batches_and_past_the_limit` ( 6 rings of 600 through 4 slots: converges fp64 / fp32,
+jit = eager to the bit; limit 256: `KernelFailure` naming a centre, eager and jit ).
+
+Timings ( errand bench, lmo, before -> after ):
+
+| bench | before | after |
+|---|---|---|
+| bench_diagram uniform 1e6 float, kernel ns/seed | 9.1 | 9.1 |
+| ... vjp float | 12.3 | 12.3 |
+| ... double | 56.4 | 57.0 |
+| ... vjp double | 57.5 | 58.1 |
+| bench_newton uniform 1e6 float limits, jit wall ( t_diag ) | 0.435 s ( 0.070 ) | 0.438 s ( 0.071 ) |
+| bench_newton lines_voronoi float limits, jit wall ( t_diag ) | 0.299 s ( 0.060 ) | 0.301 s ( 0.060 ) |
+
+Within noise ( same counts: 5 / 6 and 12 / 13 iterations / diagrams ). On the campaign's clouds no cell reaches the fourth pass:
+it is one launch that reads a zero count, as before.
+
+Risks: the budget is taken from XLA's pool at every call ( 59-117 MB at the default limit: a pool refusal is reported by loom as
+an allocation failure, not a capacity ); a cloud with thousands of 400+-gons runs them 64 at a time ( slow, still correct ); a
+`card_max_vertices` below the third pass's 384 / 256 lets cells up to that size through ( as before ). The traced failure leaves
+JAX's ordered-effect token poisoned, so the process prints an ignored `JaxRuntimeError` at exit ( as the traced capacity error did ).

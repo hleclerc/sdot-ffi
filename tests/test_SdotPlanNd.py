@@ -551,7 +551,6 @@ if test( "the_card_solves_the_transport" ):
         # the cells of these weights, measured by the generic path, are the targets
         g = _generic_measures( pos, w )
         assert numpy.abs( g - nu ).max() < 1e-8 / n, ( name, numpy.abs( g - nu ).max() * n )
-        assert not numpy.asarray( plan.card_status.raw ).any(), name
         # the moments: barycentres inside the box, the cost positive, the history readable
         bary = numpy.asarray( plan.barycenters )
         assert bary.min() > 0 and bary.max() < 1 and float( plan.cost ) > 0, name
@@ -687,34 +686,61 @@ if test( "the_card_solve_runs_under_jit" ):
     assert numpy.array_equal( numpy.asarray( wj2 ), numpy.asarray( wj ) )
 
 
-if test( "the_card_solve_grows_its_capacities_on_rings" ):
+if test( "the_card_solve_on_rings_in_batches_and_past_the_limit" ):
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
-    # a seed in the middle of a ring of 2000 ( its cell has 2000 vertices: the fourth pass of the cells, in global memory ),
-    # with a capacity too small for it: the solve asks loom for more ( eagerly: the call runs again ), and converges
+    # seeds in the middle of rings of 600 ( 600-gons: past the shared-memory pass, into the fourth one, in global memory ),
+    # six of them through FOUR slots: the fourth pass of every diagram works in batches, within its fixed budget ( no
+    # capacity, no second run ), and the solve converges, eager and under jit
     import sys
+    import jax
+    from loom.drivers.CallArg_Errors import KernelFailure
     bsp = sys.modules[ "sdot.PowerDiagram_Bsp" ]
     rng = numpy.random.default_rng( 104 )
-    k = 2000
-    a = 2 * numpy.pi * ( numpy.arange( k ) + rng.uniform( -0.1, 0.1, k ) ) / k
-    ring = 0.5 + 0.2 * numpy.stack( [ numpy.cos( a ), numpy.sin( a ) ], axis = 1 )
+    k, r = 600, 0.1
+    centres = numpy.array( [ [ 0.2, 0.25 ], [ 0.5, 0.25 ], [ 0.8, 0.25 ], [ 0.2, 0.75 ], [ 0.5, 0.75 ], [ 0.8, 0.75 ] ] )
+    parts = [ centres ]
+    for c in centres:
+        a = 2 * numpy.pi * ( numpy.arange( k ) + rng.uniform( -0.1, 0.1, k ) ) / k
+        parts.append( c + r * numpy.stack( [ numpy.cos( a ), numpy.sin( a ) ], axis = 1 ) )
     back = rng.uniform( 0.001, 0.999, size = ( 3000, 2 ) )
-    back = back[ numpy.linalg.norm( back - 0.5, axis = 1 ) > 0.3 ]
-    pos = numpy.concatenate( [ [ [ 0.5, 0.5 ] ], ring, back ] )
+    parts.append( back[ numpy.linalg.norm( back[ :, None, : ] - centres[ None ], axis = 2 ).min( axis = 1 ) > 1.3 * r ] )
+    pos = numpy.concatenate( parts )
     n = len( pos )
-    original = bsp.PowerDiagram_Bsp.card_spill_capacity
+    original = bsp.PowerDiagram_Bsp.card_overflow_warps
     try:
-        bsp.PowerDiagram_Bsp.card_spill_capacity = 256
+        bsp.PowerDiagram_Bsp.card_overflow_warps = 4
         for precision in ( "fp64", "fp32" ):
-            plan = OtProblem( SumOfDiracs( pos ), _box_target() ).solve( Iterative( tol = 1e-9 / n, max_iter = 100, precision = precision ) )
+            def solve( masses ):
+                plan = OtProblem( SumOfDiracs( pos, masses ), _box_target() ).solve( Iterative( tol = 1e-9 / n, max_iter = 100, precision = precision ) )
+                return plan
+            plan = solve( numpy.ones( n ) )
             assert plan.converged, ( precision, plan.stats )
             w = numpy.asarray( plan.weights ).reshape( -1 )
             g = _generic_measures( pos, w )
             ok = ~numpy.isnan( g )                                # ( the generic path's NaN cells on rings, see `test_CardCells` )
             assert numpy.abs( g[ ok ] - 1 / n ).max() < 1e-7 / n, ( precision, numpy.abs( g[ ok ] - 1 / n ).max() * n )
+            wj = jax.jit( lambda m: solve( m ).weights.raw )( numpy.ones( n ) )
+            assert numpy.array_equal( numpy.asarray( wj ).reshape( -1 ), w ), precision
     finally:
-        bsp.PowerDiagram_Bsp.card_spill_capacity = original
+        bsp.PowerDiagram_Bsp.card_overflow_warps = original
+    # past the vertex limit: a `KernelFailure` naming a centre, eager and under jit ( never a NaN, never a second run )
+    original = bsp.PowerDiagram_Bsp.card_max_vertices
+    try:
+        bsp.PowerDiagram_Bsp.card_max_vertices = 256
+        for run in ( lambda m: OtProblem( SumOfDiracs( pos, m ), _box_target() ).solve( Iterative( tol = 1e-9 / n, max_iter = 100 ) ).weights.raw, ):
+            for fn in ( run, jax.jit( run ) ):
+                try:
+                    numpy.asarray( fn( numpy.ones( n ) ) )
+                    raise AssertionError( "a cell past the vertex limit went through" )
+                except AssertionError:
+                    raise
+                except Exception as e:
+                    assert "more than 256 vertices" in str( e ) and any( f"seed { c }" in str( e ) for c in range( len( centres ) ) ), str( e )
+                    assert fn is not run or isinstance( e, KernelFailure ), type( e )
+    finally:
+        bsp.PowerDiagram_Bsp.card_max_vertices = original
 
 
 if test( "the_card_refuses_what_it_does_not_solve" ):

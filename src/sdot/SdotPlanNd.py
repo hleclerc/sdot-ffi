@@ -187,13 +187,8 @@ def card_facet_capacity( nb_seeds ):
 
 
 class _CardSolveWork( Aggregate ):
-    """what the card's solve writes besides its results: the STATUS of each cell at the last diagram ( 0 = done,
-    `Cell2D.cuh::Status` ), and two capacities that a diagram may ask loom to grow ( `nb_spill`: vertices per cell of the
-    fourth pass; `nb_facets`: the upper facets of a diagram )"""
-    status    : IntTensor[ "num_point", dict( size = 32 ) ]
-    num_point : Axis[ "nb_points" ]
-    nb_points : ShapeVar
-    nb_spill  : ShapeVar
+    """what the card's solve writes besides its results: the capacity that a diagram may ask loom to grow ( `nb_facets`:
+    the upper facets of a diagram; the cells' fourth pass has a fixed budget, `PowerDiagram_Bsp.card_overflow_warps_for` )"""
     nb_facets : ShapeVar
 
 
@@ -454,6 +449,8 @@ class SdotPlanNd:
             variant = f"{ card_variant_for( 32, n, nodes ) }, { card_variant_for( 64, n, nodes ) }"
         else:
             variant = card_variant_for( 32 if settings.precision == "fp32" else 64, n, nodes )
+        # the cells' fourth pass: one budget for every diagram of the solve, sized on the widest kernel it runs
+        overflow_warps = pd._card_overflow_warps( card_variant_for( 32 if settings.precision == "fp32" else 64, n, nodes ) )
 
         # the linear solver: the card's ( `Linear2D.cuh` ), or a CPU one of `Linear.cpp` on a copy of the laplacian
         lin_name = tun.linear_solver
@@ -490,9 +487,9 @@ class SdotPlanNd:
         cost        = RealTensor()
         stats = RealTensor[ Axis( ShapeVar( len( _STATS ) ), name = "num_stat" ) ]()
         w0 = RealTensor[ pd.num_point ]( pd.weights.raw )
-        work = _CardSolveWork( nb_points = n )
+        work = _CardSolveWork()
         pd_expr, pd_kwargs, pd_produced = pd._solver_weights_call()
-        maxv = int( pd.card_max_vertices )
+        limits = f"{ int( pd.card_max_vertices ) }, { overflow_warps }"
 
         loom.ffi_call(
             "sdotplan_solve_card_2d",
@@ -500,7 +497,7 @@ class SdotPlanNd:
                 f"sdot::gpu2d::solve<{ variant }>( queue, args.inputs.power_diagram, args.inputs.nu, args.inputs.w0, args.inputs.options, "
                 "args.outputs.weights, args.outputs.history, args.outputs.stats, args.outputs.cell_masses, args.outputs.barycenters, "
                 "args.outputs.cost, args.outputs.sorted_weights_out, args.outputs.node_wa_out, args.outputs.node_wb_out, args.outputs.work, "
-                f"args.errors, args.allocator, args.inputs.density, { maxv } );",
+                f"args.errors, args.allocator, args.inputs.density, { limits } );",
                 includes = [ "sdot/gpu/Newton2D.cuh" ], sources = [ "sdot/sdotplan/Linear.cpp" ], allocator = True ),
             failures = pd._card_failures(),
             power_diagram = pd,
@@ -516,13 +513,10 @@ class SdotPlanNd:
             cell_masses = loom.out( cell_masses ),
             barycenters = loom.out( barycenters ),
             cost = loom.out( cost ),
-            work = loom.out( work, capacities = { "nb_spill": int( pd.card_spill_capacity ), "nb_facets": card_facet_capacity( n ) } ),
+            work = loom.out( work, capacities = { "nb_facets": card_facet_capacity( n ) } ),
             **pd_kwargs,
         )
         pd._solver_weights_after( pd_produced )
-        if not driver.is_traced( work.status.raw ):
-            #: the per-cell status of the last diagram of the card's solve ( 0: done, `Cell2D.cuh::Status` )
-            self.card_status = work.status
         self.weights = weights
         self.cell_masses = cell_masses
         self.barycenters = barycenters

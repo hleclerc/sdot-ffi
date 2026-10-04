@@ -9,9 +9,9 @@ float kernel, is the DOUBLE's rounding ( the vertices are re-solved in double ),
 different topology.
 
 The four properties the dedicated path owes ( and that these tests pin ): it runs UNDER `jit` and under a
-derivative ( an ffi call with its own adjoint ); nothing is read back, an overflow asks loom for room through the
-error buffer and gets it ( eager ) or raises ( traced ); the index types follow the tree ( no depth limit ); a cell past
-the vertex limit is an ERROR, never a NaN.
+derivative ( an ffi call with its own adjoint ); nothing is read back and nothing runs again, the last overflow pass
+working through its cells in batches within a fixed budget; the index types follow the tree ( no depth limit ); a cell
+past the vertex limit is an ERROR ( `KernelFailure`, eager and traced ), never a NaN.
 
 Every test skips itself without a CUDA device ( the path does not exist on a CPU ) -- but the one on the choice of the
 variant, which is pure Python.
@@ -60,7 +60,6 @@ def _check( pos, w = None, mi = ( 0, 0 ), ma = ( 1, 1 ), tol64 = 1e-9, tol32_med
         m = _m( pd )
         assert m.dtype == numpy.float64
         assert not numpy.isnan( m ).any(), label
-        assert not numpy.asarray( pd._card_status.raw ).any(), ( label, "a cell was not done" )
         # the empty cells are empty on both sides
         assert ( ( m > 0 ) == ( ref > 0 ) ).mean() > 0.999, ( label, kernel )
         r = _rel( m, ref )
@@ -138,7 +137,7 @@ if test( "the_card_cells_overflow_into_the_later_passes" ):
         skip( _NO_GPU )
     else:
         # k > 8: second pass, k > 16: third pass ( shared memory ), k > 256 ( double ) / 384 ( float ): the fourth one
-        # ( global memory, `card_spill_capacity` vertices per cell )
+        # ( global memory, slots of `card_max_vertices` vertices )
         rng = numpy.random.default_rng( 2 )
         for k in ( 12, 40, 100, 300 ):
             pos = _ring( k, rng )
@@ -245,7 +244,6 @@ if test( "the_card_laplacian_is_the_generic_one" ):
                 pd = _pd( pos, w, kernel, True, tree = tree )
                 out = pd._card_cells( facets = True, moments = False )
                 assert out is not None, label
-                assert not numpy.asarray( pd._card_status.raw ).any(), ( label, kernel )
                 assert _rel( numpy.asarray( out[ "measures" ].raw ).reshape( -1 ), ref_m ).max() < ( 1e-9 if kernel == "FP64" else 1e-6 )
                 row, col, val, dia = _card_laplacian( out, n )
                 # sorted columns, no duplicate, no self loop
@@ -384,7 +382,50 @@ if test( "the_card_runs_under_jit" ):
 
 # ---- capacities, limits, variants ----------------------------------------------------------------------------------
 
-if test( "the_card_grows_its_capacity_and_raises_past_the_limit" ):
+if test( "the_card_fourth_pass_works_in_batches" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        # MANY cells past the shared-memory pass ( 24 centres of rings of 400: 400-gons, over the 384 / 256 vertices of the
+        # third pass ), through FOUR slots of the fourth pass: six batches in one launch, no capacity, no second run. The
+        # same cells as the generic path, and the same bits as with 64 slots ( one batch ), for the measures and the adjoint.
+        import sys
+        bsp = sys.modules[ "sdot.PowerDiagram_Bsp" ]           # the module ( `sdot.PowerDiagram_Bsp` is also the class )
+        rng = numpy.random.default_rng( 14 )
+        k, r = 400, 0.04
+        centres = numpy.stack( numpy.meshgrid( ( numpy.arange( 6 ) + 0.5 ) / 6, ( numpy.arange( 4 ) + 0.5 ) / 4 ), axis = -1 ).reshape( -1, 2 )
+        rings = []
+        for c in centres:
+            a = 2 * numpy.pi * ( numpy.arange( k ) + rng.uniform( -0.1, 0.1, k ) ) / k
+            rings.append( c + r * numpy.stack( [ numpy.cos( a ), numpy.sin( a ) ], axis = 1 ) )
+        pos = numpy.concatenate( [ centres ] + rings )
+        n = len( pos )
+        w = rng.uniform( -0.1, 0.1, n ) * r * r / k
+        w[ :len( centres ) ] = 0
+        tree = AaBsp( pos, w )
+        g = rng.normal( size = n )
+        assert bsp.card_overflow_warps_for( "sdot::gpu2d::Variant<double, int, int, 32>", n, 1 << 15, 4 ) == 4
+        original = bsp.PowerDiagram_Bsp.card_overflow_warps
+        try:
+            got = {}
+            for warps in ( 4, 64 ):
+                bsp.PowerDiagram_Bsp.card_overflow_warps = warps
+                if warps == 4:
+                    ref = _check( pos, w, label = "24 rings of 400, 4 slots", plain = True )
+                    apothem = 0.5 * r                    # ( the centres' weights are zero, the ring's tiny )
+                    assert numpy.abs( ref[ :len( centres ) ] / ( k * apothem ** 2 * numpy.tan( numpy.pi / k ) ) - 1 ).max() < 0.05
+                for kernel in ( "FP64", "FP32" ):
+                    m = _m( _pd( pos, w, kernel, True, tree = tree ) )
+                    _, pb = driver.vjp( _measures_fn( pos, w, tree, kernel, True, "weights" ), w )
+                    got[ warps, kernel ] = ( m, numpy.asarray( pb( g )[ 0 ] ) )
+        finally:
+            bsp.PowerDiagram_Bsp.card_overflow_warps = original
+        for kernel in ( "FP64", "FP32" ):
+            for a, b in zip( got[ 4, kernel ], got[ 64, kernel ] ):
+                assert numpy.isfinite( a ).all() and numpy.array_equal( a, b ), kernel
+            assert numpy.abs( got[ 4, kernel ][ 1 ] ).max() > 0, kernel
+
+if test( "the_card_raises_past_the_vertex_limit" ):
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -395,14 +436,13 @@ if test( "the_card_grows_its_capacity_and_raises_past_the_limit" ):
         tree = AaBsp( pos, None )
         ref = _m( _pd( pos, None, "FP64", False, tree = tree ) )
         for kernel in ( "FP64", "FP32" ):
-            # a capacity too small for the centre ( a 3000-gon ): the kernel asks loom for more, eagerly, until it fits
+            # a 3000-gon under the default limit: through the fourth pass, at once
             pd = _pd( pos, None, kernel, True, tree = tree )
-            pd.card_spill_capacity = 64
             m = _m( pd )
             r = _rel( m, ref )
             assert not numpy.isnan( m ).any() and r.max() < ( 1e-9 if kernel == "FP64" else 1e-6 ), ( kernel, r.max() )
-            assert not numpy.asarray( pd._card_status.raw ).any() and abs( m[ 0 ] - 3000 * 0.01 * numpy.tan( numpy.pi / 3000 ) ) < 1e-3 * m[ 0 ]
-            # past the hard limit: an error that says so ( and never a NaN )
+            assert abs( m[ 0 ] - 3000 * 0.01 * numpy.tan( numpy.pi / 3000 ) ) < 1e-3 * m[ 0 ]
+            # past the hard limit: an error that says so and names the seed ( and never a NaN )
             pd = _pd( pos, None, kernel, True, tree = tree )
             pd.card_max_vertices = 1024
             try:
@@ -410,21 +450,22 @@ if test( "the_card_grows_its_capacity_and_raises_past_the_limit" ):
                 raise AssertionError( "a cell past the vertex limit went through" )
             except KernelFailure as e:
                 assert "more than 1024 vertices" in str( e ) and "seed 0" in str( e ), str( e )
-            # under a trace, a capacity cannot grow: it raises instead of returning a truncated result
-            # ( a tree of its own: setting traced weights leaves tracers in the tree's majorants )
+            # ... under a trace too, and under a derivative ( a tree of its own: setting traced weights leaves tracers in
+            # the tree's majorants )
             pd = _pd( pos, numpy.zeros( len( pos ) ), kernel, True, tree = AaBsp( pos, numpy.zeros( len( pos ) ) ) )
-            pd.card_spill_capacity = 64
+            pd.card_max_vertices = 1024
 
             def f( q ):
                 pd.weights = q
                 return pd.measures.value
-            try:
-                numpy.asarray( jax.jit( f )( numpy.zeros( len( pos ) ) ) )
-                raise AssertionError( "a capacity overflow under jit went through" )
-            except AssertionError:
-                raise
-            except Exception as e:
-                assert "capacity" in str( e ), str( e )
+            for fn in ( jax.jit( f ), jax.jit( jax.grad( lambda q: ( f( q ) * q ).sum() ) ) ):
+                try:
+                    numpy.asarray( fn( numpy.zeros( len( pos ) ) ) )
+                    raise AssertionError( "a cell past the vertex limit went through under jit" )
+                except AssertionError:
+                    raise
+                except Exception as e:
+                    assert "more than 1024 vertices" in str( e ) and "seed 0" in str( e ), str( e )
 
 if test( "the_card_variant_follows_the_inputs" ):
     # pure Python: the variant chosen from the seeds and the tree, synthetic sizes past 32-bit indices and depth 32
