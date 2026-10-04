@@ -128,7 +128,10 @@ if test( "the_card_cells_are_the_generic_cells_with_weights" ):
         pos = rng.uniform( 0.001, 0.999, size = ( n, 2 ) )
         # weights of the order of a cell ( a Laguerre diagram ), then LARGE in the absolute ( a smooth potential:
         # what the weight difference carried exactly is for ), some cells empty
-        _check( pos, rng.uniform( -0.3, 0.3, n ) / n, label = "w ~ h^2" )
+        # ( `tol64`: the generic path's own gap to the exact plain storage is 2e-9 on the almost empty cells of this cloud,
+        # and it moves with the majorants -- they change the order of the cuts, hence their rounding: 0.98e-9 with the
+        # host's per-node majorants, 1.1e-9 with the build's )
+        _check( pos, rng.uniform( -0.3, 0.3, n ) / n, label = "w ~ h^2", tol64 = 3e-9 )
         _check( pos, 0.13 * numpy.sin( 3 * pos[ :, 0 ] ) + rng.uniform( -1, 1, n ) / n, label = "w ~ 0.13" )
         _check( pos, rng.uniform( -3, 3, n ) / n, label = "w ~ 3 h^2 ( empty cells )" )
 
@@ -378,6 +381,180 @@ if test( "the_card_runs_under_jit" ):
             fp = _measures_fn( pos, w, tree, kernel, True, "positions" )
             gp = numpy.asarray( jax.jit( jax.grad( lambda x: ( fp( x ) * g ).sum() ) )( pos ) )
             assert numpy.isfinite( gp ).all() and numpy.abs( gp ).max() > 0, kernel
+
+
+# ---- the tree, built on the card ( `gpu/Bsp2D.cuh` ) -------------------------------------------------------------
+#
+# The card's tree is the host's ( the per-level kernel `bsp_build_level.h`, with numpy for the top levels on a card ) as
+# soon as the coordinates along every cut are distinct: the same slices, boxes, cuts, the same seeds in each leaf ( their
+# order inside a leaf differs ). On ties at a median the two pick different halves of the tied seeds, so a tied cloud is
+# checked on the RULE instead: tight boxes, the median cut on the first longest axis, the halves on either side of it.
+
+def _tree( t ):
+    """the tensors of a tree, on the host"""
+    a = lambda x: numpy.asarray( x ).reshape( -1 )
+    d = int( t.nb_dims.value )
+    return dict( seed = a( t.seed_indices ).astype( numpy.int64 ), beg = a( t.node_begin ), end = a( t.node_end ),
+                 left = a( t.node_left ), right = a( t.node_right ), box = numpy.asarray( t.node_box ).reshape( -1, 2, d ),
+                 rank = a( t.rank_of_seeds() ).astype( numpy.int64 ) )
+
+
+def _host_tree( pos, leaf = 10 ):
+    """the host's tree ( `AaBsp._build_in_kernel`, what a card built before )"""
+    from sdot.AaBsp import _build_in_kernel
+    r = _build_in_kernel( pos, None, leaf )
+    return dict( seed = r[ "seed_indices" ], beg = r[ "node_begin" ], end = r[ "node_end" ], left = r[ "node_left" ], right = r[ "node_right" ],
+                 box = r[ "node_box" ] )
+
+
+def _check_tree_rule( pos, t, leaf = 10 ):
+    """the tree of `pos` by its rule ( see above ), whatever the side of the tied seeds"""
+    from sdot import AaBsp as Bsp
+    n = len( pos )
+    depth = Bsp.max_depth_for( n, leaf )
+    assert len( t[ "beg" ] ) == 2 ** depth - 1
+    assert numpy.array_equal( numpy.sort( t[ "seed" ] ), numpy.arange( n ) ), "a permutation"
+    assert numpy.array_equal( t[ "rank" ][ t[ "seed" ] ], numpy.arange( n ) ), "its inverse"
+    p = pos[ t[ "seed" ] ]
+    stack = [ ( 0, depth, 0, n ) ]                       # ( preorder index, height, the slice the parent gave )
+    while stack:
+        i, h, b, e = stack.pop()
+        assert ( t[ "beg" ][ i ], t[ "end" ][ i ] ) == ( b, e ), ( i, h )
+        if e > b:
+            lo, hi = p[ b:e ].min( axis = 0 ), p[ b:e ].max( axis = 0 )
+            assert numpy.array_equal( t[ "box" ][ i, 0 ], lo ) and numpy.array_equal( t[ "box" ][ i, 1 ], hi ), ( i, "the box" )
+        if h == 1:
+            assert t[ "left" ][ i ] == -1 and t[ "right" ][ i ] == -1
+            continue
+        assert t[ "left" ][ i ] == i + 1 and t[ "right" ][ i ] == i + 2 ** ( h - 1 ), i
+        m = e
+        if e > b:
+            ax = int( numpy.argmax( hi - lo ) )
+            if e - b > leaf and hi[ ax ] > lo[ ax ]:
+                m = b + ( e - b ) // 2
+                assert p[ b:m, ax ].max() <= p[ m:e, ax ].min(), ( i, "the median cut" )
+        stack += [ ( i + 1, h - 1, b, m ), ( i + 2 ** ( h - 1 ), h - 1, m, e ) ]
+
+
+def _same_tree( a, b ):
+    """the same nodes, and the same seeds in each leaf"""
+    for key in ( "beg", "end", "left", "right" ):
+        assert numpy.array_equal( a[ key ], b[ key ] ), key
+    assert numpy.array_equal( a[ "box" ], b[ "box" ] ), "the boxes"
+    for i in numpy.nonzero( ( a[ "left" ] < 0 ) & ( a[ "end" ] > a[ "beg" ] ) )[ 0 ]:
+        sl = slice( a[ "beg" ][ i ], a[ "end" ][ i ] )
+        assert numpy.array_equal( numpy.sort( a[ "seed" ][ sl ] ), numpy.sort( b[ "seed" ][ sl ] ) ), ( i, "a leaf's seeds" )
+
+
+def _tied_clouds( rng ):
+    """clouds with ties at the medians: a grid ( equal coordinates ), the grid's points repeated ( equal seeds ), a vertical
+    line, a heap of one point plus a few others ( a node that cannot be cut, propagated ), lines on a coarse lattice"""
+    g = numpy.stack( numpy.meshgrid( numpy.arange( 60 ), numpy.arange( 40 ) ), axis = -1 ).reshape( -1, 2 ) / 61.0 + 0.01
+    line = numpy.stack( [ numpy.full( 3000, 0.5 ), rng.uniform( 0, 1, 3000 ) ], axis = 1 )
+    heap = numpy.concatenate( [ numpy.full( ( 700, 2 ), 0.25 ), rng.uniform( 0, 1, size = ( 300, 2 ) ) ] )
+    lat = numpy.round( _lines( 5000, rng ) * 64 ) / 64
+    return [ ( "grid", g ), ( "grid repeated", numpy.concatenate( [ g, g, g ] ) ), ( "vertical line", line ), ( "heap", heap ),
+             ( "lines on a lattice", lat ), ( "negative and zero", numpy.concatenate( [ g - 0.5, -g, numpy.zeros( ( 30, 2 ) ) ] ) ) ]
+
+
+if test( "the_card_tree_is_the_host_tree" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        rng = numpy.random.default_rng( 20 )
+        clouds = [ ( label, pos ) for label, pos, _ in _clouds( rng ) ] + [
+            ( "uniform 30000", rng.uniform( 0, 1, size = ( 30000, 2 ) ) ),
+            ( "all in the per-level kernel", rng.uniform( -2, 3, size = ( 500, 2 ) ) ),
+            ( "clustered", numpy.concatenate( [ c + 1e-4 * rng.normal( size = ( 2000, 2 ) ) for c in rng.uniform( 0, 1, size = ( 6, 2 ) ) ] ) ) ]
+        clouds += [ ( f"n = { n }", rng.uniform( 0, 1, size = ( n, 2 ) ) ) for n in ( 1, 2, 9, 10, 11, 21, 64, 1000 ) ]
+        for label, pos in clouds:
+            for leaf in ( 10, 3 ):
+                card = _tree( AaBsp( pos, max_seeds_per_leaf = leaf ) )
+                _check_tree_rule( pos, card, leaf )
+                _same_tree( card, _host_tree( pos, leaf ) )
+            print( f"  { label }: the host's tree" )
+
+if test( "the_card_tree_follows_the_rule_on_ties" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        rng = numpy.random.default_rng( 21 )
+        for label, pos in _tied_clouds( rng ):
+            t = _tree( AaBsp( pos ) )
+            _check_tree_rule( pos, t )
+            # the same slice SIZES as the host's where no tie decides which nodes hold only equal seeds ( the heap: the same
+            # propagated nodes; elsewhere the sizes follow from `n` alone )
+            if label in ( "grid", "grid repeated", "vertical line", "heap" ):
+                h = _host_tree( pos )
+                assert numpy.array_equal( t[ "end" ] - t[ "beg" ], h[ "end" ] - h[ "beg" ] ), label
+            # the same bits at every call
+            again = _tree( AaBsp( pos ) )
+            assert all( numpy.array_equal( t[ k ], again[ k ] ) for k in t ), label
+            print( f"  { label }: the rule holds" )
+        # the cells of a tied cloud ( the grid: equal coordinates, distinct seeds ) through the card's tree are the generic ones
+        g = _tied_clouds( rng )[ 0 ][ 1 ]
+        _check( g + 1e-3 * rng.uniform( 0, 1, size = g.shape ) * ( rng.uniform( size = ( len( g ), 1 ) ) < 0.5 ), label = "grid, half jittered" )
+        _check( g, label = "grid" )
+
+if test( "the_card_tree_majorants_bound_the_weights" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        # a tree built with weights: its majorants are `Majorant2D.cuh`'s, valid on every node, and those of the same
+        # weights refreshed on a tree built without
+        rng = numpy.random.default_rng( 22 )
+        n = 8000
+        pos = rng.uniform( 0.001, 0.999, size = ( n, 2 ) )
+        for label, w in ( ( "smooth", 0.1 * numpy.sin( 5 * pos[ :, 0 ] ) + 0.05 * pos[ :, 1 ] ), ( "random", rng.uniform( -1, 1, n ) / n ),
+                          ( "constant", numpy.full( n, 0.25 ) ) ):
+            tree = AaBsp( pos, w )
+            t = _tree( tree )
+            wa, wb = numpy.asarray( tree.node_wa ).reshape( -1, 2 ), numpy.asarray( tree.node_wb ).reshape( -1 )
+            p, q = pos[ t[ "seed" ] ], w[ t[ "seed" ] ]
+            for i in range( len( t[ "beg" ] ) ):
+                sl = slice( t[ "beg" ][ i ], t[ "end" ][ i ] )
+                if sl.stop > sl.start:
+                    assert ( q[ sl ] <= p[ sl ] @ wa[ i ] + wb[ i ] ).all(), ( label, i )
+            bare = AaBsp( pos )
+            bare.refresh_weight_majorants( p, q )
+            assert numpy.array_equal( numpy.asarray( bare.node_wb ), numpy.asarray( tree.node_wb ) ), label
+            print( f"  { label }: { int( ( numpy.abs( wa ).sum( axis = 1 ) > 0 ).sum() ) } affine nodes of { len( wb ) }" )
+
+if test( "the_card_tree_is_built_under_jit_from_traced_positions" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        # the tree of TRACED positions, in the jitted program: the same bits as eager; then a diagram on it ( the gathers
+        # through the traced order ), its measures and their adjoint with respect to the positions, eager == jit
+        import jax
+        rng = numpy.random.default_rng( 23 )
+        n = 7000
+        pos = _lines( n, rng )
+        w = rng.uniform( -0.3, 0.3, n ) / n
+        keys = ( "seed_indices", "node_begin", "node_end", "node_left", "node_right", "node_box" )
+
+        def build( p, q ):
+            t = AaBsp( p, q )
+            return [ getattr( t, k ).raw for k in keys ] + [ t.rank_of_seeds(), t.node_wa.raw, t.node_wb.raw ]
+
+        eager = [ numpy.asarray( x ) for x in build( pos, w ) ]
+        jitted = [ numpy.asarray( x ) for x in jax.jit( build )( pos, w ) ]
+        for k, a, b in zip( keys + ( "rank", "wa", "wb" ), eager, jitted ):
+            assert numpy.array_equal( a, b ), k
+
+        g = rng.normal( size = n )
+        for kernel in ( "FP64", "FP32" ):
+            def measures( p ):
+                pd = PowerDiagram( p, weights = w, boundaries = box_half_spaces( ( 0, 0 ), ( 1, 1 ) ), kernel_dtype = kernel, accelerator = AaBsp( p, w ) )
+                assert pd._card_variant() is not None
+                return pd.measures.value
+            me, mj = numpy.asarray( measures( pos ) ), numpy.asarray( jax.jit( measures )( pos ) )
+            assert numpy.array_equal( me, mj ), kernel
+            ref = _m( _pd( pos, w, "FP64", False, tree = AaBsp( pos, w ) ) )
+            assert numpy.median( _rel( me, ref ) ) < 1e-9, kernel
+            loss = lambda p: ( measures( p ) * g ).sum()
+            ge, gj = numpy.asarray( jax.grad( loss )( pos ) ), numpy.asarray( jax.jit( jax.grad( loss ) )( pos ) )
+            assert numpy.array_equal( ge, gj ) and numpy.abs( ge ).max() > 0, kernel
 
 
 # ---- capacities, limits, variants ----------------------------------------------------------------------------------

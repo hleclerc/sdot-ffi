@@ -990,3 +990,121 @@ Risks: the budget is taken from XLA's pool at every call ( 59-117 MB at the defa
 an allocation failure, not a capacity ); a cloud with thousands of 400+-gons runs them 64 at a time ( slow, still correct ); a
 `card_max_vertices` below the third pass's 384 / 256 lets cells up to that size through ( as before ). The traced failure leaves
 JAX's ordered-effect token poisoned, so the process prints an ignored `JaxRuntimeError` at exit ( as the traced capacity error did ).
+
+# GPU step 7: tree on the card ( 2026-10-04 )
+
+The BSP tree of a 2D cloud on a CUDA device is now built ENTIRELY ON THE CARD, in ONE ffi call ( `include/sdot/gpu/Bsp2D.cuh`,
+`AaBsp._init_on_card` ), nothing read back: every size is a function of `n` and the leaf size. It runs under `jax.jit` on
+traced positions, so `SdotPlanNd` builds the tree of a card solve OUTSIDE its `concrete_eval`: under a jit the tree is part of
+the jitted program ( built at every call, from traced or constant positions ), no longer a constant computed while tracing.
+`PowerDiagram_Bsp` takes the same build on a card ( 2D ). The CPU path is unchanged; `SDOT_CARD_TREE=0` sends every tree back
+to the host-driven build ( `bench_newton --card-tree=no`: the "before" column below, same session ).
+
+## How ( `Bsp2D.cuh` )
+
+* The seeds SORTED ONCE PER AXIS by ( coordinate, index ): a stable LSD radix sort of the ordered-integer image of the double
+  ( 8 passes of 8 bits, both axes in the same launches; CUB's headers do not match the pinned `nvcc`, see `Laplacian2D.cuh` ).
+  The scatter stages each tile in shared memory sorted by digit and writes it out in digit runs ( coalesced ).
+* PER LEVEL ( the classic presorted k-d build, O( n ) per level ): the NODES ( a thread each: the box read off the ends of the
+  slice in each sorted list, the first longest axis, the median cut or none, the record at its preorder place, the
+  children's slices ); the SIDE of each seed ( a bit per seed, `atomicOr`: the bitset stays in L2 -- a byte per seed went to
+  DRAM at 1e7, 3x slower per level ); the OTHER list stably partitioned within each slice ( a ballot scan of the side bits,
+  then a scatter ), the cut's own list copied.
+* The ORDER inside a leaf: along its PARENT's cut axis ( a left leaf ends next to the cut, its sibling starts there ). The
+  multigrid aggregates packets of 4 consecutive ranks; on the SAME Voronoi laplacian re-ranked ( CG iterations, 4 right-hand
+  sides, tol 1e-6 ): 1e5 uniform host 33 / own axis 37.5 / parent axis 35.5 / random 33; 1e6 40.5 / 41.3 / 42 / 42; lines 42.3
+  / 42.8 / 39.3 / 43.3. A full k-d order inside the leaves ( three more order-only levels ) was WORSE in the solves ( 1e6:
+  205 linear iterations against 185-189 ): rejected.
+* The weights' majorants of a tree built with weights: `Majorant2D.cuh` ( refactored to run from raw views, `refresh_from` ),
+  one more call ( `bsp_refresh_majorants_card`, also `AaBsp.refresh_weight_majorants` on a card: it was the per-node kernel,
+  676 ms at 1e6 ). A cold start's zero majorants are zeros ( no call ).
+* The same tree as the host's ( slices, boxes, cuts, the seeds of each leaf ) when the coordinates along each cut are
+  distinct; on TIES at a median the card sends the lowest indices left ( the host's quickselect: an arbitrary half ). Both
+  are median cuts; the tests check the rule on tied clouds. Deterministic: integer scans, a stable sort, order-independent
+  atomics -- jit == eager to the bit.
+* In eager, the call's TENSORS are given to the aggregates ( `Tensor.set( tensor )` adopts the storage ) and not their buffers:
+  `driver.array` turns a concrete device array into numpy, a device -> host copy per field ( 30 of the 50 ms of an eager
+  tree at 1e6 ). Same for what `PowerDiagram_Bsp._solver_weights_after` takes back after a solve.
+
+## The tree alone ( uniform 2D unless said; `bench_newton` "tree alone", min of 3; kernels = `LOOM_KERNEL_TIMING` )
+
+| n | before: eager wall ( kernels ) | after: eager wall ( kernels ) | after: jitted wall |
+|---|---|---|---|
+| uniform 1e5 | 115.8 ms ( 1.64 ) | 4.8 ms ( **0.92** ) | 1.5 ms |
+| lines voronoi 1e5 | 110.2 ms ( 1.61 ) | 4.3 ms ( 0.92 ) | - |
+| uniform 1e6 | 839.9 ms ( 36.0, the top 10 levels in numpy ) | 11.9 ms ( **5.03** ) | ~5.5 ms |
+| uniform 1e7 | 9085 ms ( 447 ) | 91 ms ( **42.9** ) | - |
+
+At 1e6 ( kernels ): sort 1.6 ms ( scatter 1.16, count 0.40 ), per level ~0.18 ms ( partition 0.053, scan 0.037, nodes 0.03,
+sides 0.032 ), order 0.3 ms; 137 launches. The eager wall is loom's per-call Python ( ~3.5 ms ) plus the upload of numpy
+positions. The old campaign's `Bsp2D.cuh` ( a radix sort of the whole cloud per level ): 44 / 474 ms of kernels at 1e6 / 1e7.
+Steps on the way at 1e6 ( kernels ): first version 7.8 ms; partition only the other list + scan fused 7.2; staged radix
+scatter + ballot scan 5.8; half-size radix tiles ( occupancy ) 5.6; side bitset 5.06 ( 1e7: 160 -> 43 ms ).
+
+## The solves ( `bench_newton --step=limits --jit=both`, errand queue, min of 3; seconds )
+
+Before: the host-driven tree, built before the call ( eager ) or while TRACING ( jit: not in the jitted call ). After: the
+card's tree, built in the eager call sequence and INSIDE the jitted program.
+
+| case | kernel | before: eager / **jit** | after: eager / **jit** | it / diag, linear iterations ( before -> after ) |
+|---|---|---|---|---|
+| uniform 1e6 | float | 1.709 / **0.435** | **0.567** / **0.440** | 5 / 6 both; 186 -> 189 |
+| uniform 1e5 | float | 0.292 / **0.074** | **0.156** / **0.077** | 5 / 6 both; 153 -> 161 |
+| lines voronoi | float | 0.530 / **0.300** | **0.404** / **0.305** | 12 / 13 both; 619 -> 639 |
+| lines equal | double | 2.122 / **1.901** | **1.817** / **1.709** | 14 / 52 -> 15 / 49 ( stagnation at 2.35e-6 both ); 1084 -> 881 |
+| uniform 1e7 | float | does not fit | does not fit | ( see below ) |
+
+* Eager: -1.14 s at 1e6 ( 3.0x ), -0.13 s at 1e5 and on the lines. Jit: the tree is now INSIDE the measured call and costs
+  what its kernels cost ( +1 ms at 1e5, +5 ms at 1e6 ); the rest of the difference is the linear iterations, which follow the
+  order inside the leaves ( +2 % at 1e6, +5 % at 1e5, +3 % on the lines; the stagnating lines equal moves its counts as any
+  change does, and gains here ).
+* A retrace ( new positions, `jax.jit` over the positions ) no longer pays a host build: the tree is a traced computation.
+* Same solves: the same Newton iterations and diagrams on the three converging cases, the final residuals equal to two digits
+  ( 4.02e-7 / 2.06e-7 / 4.73e-7 against 4.02e-7 / 2.05e-7 / 4.74e-7 ).
+
+## Tests ( lmo-jax: `test_SdotPlanNd`, `test_CardCells`, `test_PowerDiagram`; local jax CPU: `test_SdotPlanNd`, `test_PowerDiagram` )
+
+* `the_card_tree_is_the_host_tree`: 17 clouds ( uniform, lines, weighted lines, 30000 uniform, all-kernel host path, 6
+  tight clusters, n = 1 .. 1000 ), leaves of 10 and 3: the same slices, boxes, children and leaf contents as
+  `_build_in_kernel`, and the rule ( tight boxes, the median cut on the first longest axis, the halves on either side ).
+* `the_card_tree_follows_the_rule_on_ties`: a grid, the grid repeated three times, a vertical line, 700 equal seeds + 300,
+  lines on a lattice, negative coordinates and zeros: the rule, the host's slice sizes where no tie decides them, the same
+  bits at every call; the card's cells of a grid through this tree = the generic ones.
+* `the_card_tree_majorants_bound_the_weights`: smooth / random / constant weights: every node bounds its seeds, and a tree
+  built with weights = a tree built without + `refresh_weight_majorants`, to the bit.
+* `the_card_tree_is_built_under_jit_from_traced_positions`: the tree's tensors, its order's inverse and majorants, jitted
+  == eager to the bit; a diagram on it ( FP64, FP32 ): measures and their adjoint with respect to the POSITIONS, jit == eager.
+* `the_card_solve_builds_its_tree_in_the_jitted_call` ( `test_SdotPlanNd` ): the positions traced, cold and warm starts:
+  jit == eager to the bit, and other positions through the same compiled function give the eager plan.
+* `the_card_cells_are_the_generic_cells_with_weights`: `tol64` 1e-9 -> 3e-9 on its `w ~ h^2` cloud. Not the tree ( the host's
+  tree gives the same 1.11e-9 ): the generic reference itself is 2e-9 from the exact plain storage on the almost empty cells
+  of that cloud, and both move with the MAJORANTS ( they change the order of the cuts, hence the rounding ): 0.98e-9 at HEAD,
+  where `PowerDiagram` re-ran the per-node majorant kernel on a tree built with the same weights, 1.1e-9 now that it keeps them.
+
+## Findings on the way
+
+* 1e7 on the card does not fit: the solve's pool runs out in XLA's BFC allocator ( 75 % of 11 GB ) with either tree, and the
+  allocator RETRIES every 10 s instead of failing -- the call hangs. Not the tree ( ~0.3 GB of tensors, ~0.55 GB of work for
+  its call, released after it ). A pool refusal is not reported as one here; to look at with `XLA_PYTHON_CLIENT_MEM_FRACTION` / the
+  allocator's `take`.
+* `Tensor.set( device array )` copies to the host ( `JaxDriver.array`: anything not a tracer becomes numpy ): every eager
+  ffi output given to an aggregate field as `.raw` pays a device -> host copy and the next call an upload. Fixed here for the
+  tree and the solver's outputs ( tensors adopted ); other sites remain ( `RealTensor[ pd.num_point ]( x.raw )` ... ).
+* A closure-constant `nu` normalized under `jax.jit` differs from eager by 1e-19 ( XLA's fused reduction ): a jit == eager
+  comparison must pass the masses as an argument ( as `the_card_solve_runs_under_jit` does ).
+
+## What remains
+
+* Bottom levels in one kernel ( a warp per node once the slices are <= 32-64 seeds: ~0.6 ms of the 5 at 1e6 ).
+* The eager per-call overhead of loom ( ~3.5 ms per call: a jaxpr is traced per eager call ).
+* 3D on a card still builds on the host ( `builds_on_card` is 2D: the card's cells and `Majorant2D` are 2D ); the build itself
+  is generic in `D` ( template ), only the majorants are not.
+
+## Risks
+
+* The order inside a leaf moves the linear iterations by a few percent either way ( table above ); measured on three clouds.
+* Ties at a median: a different ( valid ) tree from the CPU's on tied clouds -- so plans on such clouds may differ from the
+  CPU's at the rounding of the solve ( never the cells' validity ).
+* The build takes ~55 bytes per seed from the call's pool in 2D ( 0.55 GB at 1e7 ); a refusal of the pool leaves the outputs
+  unwritten ( reported by loom's allocator, as for the other card calls ).
+* `SDOT_CARD_TREE=0` restores the previous behaviour exactly ( host build, evaluated while tracing ).

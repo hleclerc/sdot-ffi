@@ -35,7 +35,8 @@ ON THE CARD ( `lmo-jax`, a CUDA device: `SdotPlanNd` solves on the card, `gpu/Ne
 per call ); the KERNEL-ONLY time of the solve ( `LOOM_KERNEL_TIMING=1`, every launch of the call between CUDA events ) is
 printed next to the wall time, and the stages are the card's: `t_maj` ( the weight majorants ), `t_diag` ( the cells ),
 `t_asm` ( right-hand side + laplacian CSR ), `t_lin` ( the linear solve, wall: it reads residuals back ), `t_lim` ( the
-polynomial passes of `step = limits` ). `t_tree` is the BSP tree, built before the solve ( host-driven, per level ).
+polynomial passes of `step = limits` ). `t_tree` is the BSP tree alone ( on the card: one call of `gpu/Bsp2D.cuh`, also part of
+every timed solve, eager or jitted ), wall and kernel-only.
 `--linear-host=yes` solves the linear systems with the CPU solver named by `--linear-solver` on a copy of the laplacian.
 `--save-weights=f.npy` / `--compare=f.npy`: the weights of the solve, saved / compared ( after the gauge ) with another
 run's -- the CPU's plan against the card's.
@@ -87,6 +88,7 @@ if p := bench( "newton",
                mg_smoothed   = Param( -1, help = "ON THE CARD: levels passed on by the smoothed aggregation ( -1: the default, 1; 0: plain aggregation )" ),
                trace         = Param( "no", choices = [ "no", "yes" ], help = "print the solver's trace ( per iteration, per linear solve )" ),
                card_graphs   = Param( "yes", choices = [ "yes", "no" ], help = "ON THE CARD: the linear solver's iterations replayed from CUDA graphs ( no: plain launches, every kernel timed )" ),
+               card_tree     = Param( "yes", choices = [ "yes", "no" ], help = "ON THE CARD: the tree built by the card in one call ( no: the host-driven build, `SDOT_CARD_TREE=0`, evaluated while tracing )" ),
                lin_dump      = Param( "", help = "ON THE CARD: write every linear system to `<prefix>_<k>.bin` ( `SDOT_CARD_LIN_DUMP`, `Linear2D.cuh::dump_system` )" ),
                all_slots     = Param( "no", choices = [ "no", "yes" ], help = "ON THE CARD: print every timed kernel slot ( index, ms, launches, registers )" ),
                save_weights  = Param( "", help = "save the final weights ( .npy )" ),
@@ -96,6 +98,9 @@ if p := bench( "newton",
     if p.card_graphs == "no":
         import os
         os.environ[ "SDOT_CARD_GRAPHS" ] = "0"
+    if p.card_tree == "no":
+        import os
+        os.environ[ "SDOT_CARD_TREE" ] = "0"
     if p.lin_dump:
         import os
         os.environ[ "SDOT_CARD_LIN_DUMP" ] = p.lin_dump
@@ -136,10 +141,19 @@ if p := bench( "newton",
     from loom.drivers.driver import driver
     on_card = bool( getattr( driver.device, "is_cuda_gpu", False ) )
     kt = benchlib.KernelTiming() if on_card else None
+    # THE TREE alone ( on the card: one call, `gpu/Bsp2D.cuh`; waited for, min of `reps` ), kernel-only next to the wall
     from sdot import AaBsp
-    t = time.perf_counter()
-    AaBsp( pos )
-    t_tree = time.perf_counter() - t
+    t_tree = t_tree_kern = None
+    for _ in range( max( p.reps, 1 ) ):
+        if kt: kt.reset()
+        t = time.perf_counter()
+        tree = AaBsp( pos )
+        benchlib.block_until_ready( getattr( tree.seed_indices, "raw", None ) )
+        tw = time.perf_counter() - t
+        tk = kt.read() if kt else None
+        if t_tree is None or tw < t_tree:
+            t_tree, t_tree_kern = tw, ( tk[ "ms" ] / 1e3 if tk else None )
+    del tree
 
     best = None
     if not on_card or p.jit in ( "no", "both" ):
@@ -155,8 +169,8 @@ if p := bench( "newton",
     wall, sol, kern = best if best else ( None, None, None )
     st = sol.stats if sol else None
 
-    # UNDER `jax.jit`: the solve of a function of the target masses ( the positions are constants of the trace: the tree is
-    # built when tracing ); the first call traces and compiles, the next ones only run
+    # UNDER `jax.jit`: the solve of a function of the target masses ( the positions are constants of the trace; on the card
+    # the tree is built INSIDE the jitted program, at every call ); the first call traces and compiles, the next ones only run
     jit_wall = jit_kern = None
     if on_card and p.jit in ( "yes", "both" ):
         import jax
@@ -218,7 +232,7 @@ if p := bench( "newton",
                       t_total_wall = wall, t_total_cpp = st[ "t_total" ], t_diag = st[ "t_diag" ], t_majorant = st[ "t_majorant" ],
                       t_asm = st[ "t_asm" ], t_lin = st[ "t_lin" ], t_lim = st[ "t_lim" ],
                       residual_rel = res_rel, start = st[ "start" ], lin_nb_iter = st[ "lin_nb_iter" ],
-                      on_card = int( on_card ), t_tree = t_tree, nb_limit_rounds = st[ "nb_limit_rounds" ] )
+                      on_card = int( on_card ), t_tree = t_tree, t_tree_kernels = t_tree_kern, nb_limit_rounds = st[ "nb_limit_rounds" ] )
     if on_card:
         p.results.update( linear_host = p.linear_host, jit = p.jit,
                           t_eager_wall = best[ 0 ] if best else None, t_eager_kernels = kern[ "ms" ] / 1e3 if kern else None,
@@ -241,8 +255,8 @@ if p := bench( "newton",
     if on_card:
         f3 = lambda x: "-" if x is None else f"{ x :.3f}"
         print( f"  card: eager wall { f3( best[ 0 ] if best else None ) } s ( kernels { f3( kern[ 'ms' ] / 1e3 if kern else None ) } s ), "
-               f"jit wall { f3( jit_wall ) } s ( kernels { f3( jit_kern[ 'ms' ] / 1e3 if jit_kern else None ) } s ); tree { t_tree :.3f} s "
-               f"( built before the solve, host-driven ); limit rounds { st[ 'nb_limit_rounds' ] }; double kernel from it { st[ 'it_double' ] }" )
+               f"jit wall { f3( jit_wall ) } s ( kernels { f3( jit_kern[ 'ms' ] / 1e3 if jit_kern else None ) } s ); tree alone { t_tree * 1e3 :.2f} ms "
+               f"( kernels { '-' if t_tree_kern is None else f'{ t_tree_kern * 1e3 :.2f}' } ms; inside the solve's totals ); limit rounds { st[ 'nb_limit_rounds' ] }; double kernel from it { st[ 'it_double' ] }" )
         k = jit_kern or kern
         if k:
             top = sorted( k[ "all" ], key = lambda r: -r[ "ms" ] )[ :8 ]

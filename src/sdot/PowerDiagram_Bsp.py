@@ -9,6 +9,9 @@ in the user's order, measures and cells leave the kernel already at their index
 ( `user_id( k )` ), and the gathering `sorted = positions[ seed_indices ]` is an operation of the
 backend, DIFFERENTIABLE: a derivative with respect to `sorted_positions` comes back to `positions` on its own.
 
+On a CUDA card, in 2D, the tree is built by the card ( `AaBsp._init_on_card` ): the order and its inverse are then the
+card's arrays ( tracers under a `jit`, positions traced or not ), and the gathers run there.
+
 Changing the WEIGHTS does not change the tree, only the affine majorant each node carries
 ( `refresh_weight_majorants` ): this is what makes a diagram reusable from one step to the next
 of a fit ( `SdotPlanNd` ). Changing the POSITIONS rebuilds it.
@@ -30,7 +33,7 @@ from loom.compilation.FfiCode import FfiCode
 from loom.tensor import Axis, IntTensor, RealTensor, ShapeVar
 from loom.util import Aggregate
 
-from .AaBsp import AaBsp
+from .AaBsp import AaBsp, take_rows
 from .PowerDiagram import PowerDiagram
 
 
@@ -50,14 +53,19 @@ class PowerDiagram_Bsp( PowerDiagram ):
         n = int( tree.nb_bsp_seeds.value )
         if n != int( positions.shape[ 0 ] ):
             raise ValueError( f"the accelerator was built on { n } seeds, this diagram has { int( positions.shape[ 0 ] ) }" )
-        self._order = np.asarray( tree.seed_indices ).reshape( -1 ).astype( np.int64 )
+        # the order and its inverse: host arrays for a tree built on the host, the card's ( maybe traced ) for a tree built
+        # there ( `AaBsp._init_on_card` ) -- the gathers below then run on the card too
         self._rank_of = tree.rank_of_seeds()
+        if isinstance( self._rank_of, np.ndarray ):
+            self._order = np.asarray( tree.seed_indices ).reshape( -1 ).astype( np.int64 )
+        else:
+            self._order = getattr( tree.seed_indices, "raw", tree.seed_indices ).reshape( -1 )
         res = { "tree": tree, "sorted_positions": self._gather( positions ) }
         if weights is not None:
             res[ "sorted_weights" ] = self._gather( weights )
             # a tree coming from outside may have been built on other weights, or none: its majorant
-            # is redone on THESE ( built here, it already has them )
-            if tree is accelerator:
+            # is redone on THESE ( built here, it already has them; so has a tree built on these very weights )
+            if tree is accelerator and getattr( tree, "_majorant_weights", None ) is not weights:
                 tree.refresh_weight_majorants( res[ "sorted_positions" ], res[ "sorted_weights" ] )
         # the memory starts empty ( no memories: the ordinary path, until the first `measures` )
         K = int( getattr( self, "_memory", 0 ) )
@@ -226,8 +234,7 @@ class PowerDiagram_Bsp( PowerDiagram ):
     def _gather( self, seeds ):
         """`seeds[ seed_indices ]`, through the backend: a tracer stays a tracer, and the derivative
         with respect to what we gather comes back through here on its own"""
-        raw = getattr( seeds, "raw", seeds )
-        return raw[ self._order ]
+        return take_rows( seeds, self._order )
 
     def _scatter( self, sorted_values ):
         """the inverse: what is stored in tree order, put back in the user's order"""
@@ -291,9 +298,11 @@ class PowerDiagram_Bsp( PowerDiagram ):
         return ( expr + " )", { n: loom.out( t ) for n, t in args.items() }, args )
 
     def _solver_weights_after( self, produced ):
-        self.sorted_weights = produced[ "sorted_weights_out" ].raw
-        self.tree.node_wa = produced[ "node_wa_out" ].raw
-        self.tree.node_wb = produced[ "node_wb_out" ].raw
+        # the TENSORS, whose storage is adopted as it is ( a buffer would go through `driver.array`, which brings a concrete
+        # device array back to the host )
+        self.sorted_weights = produced[ "sorted_weights_out" ]
+        self.tree.node_wa = produced[ "node_wa_out" ]
+        self.tree.node_wb = produced[ "node_wb_out" ]
         if "memo_counts_out" in produced:
             self.memo_nbrs = produced[ "memo_nbrs_out" ].raw
             self.memo_counts = produced[ "memo_counts_out" ].raw

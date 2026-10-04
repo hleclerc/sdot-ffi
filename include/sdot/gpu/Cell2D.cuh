@@ -275,6 +275,7 @@ struct StridedOut {
 
     __device__ __forceinline__ T &operator()( SI i ) const { return *reinterpret_cast<T *>( p + i * s[ 0 ] ); }
     __device__ __forceinline__ T &operator()( SI i, SI j ) const { return *reinterpret_cast<T *>( p + i * s[ 0 ] + j * s[ 1 ] ); }
+    __device__ __forceinline__ T &operator()( SI i, SI j, SI k ) const { return *reinterpret_cast<T *>( p + i * s[ 0 ] + j * s[ 1 ] + k * s[ 2 ] ); }
 };
 
 template<class View>

@@ -76,6 +76,13 @@ class AaBsp( SpatialAccelerator ):
     this construction from going under a `jit` -- but an `AaBsp` is a CONSTANT of the trace (see
     below), so that is not what is asked of it.
 
+    ON A CUDA CARD, IN 2D, the whole tree is ONE ffi call instead ( `gpu/Bsp2D.cuh`, `_init_on_card` ): the seeds
+    sorted once per axis, then per level the boxes read off the sorted lists and a stable partition of the lists by
+    a scan -- nothing read back, so it runs under a `jit` on TRACED positions too, and a solve on the card builds its
+    tree inside its jitted program ( `SdotPlanNd` ). The same tree, but for which half of the seeds TIED at a median
+    goes left ( the lowest indices on the card ) and the order inside a leaf. Its tensors stay on the card ( tracers
+    under a `jit` ), and so do the order and its inverse ( `rank_of_seeds` ) that `PowerDiagram_Bsp` gathers with.
+
     The CLOUD, for its part, never comes back down: `positions` / `weights` are passed to the kernel as they
     arrive, without `np.asarray`. Seeds that live on the GPU stay there -- which matters for
     whoever rebuilds the tree at each Newton step, where a host round trip would cost twice
@@ -145,6 +152,11 @@ class AaBsp( SpatialAccelerator ):
         Only a SHAPE is read here, and a shape is not data.
         """
         pos = positions if hasattr( positions, "shape" ) else np.asarray( positions, dtype = float )
+        # ON A CUDA CARD, in 2D: the whole tree in ONE ffi call ( `gpu/Bsp2D.cuh` ), nothing read back -- traced positions
+        # included ( under a `jit` the tree is then built in the jitted program )
+        if builds_on_card( pos ):
+            self._init_on_card( pos, weights, max_seeds_per_leaf )
+            return
         # under a `jit`, `positions` is a tracer: its shape can be read, but the per-level loop
         # reads the `mid` back on the host side and has nothing to read on a tracer. Say so HERE rather than
         # letting the backend's error surface fifteen lines later: it is not an accident,
@@ -178,7 +190,8 @@ class AaBsp( SpatialAccelerator ):
         # of the descent, and a stack that is too short would be a walk that skips seeds.
         self.max_depth = tree[ "max_depth" ]
         self.max_seeds_per_leaf = int( max_seeds_per_leaf )
-        self.nb_leaves = tree[ "nb_leaves" ]
+        self._nb_leaves = tree[ "nb_leaves" ]
+        self._rank = None
 
         kwargs = dict(
             seed_indices = tree[ "seed_indices" ],
@@ -198,10 +211,54 @@ class AaBsp( SpatialAccelerator ):
 
         self.__base_init__( nb_dims = int( pos.shape[ 1 ] ), nb_lohi = 2, **kwargs )
 
+        self._majorant_weights = weights
         if traced_w:
             order = tree[ "seed_indices" ]
             self.refresh_weight_majorants( getattr( pos, "raw", pos )[ order ], w[ order ] )
+            self._majorant_weights = weights
 
+
+    def _init_on_card( self, pos, weights, max_seeds_per_leaf ):
+        """THE CARD'S BUILD ( `gpu/Bsp2D.cuh::build_tree` ): the same tree as `_build_in_kernel` ( slices, boxes, median
+        cuts on the longest axis, preorder ), but for the side of a tie at a median ( the lowest indices go left ) and
+        the order inside a leaf. Every output stays on the card -- a tracer under a `jit` --, and the weights, if any,
+        enter the majorants by `refresh_weight_majorants` ( one more call )."""
+        if len( pos.shape ) != 2:
+            raise ValueError( f"`positions` has to be [ n, d ] ( got { tuple( pos.shape ) } )" )
+        n, d = int( pos.shape[ 0 ] ), int( pos.shape[ 1 ] )
+        if n == 0:
+            raise ValueError( "an accelerator over no seed at all has nothing to accelerate" )
+        w = None if weights is None else ( weights if hasattr( weights, "shape" ) else np.asarray( weights, dtype = float ) )
+        if w is not None and int( np.prod( w.shape ) ) != n:
+            raise ValueError( "`weights` has to hold one weight per position" )
+        leaf = int( max_seeds_per_leaf )
+        # ( the call's TENSORS, not their buffers: a buffer given to a field goes through `driver.array`, which brings a
+        # concrete device array back to the host -- the tensor's storage is adopted as it is )
+        tree = _build_on_card( pos, leaf )
+        self.max_depth = AaBsp.max_depth_for( n, leaf )
+        self.max_seeds_per_leaf = leaf
+        self._nb_leaves = None                           # ( a host read: counted when asked, see `nb_leaves` )
+        self._rank = tree.pop( "rank_of" ).raw
+        # ( an adopted tensor does not make the counts pull from it: they are prescribed, both functions of `n` and `leaf` )
+        self.__base_init__( nb_dims = d, nb_lohi = 2, nb_bsp_seeds = n, nb_bsp_nodes = 2 ** self.max_depth - 1, **tree )
+        if w is not None:
+            order = tree[ "seed_indices" ].raw
+            self.refresh_weight_majorants( take_rows( getattr( pos, "raw", pos ), order ), take_rows( getattr( w, "raw", w ), order ) )
+            self._majorant_weights = weights
+
+    def set_zero_weight_majorants( self ):
+        """the majorants of ZERO weights ( a cold start ): zero, without a call -- on the card, and traced under a `jit`"""
+        self.node_wa = RealTensor[ self.num_bsp_node, self.dim ].zeros()
+        self.node_wb = RealTensor[ self.num_bsp_node ].zeros()
+
+    @property
+    def nb_leaves( self ):
+        """the non-empty leaves ( a host read of the slices when the tree was built on the card )"""
+        if self._nb_leaves is None:
+            beg = np.asarray( self.node_begin ).reshape( -1 )
+            end = np.asarray( self.node_end ).reshape( -1 )
+            self._nb_leaves = int( ( ( np.asarray( self.node_left ).reshape( -1 ) < 0 ) & ( end > beg ) ).sum() )
+        return self._nb_leaves
 
     @staticmethod
     def max_depth_for( nb_seeds, max_seeds_per_leaf = 10 ):
@@ -245,7 +302,10 @@ class AaBsp( SpatialAccelerator ):
         return int( self.nb_bsp_seeds.value )
 
     def rank_of_seeds( self ):
-        """the inverse of `seed_indices`: the RANK ( in the tree's order ) of seed `i`"""
+        """the inverse of `seed_indices`: the RANK ( in the tree's order ) of seed `i` ( on the card, and possibly traced,
+        for a tree built there )"""
+        if self._rank is not None:
+            return self._rank
         order = np.asarray( self.seed_indices ).reshape( -1 ).astype( np.int64 )
         rank = np.empty_like( order )
         rank[ order ] = np.arange( len( order ) )
@@ -265,6 +325,30 @@ class AaBsp( SpatialAccelerator ):
         an object of PRUNING, which does not change the result -- its true derivative is zero.
         """
         nb_nodes = int( self.nb_bsp_nodes.value )
+        self._majorant_weights = None
+        if builds_on_card( self.node_box ):
+            # ON THE CARD: `Majorant2D.cuh`'s launches over the seeds and the levels ( the per-node kernel below gives the
+            # root's million seeds to one thread ); the tree's tensors are read where they are, traced or not
+            num_seed = self.num_bsp_seed
+            sp = RealTensor[ num_seed, self.dim ]( driver.stop_gradient( getattr( sorted_positions, "raw", sorted_positions ) ) )
+            sw = RealTensor[ num_seed ]( driver.stop_gradient( getattr( sorted_weights, "raw", sorted_weights ) ).reshape( -1 ) )
+            wa = RealTensor[ self.num_bsp_node, self.dim ]()
+            wb = RealTensor[ self.num_bsp_node ]()
+            tn = "int" if nb_nodes <= 2 ** 31 - 1 else "long long"
+            loom.ffi_call(
+                "bsp_refresh_majorants_card",
+                FfiCode.inline( f"sdot::gpu2d::refresh_majorants<{ tn }>( queue, args.inputs.node_box, args.inputs.node_begin, "
+                                "args.inputs.node_end, args.inputs.sorted_positions, args.inputs.sorted_weights, args.outputs.node_wa, "
+                                "args.outputs.node_wb, args.allocator );",
+                                includes = [ "sdot/gpu/Bsp2D.cuh" ], allocator = True ),
+                node_box = self.node_box, node_begin = self.node_begin, node_end = self.node_end,
+                sorted_positions = sp, sorted_weights = sw,
+                node_wa = loom.out( wa ), node_wb = loom.out( wb ),
+                has_dynamic_capacity = False,
+            )
+            self.node_wa = wa                            # ( the tensors: their buffers stay on the card )
+            self.node_wb = wb
+            return
         num_node = new_batch_axis( nb_nodes, prefix = "bspnode" )
         majorant = _NodeMajorant( nb_dims = int( self.nb_dims.value ), batch_axes = [ num_node ] )
 
@@ -644,3 +728,61 @@ def _build_in_kernel( pos, w, leaf_size ):
         max_depth    = depth,
         nb_leaves    = int( ( in_preorder( is_leaf ) & ( node_end_pre > node_begin_pre ) ).sum() ),
     )
+
+
+# -- the construction ON THE CARD ( `gpu/Bsp2D.cuh` ) --------------------------------------------------------------------
+
+
+def builds_on_card( x ):
+    """whether a tree on `x` ( positions `[ n, d ]`, or any `[ ..., d ]` tensor of the tree ) is built and refreshed by the
+    card's kernels: a CUDA device and 2D -- the card's cells' scope ( `PowerDiagram_Bsp._card_variant` ). `SDOT_CARD_TREE=0`
+    sends every tree to the host-driven build ( `_build_in_kernel`: under a trace, a constant evaluated while tracing ) -- the
+    comparison point of the benches"""
+    import os
+    if os.environ.get( "SDOT_CARD_TREE", "1" ).lower() in ( "0", "no", "false", "off" ):
+        return False
+    return bool( getattr( driver.device, "is_cuda_gpu", False ) ) and len( x.shape ) >= 2 and int( x.shape[ -1 ] ) == 2
+
+
+def take_rows( a, idx ):
+    """`a[ idx ]` along the first axis, through the backend of `idx`: a numpy order indexes as numpy, a device one ( a
+    tree built on the card, a tracer under a `jit` ) brings `a` to the device first -- a gather the backend differentiates"""
+    a = getattr( a, "raw", a )
+    if isinstance( idx, np.ndarray ):
+        return a[ idx ]
+    if "torch" in type( idx ).__module__:
+        import torch
+        return torch.as_tensor( a, device = idx.device )[ idx ]
+    import jax.numpy as jnp
+    return jnp.asarray( a )[ idx ]
+
+
+def _build_on_card( pos, leaf ):
+    """the tree's tensors ( loom tensors, their buffers on the card ) from ONE ffi call ( `sdot::gpu2d::build_tree` ): `seed_indices`, `rank_of` ( its inverse ),
+    `node_begin` / `node_end` / `node_left` / `node_right` / `node_box` in preorder. Every size is a function of `n` and
+    `leaf`; the work's index type is chosen here ( `int` while `d n` fits in it ). The positions enter WITHOUT their
+    gradient: the tree is combinatorial ( see the class docstring )."""
+    n, d = int( pos.shape[ 0 ] ), int( pos.shape[ 1 ] )
+    depth = AaBsp.max_depth_for( n, leaf )
+    nb_nodes = 2 ** depth - 1
+    num_seed = Axis( ShapeVar( n ), name = "num_bsp_seed" )
+    num_node = Axis( ShapeVar( nb_nodes ), name = "num_bsp_node" )
+    num_lohi = Axis( ShapeVar( 2 ), name = "num_lohi" )
+    dim = Axis( ShapeVar( d ), name = "dim" )
+    positions = RealTensor[ num_seed, dim ]( driver.stop_gradient( getattr( pos, "raw", pos ) ) )
+    out = dict( seed_indices = IntTensor[ num_seed ](), rank_of = IntTensor[ num_seed ](),
+                node_begin = IntTensor[ num_node ](), node_end = IntTensor[ num_node ](),
+                node_left = IntTensor[ num_node ](), node_right = IntTensor[ num_node ](),
+                node_box = RealTensor[ num_node, num_lohi, dim ]() )
+    ti = "int" if d * n <= 2 ** 31 - 1 else "long long"
+    loom.ffi_call(
+        "bsp_build_card",
+        FfiCode.inline( f"sdot::gpu2d::build_tree<{ d }, { ti }>( queue, args.inputs.positions, { int( leaf ) }, "
+                        "args.outputs.seed_indices, args.outputs.rank_of, args.outputs.node_begin, args.outputs.node_end, "
+                        "args.outputs.node_left, args.outputs.node_right, args.outputs.node_box, args.allocator );",
+                        includes = [ "sdot/gpu/Bsp2D.cuh" ], allocator = True ),
+        positions = positions,
+        has_dynamic_capacity = False,
+        **{ k: loom.out( v ) for k, v in out.items() },
+    )
+    return out

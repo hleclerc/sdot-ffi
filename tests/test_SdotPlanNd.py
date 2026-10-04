@@ -686,6 +686,37 @@ if test( "the_card_solve_runs_under_jit" ):
     assert numpy.array_equal( numpy.asarray( wj2 ), numpy.asarray( wj ) )
 
 
+if test( "the_card_solve_builds_its_tree_in_the_jitted_call" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    # the POSITIONS traced: the tree is built on the card inside the jitted program ( `gpu/Bsp2D.cuh` ), and the solve is the
+    # eager one to the bit; a cold start and a warm one ( given weights: their majorants on the card too )
+    import jax
+    rng = numpy.random.default_rng( 107 )
+    n = 5000
+    pos = rng.uniform( 0.001, 0.999, size = ( n, 2 ) )
+    nu = rng.uniform( 0.5, 1.5, n )
+    w0 = 1e-3 * ( pos[ :, 0 ] - 0.5 ) / n
+
+    # ( the masses are an argument too: a closure constant would be normalized by XLA's fused reduction under the jit and
+    # op by op in eager, 1e-19 apart -- nothing to do with the tree )
+    def solve( p, m, start ):
+        plan = OtProblem( SumOfDiracs( p, m ), _box_target() ).solve( Iterative( tol = 1e-10 / n, max_iter = 60, weights0 = start ) )
+        return plan.weights.raw, plan.stats[ "nb_diag" ], plan.stats[ "status" ]
+
+    for start in ( None, w0 ):
+        we, de, se = solve( pos, nu, start )
+        assert se == "converged", se
+        f = jax.jit( lambda p, m: solve( p, m, start ) )
+        wj, dj, _ = f( pos, nu )
+        assert numpy.array_equal( numpy.asarray( wj ), numpy.asarray( we ) ), numpy.abs( numpy.asarray( wj ) - numpy.asarray( we ) ).max()
+        assert float( dj ) == float( de ), ( dj, de )
+        # other positions through the same compiled function: another tree, the eager result again
+        pos2 = numpy.clip( pos + 1e-3 * rng.normal( size = pos.shape ), 0.001, 0.999 )
+        assert numpy.array_equal( numpy.asarray( f( pos2, nu )[ 0 ] ), numpy.asarray( solve( pos2, nu, start )[ 0 ] ) )
+
+
 if test( "the_card_solve_on_rings_in_batches_and_past_the_limit" ):
     from errand import skip
     if not _card():

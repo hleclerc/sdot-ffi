@@ -191,10 +191,10 @@ __global__ void __launch_bounds__( BLOCK ) majorant_spread( int depth, SI n, Str
 }
 
 /// STEP 3, one thread per node: the choice of the slope, the constant and its margin, the records
-template<class TR,class TB,class TJ>
+template<class TR,class TB,class TJ,class TW>
 __global__ void __launch_bounds__( BLOCK ) majorant_write( SI nb_nodes, Strided<TB,3> box, Strided<TJ,1> beg, Strided<TJ,1> end,
                                                           const MajStats *st, const MajRed *red, Node<true,TR> *out,
-                                                          StridedOut<double,2> wa_out, StridedOut<double,1> wb_out ) {
+                                                          StridedOut<TW,2> wa_out, StridedOut<TW,1> wb_out ) {
     const SI i = SI( blockIdx.x ) * BLOCK + threadIdx.x;
     if ( i >= nb_nodes )
         return;
@@ -213,21 +213,24 @@ __global__ void __launch_bounds__( BLOCK ) majorant_write( SI nb_nodes, Strided<
     double wb = bb + 1e-6 * ( fabs( bb ) + spread + amax );
     if ( s.m == 0 ) { a0 = a1 = 0; wb = 0; }
 
-    Node<true,TR> nd;
-    for ( int d = 0; d < 2; ++d ) {
-        nd.lo[ d ] = __double2float_rd( double( box( i, 0, d ) ) );
-        nd.hi[ d ] = __double2float_ru( double( box( i, 1, d ) ) );
+    if ( out ) {                                         // ( no records: the tree's own tensors only, `refresh_majorants` )
+        Node<true,TR> nd;
+        for ( int d = 0; d < 2; ++d ) {
+            nd.lo[ d ] = __double2float_rd( double( box( i, 0, d ) ) );
+            nd.hi[ d ] = __double2float_ru( double( box( i, 1, d ) ) );
+        }
+        nd.a[ 0 ] = float( a0 );
+        nd.a[ 1 ] = float( a1 );
+        nd.b = __double2float_ru( wb );
+        nd.beg = TR( beg( i ) );
+        nd.end = TR( end( i ) );
+        out[ i ] = nd;
     }
-    nd.a[ 0 ] = float( a0 );
-    nd.a[ 1 ] = float( a1 );
-    nd.b = __double2float_ru( wb );
-    nd.beg = TR( beg( i ) );
-    nd.end = TR( end( i ) );
-    out[ i ] = nd;
     if ( wa_out.p ) {
-        wa_out( i, 0 ) = a0;
-        wa_out( i, 1 ) = a1;
-        wb_out( i ) = wb;
+        wa_out( i, 0 ) = TW( a0 );
+        wa_out( i, 1 ) = TW( a1 );
+        // a float tensor rounds the constant UP: it stays a majorant
+        wb_out( i ) = std::is_same_v<TW,float> ? TW( __double2float_ru( wb ) ) : TW( wb );
     }
 }
 
@@ -254,7 +257,12 @@ struct Majorants {
     int       depth = 0;
 
     bool prepare( auto &allocator, const auto &pd ) {
-        nb_nodes = SI( pd.tree.node_begin.shape( 0 ) );
+        return prepare_for( allocator, SI( pd.tree.node_begin.shape( 0 ) ) );
+    }
+
+    /// the same from the number of nodes alone ( a perfect tree: its depth follows )
+    bool prepare_for( auto &allocator, SI nb_nodes_ ) {
+        nb_nodes = nb_nodes_;
         depth = 0;
         for ( SI m = nb_nodes; m; m >>= 1 )
             ++depth;
@@ -264,23 +272,24 @@ struct Majorants {
     }
 
     /// the majorants of `w` ( rank order, `n` seeds ) into `nodes` ( the card's records ), and into `wa` / `wb` if given
-    template<class PD>
+    template<class PD,class TW = double>
     void refresh( const CudaQueue &queue, const PD &pd, const double *w, Node<true,TR> *nodes,
-                  StridedOut<double,2> wa = {}, StridedOut<double,1> wb = {} ) const {
-        using TB = std::remove_const_t<typename std::decay_t<decltype( pd.tree.node_box )>::TF>;
-        using TJ = std::remove_const_t<typename std::decay_t<decltype( pd.tree.node_begin )>::TF>;
-        using TF = std::remove_const_t<typename std::decay_t<decltype( pd.sorted_positions )>::TF>;
-        const SI n = SI( pd.nb_seeds() );
-        const auto box = strided( pd.tree.node_box );
-        const auto beg = strided( pd.tree.node_begin ), end = strided( pd.tree.node_end );
-        const auto pos = strided( pd.sorted_positions );
+                  StridedOut<TW,2> wa = {}, StridedOut<TW,1> wb = {} ) const {
+        refresh_from( queue, SI( pd.nb_seeds() ), strided( pd.tree.node_box ), strided( pd.tree.node_begin ), strided( pd.tree.node_end ),
+                      strided( pd.sorted_positions ), w, nodes, wa, wb );
+    }
+
+    /// the same from the tree's and the seeds' views ( `n` seeds, tree order ); `nodes` may be null ( no records )
+    template<class TB,class TJ,class TF,class TW>
+    void refresh_from( const CudaQueue &queue, SI n, Strided<TB,3> box, Strided<TJ,1> beg, Strided<TJ,1> end, Strided<TF,2> pos,
+                       const double *w, Node<true,TR> *nodes, StridedOut<TW,2> wa, StridedOut<TW,1> wb ) const {
         for ( int h = 1; h <= depth; ++h ) {
             const TN nb = TN( 1 ) << ( depth - h );
             launch_kernel( queue, &majorant_up<TB,TJ,TF,TN>, int( ( SI( nb ) + BLOCK - 1 ) / BLOCK ), BLOCK, 0,
                            depth, h, nb, box, beg, end, pos, w, st, red );
         }
         launch_kernel( queue, &majorant_spread<TJ,TF,TN>, blocks_for( n ), BLOCK, 0, depth, n, end, pos, w, ( const MajStats * ) st, red );
-        launch_kernel( queue, &majorant_write<TR,TB,TJ>, blocks_for( nb_nodes ), BLOCK, 0, nb_nodes, box, beg, end,
+        launch_kernel( queue, &majorant_write<TR,TB,TJ,TW>, blocks_for( nb_nodes ), BLOCK, 0, nb_nodes, box, beg, end,
                        ( const MajStats * ) st, ( const MajRed * ) red, nodes, wa, wb );
     }
 };

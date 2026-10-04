@@ -29,7 +29,9 @@ the problem and reads what comes out. That is what the `solvers_des_familles` be
 
 The same solve, in ONE ffi call too, whose handler drives the Newton loop on the call's stream ( `gpu/Newton2D.cuh`, see
 `_build_card` ): the tree's majorants, the cells, the laplacian, the linear solver ( the card's multigrid ) and the step all
-run on the card, and the host only reads back the scalars it decides on -- so the solve runs under `jax.jit` as well. It
+run on the card, and the host only reads back the scalars it decides on -- so the solve runs under `jax.jit` as well. The
+tree itself is one more card call just before ( `gpu/Bsp2D.cuh`, `AaBsp._init_on_card` ): under `jax.jit` it is part of
+the jitted program, built at every call, from traced positions as well as from constant ones. It
 takes 2D problems in a box against a CONSTANT density; anything else raises on a card ( the CPU solves it ).
 
 = The starting point
@@ -289,18 +291,30 @@ class SdotPlanNd:
         # carries at a given moment are the last ones set
         # Under a trace ( `jax.jit` ) the weights may be tracers, and a diagram with traced weights falls back on the
         # plain storage. The zeros of a cold start are made on the host ( a constant ); given traced weights, the TREE is
-        # built on the positions alone ( it only depends on them ) and the weights enter its majorants ( a kernel )
+        # built on the positions alone ( it only depends on them ) and the weights enter its majorants ( a kernel ). On the
+        # card, see below.
         accelerator = tun.accelerator
         pos_raw = getattr( src_dist.positions, "raw", src_dist.positions )
-        if w0_given is not None and accelerator is None and not driver.is_traced( pos_raw ) \
+        import numpy as np
+        w_start = np.zeros( int( src_dist.nb_diracs.value ) ) if w0_given is None else w0_given
+        from .AaBsp import AaBsp, builds_on_card
+        if accelerator is None and on_card and builds_on_card( pos_raw ):
+            # ON THE CARD the tree is built by the card ( `gpu/Bsp2D.cuh`, one call ), HERE, outside the `concrete_eval`
+            # below: under a `jit` it is then a part of the jitted program -- built at every call, from traced positions as
+            # well as from constant ones -- and not a constant computed while tracing. The majorants of a cold start ( zero
+            # weights ) are zero: no call for them
+            if w0_given is None:
+                accelerator = AaBsp( pos_raw )
+                accelerator.set_zero_weight_majorants()
+            else:
+                accelerator = AaBsp( pos_raw, getattr( w_start, "raw", w_start ) )
+            accelerator._majorant_weights = w_start
+        elif w0_given is not None and accelerator is None and not driver.is_traced( pos_raw ) \
                 and driver.is_traced( getattr( w0_given, "raw", w0_given ) ):
-            from .AaBsp import AaBsp
             accelerator = AaBsp( pos_raw )
         # ( and what is concrete is EVALUATED under the trace: the domain, the tree, the density's values stay readable )
-        import numpy as np
         with driver.concrete_eval():
-            self._pd = PowerDiagram( src_dist.positions,
-                                     np.zeros( int( src_dist.nb_diracs.value ) ) if w0_given is None else w0_given,
+            self._pd = PowerDiagram( src_dist.positions, w_start,
                                      accelerator = accelerator, kernel_dtype = settings.kernel_dtype,
                                      distribution = dst_dist, memory = tun.memory,
                                      scratch_capacity = tun.scratch_capacity )
