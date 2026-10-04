@@ -540,7 +540,8 @@ if test( "the_card_solves_the_transport" ):
                                      ( "limits host mg", "fp64", Tuning( step = "limits", linear_solver = "mg", linear_host = True ) ),
                                      ( "limits mg float", "fp32", Tuning( step = "limits" ) ),
                                      ( "limits mixed ( auto )", "auto", Tuning( step = "limits" ) ),
-                                     ( "limits mg float levels", "fp64", Tuning( step = "limits", mg_precision = "float" ) ) ):
+                                     ( "limits mg double levels", "fp64", Tuning( step = "limits", mg_precision = "double" ) ),
+                                     ( "limits mg plain aggregation", "fp64", Tuning( step = "limits", mg_smoothed = 0 ) ) ):
         plan = OtProblem( SumOfDiracs( pos, nu ), _box_target() ).solve( Iterative( tol = 1e-10 / n, max_iter = 60, precision = precision, tuning = tuning ) )
         assert plan.converged, ( name, plan.stats )
         w = numpy.asarray( plan.weights ).reshape( -1 )
@@ -562,6 +563,73 @@ if test( "the_card_solves_the_transport" ):
     ref = plans[ "limits mg double" ]
     for name, w in plans.items():
         assert numpy.abs( w - ref ).max() < 1e-9 / n, ( name, numpy.abs( w - ref ).max() * n )
+
+
+def _card_csr( pos ):
+    """the laplacian of the Voronoi diagram of `pos` in the unit box, on the card, in ranks: `( row, col, val, dia )`"""
+    from sdot import AaBsp, PowerDiagram as Pd
+    n = len( pos )
+    pd = Pd( pos, boundaries = box_half_spaces( [ 0, 0 ], [ 1, 1 ] ), kernel_dtype = "FP64", accelerator = AaBsp( pos ) )
+    out = pd._card_cells( facets = True, moments = False )
+    row = numpy.asarray( out[ "row" ].raw ).reshape( -1 ).astype( numpy.int64 )[ :n + 1 ]
+    col = numpy.asarray( out[ "col" ].raw ).reshape( -1 ).astype( numpy.int64 )[ :row[ n ] ]
+    val = numpy.asarray( out[ "val" ].raw ).reshape( -1 )[ :row[ n ] ]
+    dia = numpy.asarray( out[ "dia" ].raw ).reshape( -1 )[ :n ]
+    return row, col, val, dia
+
+
+def _csr_product( row, col, val, dia, x ):
+    """`L x` ( `y_i = dia_i x_i - sum_e val_e x_( col_e )` )"""
+    n = len( dia )
+    off = numpy.zeros( n )
+    nz = numpy.repeat( numpy.arange( n ), numpy.diff( row ) )
+    numpy.add.at( off, nz, val * x[ col ] )
+    return dia * x - off
+
+
+if test( "the_card_linear_solver_solves" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    from sdot.SdotPlanNd import _card_linear_solves
+    rng = numpy.random.default_rng( 106 )
+    # a small system against a dense solve ( the multigrid's variants and CG ), then a larger one ( the hash table of the
+    # Galerkin product: coarse levels over 4096 rows ) against its own residual
+    for n, dense in ( ( 1500, True ), ( 40000, False ) ):
+        pos = rng.uniform( 0.001, 0.999, size = ( n, 2 ) )
+        row, col, val, dia = _card_csr( pos )
+        b = rng.normal( size = ( 3, n ) )
+        b -= b.mean( axis = 1, keepdims = True )                     # the range of the laplacian
+        ref = None
+        if dense:
+            L = numpy.diag( dia )
+            for i in range( n ):
+                L[ i, col[ row[ i ]:row[ i + 1 ] ] ] -= val[ row[ i ]:row[ i + 1 ] ]
+            ref = numpy.linalg.lstsq( L, b.T, rcond = None )[ 0 ].T
+            ref -= ref.mean( axis = 1, keepdims = True )
+        for name, kw in ( ( "mg", {} ), ( "mg double levels", dict( precision = "double" ) ), ( "mg plain", dict( smoothed = 0 ) ),
+                          ( "mg smoothed twice", dict( smoothed = 2 ) ), ( "cg", dict( method = "cg" ) ) ):
+            for tol in ( 1e-6, 1e-10 ):
+                d, its = _card_linear_solves( row, col, val, dia, b, tol = tol, **kw )
+                assert ( its >= 0 ).all(), ( n, name, its )
+                for j in range( len( b ) ):
+                    assert abs( d[ j ].mean() ) < 1e-12 * numpy.abs( d[ j ] ).max(), ( n, name, "the gauge" )
+                    res = numpy.linalg.norm( _csr_product( row, col, val, dia, d[ j ] ) - b[ j ] ) / numpy.linalg.norm( b[ j ] )
+                    assert res < 2 * tol, ( n, name, tol, j, res )
+                    if ref is not None and tol == 1e-10:
+                        assert numpy.abs( d[ j ] - ref[ j ] ).max() < 1e-6 * numpy.abs( ref[ j ] ).max(), ( n, name, j )
+                print( f"  n { n } { name } tol { tol :.0e}: iterations { its.tolist() }" )
+        # the same calls give the same numbers, to the bit
+        d1, _ = _card_linear_solves( row, col, val, dia, b )
+        d2, _ = _card_linear_solves( row, col, val, dia, b )
+        assert numpy.array_equal( d1, d2 ), n
+        # RECYCLING: a right-hand side already solved ( kept in the subspace ) starts at its solution; without recycling,
+        # the same system again is the same solve, to the bit
+        bb = numpy.stack( [ b[ 0 ], b[ 1 ], b[ 0 ] ] )
+        d, its = _card_linear_solves( row, col, val, dia, bb, recycle = 2 )
+        assert its[ 2 ] <= 2 and its[ 0 ] > 3, its
+        d, its = _card_linear_solves( row, col, val, dia, bb, recycle = 0 )
+        assert its[ 2 ] == its[ 0 ] and numpy.array_equal( d[ 2 ], d[ 0 ] ), its
 
 
 if test( "the_card_majorants_bound_the_weights" ):

@@ -766,3 +766,177 @@ AMGCL ~19 ) and a cycle bound by its ~150 small dependent kernels, not by bytes.
 * Memory per solve ~1 GB at 1e6 from XLA's pool ( two cards in mixed, two slots of cells, the CSR, the levels ): ~1e7 seeds on
   the 11 GB card.
 * Under `jax.jit` the tree is built at TRACE time: a function retraced per call ( new positions ) pays it each time.
+
+# GPU step 5: linear solver ( 2026-10-04 )
+
+The card's linear solve was 80-97 % of the card's Newton solve ( step 4 ). It is now **1.8-2.1x faster on every case**, with the same
+Newton counts on the converging cases: t_lin 0.647 -> **0.312 s** at 1e6, 0.100 -> **0.056 s** at 1e5, lines Voronoi 0.431 ->
+**0.220 s**, lines equal 0.700 -> **0.372 s** ( jit, errand; table below ).
+
+Code: `include/sdot/gpu/Linear2D.cuh` ( header = the design ). In short:
+
+* **Smoothed aggregation on the first level only**: `P = ( I - 0.7 D^-1 A ) P0` truncated at 0.3 of each row's largest entry
+  and renormalized ( the CPU `Multigrid.h` recipe ), `P^t` by a transposition ( atomic placement, then each row sorted: values
+  copied, not summed ), `A_c = P^t A P` by **one warp per coarse row and a hash table in shared memory that sums in FIXED
+  POINT** ( 64 bits as two native 32-bit atomics: integers add in any order to the same sum, so the coarse matrix is the same at
+  every run ). Deeper levels: the plain aggregation ( merge of sorted rows, or the same warp product past 12 entries per fine
+  row ) with the **K-cycle moved to levels 2-3** ( the first plain levels ).
+* **Float levels by default** ( `Tuning.mg_precision`: `None` = float now ): the outer flexible CG stays in double. Same
+  iteration counts as double levels.
+* **No double division left in the cycle**: the Chebyshev coefficients and the K-cycle's scalars are computed once by the thread
+  that finishes the reduction they depend on ( a finalizer of `reduce_last` ), not by every thread of every elementwise kernel
+  ( Turing's double is 1/32 of its float: `smooth_fresh` at 1e6 took 104 us for 24 MB, `kcycle_combine` 54 us for 6 MB ).
+* **4 lanes per row** in the matrix-vector kernels of the cycle; reductions on a fixed grid of 272 blocks.
+* Fusions: the plain prolongation inside the post-smoothing ( `e[ j >> 2 ]` read at the neighbours ), the float copies of `r`
+  and `z` inside the CG's update and dot kernels, the CG scalars in the reductions' finalizers; ONE graph per FCG iteration.
+* Options: `LinOptions` ( `smoothed`, `omega`, `truncate`, `nu`, `nu0`, `cheb`, `kcycle`, `kfrom`, `lanes`, ... );
+  `Tuning( mg_smoothed = ... )` ( `None`: 1, `0`: the plain aggregation everywhere ), `bench_newton --mg-smoothed`;
+  `SDOT_CARD_LIN_DUMP=prefix` / `bench_newton --lin-dump=prefix` writes every system a Newton solve hands to the card.
+* Tests ( `test_SdotPlanNd` ): `the_card_linear_solver_solves` ( new ffi hook `SdotPlanNd._card_linear_solves` ->
+  `Newton2D.cuh::linear_solves`: the card's solver on a given CSR; against a dense solve at n = 1500, against its own residual at
+  n = 4e4 where the hash product runs; 5 variants ( mg float / double levels / plain / smoothed twice, cg ), tol 1e-6 and 1e-10;
+  zero mean; two calls equal to the bit; a right-hand side already in the recycled subspace takes <= 2 iterations, the same
+  system twice without recycling gives the same solve to the bit ); `the_card_solves_the_transport` has two more variants
+  ( double levels, plain aggregation ). `test_SdotPlanNd`, `test_CardCells`: green on lmo-jax.
+
+## Protocol
+
+1. `bench_newton --lin-dump` wrote the systems of the four bench solves ( `uniform 1e6` float limits: 5 systems; `1e5`: 5;
+   `lines voronoi`: 12; `lines equal` double: 13 ) to `lmo:/home/leclerc/lindump` ( 0.73 GB ).
+2. `bench/linear/linbench.cu` replays them through `CardLinear` exactly as the Newton loop does ( one solver object, recycling,
+   hierarchies ): it reproduces the bench's linear iterations to the unit ( 244 / 201 / 848 / 1401 ) and t_lin to 1 %
+   ( 0.638 against 0.647 s at 1e6 ). A compile is 10 s instead of minutes: every attempt below was measured this way, then the
+   kept ones through errand. `nsys --cuda-graph-trace=node` for the kernels inside the graphs ( kernel time per ( kernel, grid )
+   = per level ). The card warms up 0.5 s before timing ( without it the first run of a series read 0.0711 instead of 0.0572 s ).
+3. `bench/linear/cpumg.cpp`: the CPU `Multigrid.h` on the same systems, for iteration counts of variants before writing them.
+4. Final numbers: `bench_newton` through errand's queue, `--jit=yes --reps=3`, min of 3.
+
+## Where the time went before ( 1e6, nsys, kernel time per FCG iteration: 2.52 ms, 124 launches )
+
+| fine level | level 1 ( 2.5e5 ) | level 2 ( K x2 ) | levels 3-7 ( K x4 ) | reductions' 2nd pass etc |
+|---|---|---|---|---|
+| 1.11 ms ( `smooth_post` 321 us, `restrict_residual` 254, `SpmvDot` 227, `smooth_fresh` 104 ... ) | 0.64 ms | 0.37 ms | 0.25 ms | 0.1 ms |
+
+The cycle was NOT purely latency bound at 1e6: the fine and first levels were half of it, and double arithmetic ( divisions in
+every thread ) inflated the elementwise kernels 2-5x. At 1e5 the small levels' launches ( ~4 us each, 4 visits per iteration
+by the K-cycle ) are the floor.
+
+## How many iterations the smoothed aggregation saves ( CPU `Multigrid.h`, V-cycle, LDLT bottom, iterations per solve )
+
+| packets / degree | uniform 1e6 | uniform 1e5 | lines Voronoi | lines equal |
+|---|---|---|---|---|
+| card ( step 4: plain, K-cycle, degree 1 ) | 48.8 | 40.2 | 70.7 | 107.8 |
+| SA 8 / nu 3 ( the CPU default ) | 37.6 | 27.4 | 49.8 | 67.9 |
+| SA 8 / nu 1 | 58.2 | 46.0 | 98.4 | 129.6 |
+| SA 4 / nu 1 | 34.8 | 30.8 | 62.3 | 97.6 |
+| SA 4 / nu 2 | 25.4 ( 22.4 with a hierarchy per solve ) | 22.0 | 46.2 | 65.9 |
+| SA 4 / nu 3 | 19.8 | 18.0 | 35.3 | 50.4 |
+| SA 4 / nu 2, smoothed on the first 1 / 2 / 3 levels only, V-cycle | 58.0 / 43.0 / 30.0 | | | |
+| SA 2 / nu 1 | 360 | | | |
+
+( SA 4 at 1e6: operator complexity 2.5, 17.6 / 38 / 78 / 151 / 237 entries per row from level 1 down; truncation 0.1 / 0.2 / 0.3:
+23.6 / 25.4 / 28.8 iterations; omega 0.5 / 0.7 / 0.9: 46 / 25.4 / 32.6; cheb 5 / 10 / 20: no change. )
+
+## Experiment log ( replayed systems; t_lin = the sum over the systems of a solve, min of 2-3; it = iterations per solve )
+
+| # | change | u1e6 | u1e5 | lines V. | lines eq. | kept? |
+|---|---|---|---|---|---|---|
+| 0 | step 4 as committed ( replay ) | 0.638 s, 48.8 it, 2.61 ms/it | 0.0991, 40.2, 0.49 | 0.4255, 70.7, 0.50 | 0.694, 107.8, 0.49 | |
+| 1 | Chebyshev / K-cycle / CG scalars by finalizers ( no division per thread ), prolongation fused into the post-smoothing | 0.598, 2.45 ms/it | 0.0862 | | | yes |
+| 2 | float levels ( measured slower at step 4: the divisions and the double accumulators ate it ) | 0.413, 1.69 | 0.0725 | | | **yes** |
+| 3 | reductions' first pass on 1024 blocks ( vs 240 ): `SpmvDot` 227 -> 281 us; sweep 136 / 240 / 340 / 512 / 1024 / 2048 blocks | 0.400 / 0.395 / 0.394 / 0.412 / 0.413 / 0.414 | 0.0705 / 0.0701 / 0.0705 / 0.0704 / 0.0725 / 0.0728 | | | 272 ( between the best two ) |
+| 4 | matrix kernels capped to 272 / 544 / 1088 blocks ( grid stride ) | 0.391 / 0.392 / 0.393 ( = ) | = | | | no |
+| 5 | the whole FCG loop as ONE graph with a while node ( `cudaGraphSetConditional` from the last finalizer, one read back per solve ) | 0.400 | 0.0767 | | | **no** ( slower than a launch + read back per iteration: 0.0703 ) |
+| 6 | one graph per iteration instead of two | 0.392 | 0.0703 | | | yes ( = , simpler ) |
+| 7 | the V-cycled small levels and the dense bottom in ONE single-block kernel ( barriers instead of launches; the old campaign's negative result ) | tail <= 4096: 0.443 | tail 500: 0.0701, 2000: 0.0805 | 0.3416 ( vs 0.2983 ) | | **no** |
+| 8 | SA on every level ( the CPU recipe, packets 4, nu 2, V-cycle ), first card build ( thread per row, list heads in local memory ) | 1.75 s: 22.4 it ( = CPU ), 3.0 ms/it, BUILD 285 ms per hierarchy | 0.234: 20.2 it, build 38 ms | 0.82: 34.3 it | 0.95: 50.2 it | no |
+| 9 | the same, solve part only ( build excluded ): SA V(1,1) | 0.28 s ( 31.4 it ) vs 0.39 | 0.042 vs 0.083 | 0.180 vs 0.291 | 0.294 vs 0.481 | ( what a cheap build would give ) |
+| 10 | SA on level 0 only, K-cycle on levels 1-2 ( dense level 1 visited twice ) | 0.72: 23.4 it, 3.8 ms/it | | | | no |
+| 11 | SA on level 0 only, K-cycle on levels 2-3 ( `kfrom` ) | 0.430: 36.6 it, build 23 ms | 0.0615: 29.6 it | 0.258: 52.0 | 0.411: 79.8 | **the scheme kept** |
+| 11b | the same with SA on 2 / 3 levels ( K on the 2 levels after ) | | 0.0719 / 0.0852 | 0.288 / 0.370 | | no |
+| 11c | hierarchy reused for 2 / 4 solves ( SA level 0 ) | 0.390 / 0.394 | 0.0593 / 0.0637 | 0.266 / 0.319 ( 56.8 / 70.8 it ) | 0.445 / 0.541 | no ( the lines lose ) |
+| 12 | Galerkin by a warp per coarse row, shared hash, fixed-point sums ( instead of k-way merges in local memory ) | build 77 ms ( all SA ) | | | | yes |
+| 12b | a dense shared accumulator, a block per coarse row, when the coarse level has <= 4096 rows | 56 ms | 11 ms | | | yes ( deep SA levels ) |
+| 12c | ownership instead of the hash ( contributions broadcast by shuffles to the lane owning `col mod 32`, double sums in registers ) | build 83 ms, then 36 ms ( sums in shared ) | | | | no |
+| 12d | sort instead of the hash ( contributions in shared, bitonic by ( column, number ), runs summed in order ) | 37 ms | | | | no ( low occupancy ) |
+| 12e | the hash, its ( i, j ) pairs flattened over the lanes ( was: lanes over the neighbours of one i, 20 % busy ) | 17 ms | 2.1 ms | 0.248 | 0.399 | yes |
+| 12f | `P` and the products in the level's precision ( double was compute bound: ncu 84 % SM ), the plain level 1 -> 2 by the warp product ( a thread per coarse row read 4 rows of 17 uncoalesced: 2.3 ms ) | 11.8 ms; t_lin 0.368 | 0.0571 | 0.244 | 0.394 | yes |
+| 12g | `P^t` by transposition + row sort ( instead of a merge of the members' neighbours per coarse row: 3.9 ms ) | 9.1 ms; 0.3506 | 0.0565 | 0.2421 | 0.3927 | yes |
+| 13 | truncate 0.3 / cheb 20 ( sweep: truncate 0.1 / 0.2 / 0.25 / 0.3, omega 0.7 / 0.8, cheb 10 / 20, packets 8, K on 3 levels, nu0 = 2 ) | 0.3323: 37.2 it | 0.0568: 30.6 | 0.2326: 51.6 | 0.3840: 80.7 | yes |
+| 13b | nu0 = 2 ( degree 2 on the fine level ) | 0.3835: 35.0 it | 0.0603: 28.6 | 0.2268: 44.4 | **0.3344**: 61.7 | no as default ( the lines gain, uniform loses ) |
+| 14 | the float copies of `r` / `z` inside the CG's update / dots | 0.3257 | 0.0560 | 0.2292 | 0.3785 | yes |
+| 15 | 2 / 4 lanes per row ( 4 lanes measured slower at step 4: the divisions again ) | 0.296 / 0.300 | 0.0548 / 0.0543 | 0.2203 / 0.2147 | 0.3526 ( 4 ) | **4 lanes** |
+| 16 | final ( cleaned ): float levels | **0.299 s, 37.2 it, 1.44 ms/it ( 92 launches )**, build 6.3 ms | **0.0535, 30.6 it, 0.31 ms/it ( 80 launches )** | **0.2138, 51.6 it** | **0.3510, 80.7 it** | |
+| 16b | final, double levels | 0.4127 | 0.0647 | 0.2595 | 0.4264 | ( same it ) |
+| 16c | final, plain aggregation ( `smoothed = 0` ) | 0.3839, 48.2 it | 0.0666, 40.2 | 0.2764, 69.7 | 0.4494, 105.8 | |
+| 16d | card CG ( Jacobi ) | 8.58 s, 4323 it | 0.358, 1268 | 2.66, 3884 | 3.79, 5143 | |
+
+Every final variant: the true relative residuals of all systems < 1e-6, the solutions identical to the bit from one run to the next
+( checksum ).
+
+## Final table ( `bench_newton`, errand queue, jit wall, min of 3; seconds )
+
+| case | kernel | before: it / diag, lin it, t_lin, **total** | after ( SA 1 + K, float levels ): it / diag, lin it, t_lin, **total** | after, plain aggregation ( `--mg-smoothed=0` ): t_lin, total |
+|---|---|---|---|---|
+| uniform 1e6 | float | 5 / 6, 244, 0.647, **0.769** | 5 / 6, 186, **0.312**, **0.437** | 0.397, 0.523 ( 241 lin it ) |
+| uniform 1e6 | double | 5 / 6, 244, 0.649, **1.161** | 5 / 6, 186, **0.312**, **0.839** | 0.398, 0.931 |
+| uniform 1e5 | float | 5 / 6, 201, 0.100, **0.118** | 5 / 6, 153, **0.056**, **0.074** | 0.069, 0.087 |
+| lines voronoi | float | 12 / 13, 848, 0.431, **0.510** | 12 / 13, 619, **0.220**, **0.300** | 0.284, 0.364 |
+| lines equal | double | 13 / 47 ( 34 bt ), 1401, 0.700, **2.043**, stagn. 3.05e-6 | **14 / 52 ( 38 bt )**, 1084, **0.372**, **1.888**, stagn. 2.35e-6 | 13 / 47, 0.462, **1.832**, stagn. 2.35e-6 |
+
+* ms per FCG iteration ( t_lin / lin it, builds included ): 1e6 2.65 -> 1.68, 1e5 0.50 -> 0.37, lines 0.51 -> 0.36 / 0.50 -> 0.34.
+  Kernel time per iteration ( nsys ): 1e6 2.52 -> 1.44 ms, launches per iteration 124 -> 92 ( 80 at 1e5 ).
+* The Newton counts and final residuals are unchanged on the three converging cases. Lines equal STAGNATES at the floor of the
+  double weights ( step 4 ); any change of the directions at the 1e-6 of the linear tolerance moves its backtracking sequence: the
+  plain variant ends at 13 / 47 like before ( 2.35e-6, the CPU's floor, instead of 3.05e-6 ), the smoothed one at 14 / 52 ( 2.35e-6
+  ). Per linear solve the smoothed aggregation is 1.24x faster there too, but the total is 3 % SLOWER than the plain variant
+  ( 1.888 against 1.832 s ) because of the 5 extra diagrams. Not a property of the solver: of a solve that stagnates.
+* The linear solve is now 71 % of the 1e6 float solve ( was 84 % ), 76 % at 1e5, 73 % on lines Voronoi.
+
+## The smoothed aggregation against the plain one, and the old campaign's negative result
+
+The old GPU campaign ( `gpu_des_familles/doc/06-ce-qui-reste.md`, "La prolongation lissée avec `cusparseSpGEMM`: écrite, mesurée,
+et elle PERD", `src/gpu/Lisse2D.cuh`, `AMG_LISSE=1` ) built `P = P0 - w D^-1 A P0`, UNTRUNCATED, on packets of 4, every level, with
+three `cusparseSpGEMM`, a column sort and a transpose per level. At 2e5 ( K on 2 levels, nu 2 ): plain 65 it, hierarchy 4 ms,
+solve 206 ms; smoothed V-cycle 64 it, hierarchy **289 ms**, solve 234 ms; smoothed + K 35 it, 289 + 442 ms ( 3.65 ms per
+iteration against 3.17: denser coarse levels ). At 1e6 the smoothed V-cycle did not converge ( 20000 it ) and smoothed + K took
+278 it / 6.9 s against 75 / 0.85 s. Its conclusion: the K-cycle on the plain aggregation reaches the smoothed V-cycle's
+convergence for a 70x cheaper setup ( AGMG's argument ).
+
+What differs here, and why it wins this time: ( 1 ) the CPU's TRUNCATION and renormalization ( operator complexity 2.5 instead of
+the untruncated blow-up: 278 entries per row at the bottom ), ( 2 ) the smoothed transfer on the FIRST level only, the plain one
+and the K-cycle below ( smoothing every level on the card costs 2.9-3.8 ms per iteration: the dense coarse rows ), ( 3 ) a
+hand-written Galerkin product, one warp per coarse row with fixed-point hashing: **6-9 ms per hierarchy at 1e6, ~1.4 ms at 1e5**
+( 285 ms for the first version here, 289 ms with SpGEMM at 2e5 in the old campaign ). Measured both ways on the same cases
+( tables above ): the smoothed first level wins on t_lin everywhere ( 1.21-1.29x ) and on the total of every converging case.
+
+## Findings on the way
+
+* `RED_GRID`-like reductions: more resident threads in a fused matrix-vector reduction made it SLOWER ( 227 -> 281 us at 1e6 ).
+* Two step-4 rejections were the double divisions in disguise: float levels and 4 lanes per row both win once the per-thread
+  divisions are gone.
+* A CUDA graph's while node ( device-driven loop, one read back per solve ) is slower on this driver / Turing than a graph launch
+  and a read back per iteration ( 0.0767 vs 0.0703 s at 1e5 ): the per-iteration synchronization is not where the time goes.
+* A name `d` for an output of an ffi call breaks loom's generated aggregates ( `template<int d>` ): the test hook uses `solution`.
+
+## What remains
+
+* The fine level is ~55 % of an iteration at 1e6: the outer CG's double SpMV ( 221 us, ~430 GB/s ) and the double update / dots
+  are at bandwidth; what is left is fusing the direction into the SpMV ( a second buffer of `p`, two graphs ), int32 row pointers
+  in the float copy ( 4 of ~52 MB per pass ), maybe 5 %.
+* Degree 2 on the fine level ( `nu0 = 2` ) is 13 % faster on lines equal and 15 % slower on uniform 1e6: a per-input choice that
+  Python cannot make from `n` alone; not exposed in `Tuning` yet ( `LinOptions::nu0` ).
+* The Galerkin count pass ( 1.5 ms of the ~6-9 at 1e6 ) could go with a fixed-width first write; the dense rows of deeper smoothed
+  levels make `smoothed >= 2` cost more than it saves on the card.
+* 3D ( 15-27 entries per row: the warp product and 4 lanes should carry over; packets of 8 ).
+
+## Risks
+
+* The Galerkin hash table holds at most 512 columns per coarse row ( 64 to 512, retried larger when full ): past it the build
+  fails and the Newton reports a linear failure ( not seen: the first smoothed level has ~18 per row on these clouds; deeper
+  smoothed levels use the dense block path up to 4096 coarse rows ).
+* Fixed point: the scale is `2^61` over a bound of the row's sum of magnitudes; entries smaller than ~1e-18 of the row's largest
+  are lost ( harmless for a preconditioner; the fine operator of the outer CG is the exact double laplacian ).
+* Float levels: a preconditioner in float on a system that needs 1e-6; same counts as double on the four cases and the tests.
+* The stagnating case ( lines equal ) moves its counts with any change of the solver ( above ).
+* `lmo:/home/leclerc/lindump` ( 0.73 GB of dumped systems ) and `lmo:/home/leclerc/linbench` are left for further work.

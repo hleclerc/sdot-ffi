@@ -122,7 +122,14 @@ errand -k bench --env lmo-jax bench_newton --case=lines_voronoi,lines_equal --st
 errand -k bench --env lmo-jax bench_newton --case=uniform --dim=2 --linear-host=yes --linear-solver=mg,amg,cholesky   # CPU solvers on a copy
 errand -k bench --env lmo-numpy bench_newton --case=lines_voronoi --step=limits --threads=8 --save-weights=/tmp/w_cpu_lv.npy
 errand -k bench --env lmo-jax bench_newton --case=lines_voronoi --step=limits --compare=/tmp/w_cpu_lv.npy        # the plans
+errand -k bench --env lmo-jax bench_newton --case=uniform --dim=2 --mg-smoothed=0                    # the card's multigrid, plain aggregation
+errand -k bench --env lmo-jax bench_newton --case=uniform --dim=2 --jit=no --reps=1 --lin-dump=/home/leclerc/lindump/u1e5   # the linear systems to files
 ```
+
+THE CARD'S LINEAR SOLVER ALONE ( `calibration_lmo_today.md`, "GPU step 5" ): `--lin-dump=prefix` writes every system a Newton
+solve hands to the card ( `Linear2D.cuh::dump_system` ); `linear/linbench.cu` replays them through the card's solver as the
+Newton loop does ( same iterations, same time, a 10 s compile: the way to try a variant ), `linear/cpumg.cpp` through the CPU's
+`Multigrid.h` ( iteration counts ). Their headers say how to build and run them.
 
 ### Threads
 

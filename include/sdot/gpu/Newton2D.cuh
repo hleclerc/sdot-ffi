@@ -70,7 +70,7 @@ namespace sp = sdot::sdotplan;
 enum Opt : int {
     O_TOL_ABS = 0, O_TOL_REL, O_T_MIN, O_MULT_OK, O_FACTOR, O_MAXIT, O_MAX_BACKTRACKS, O_STEP, O_RESIDUAL, O_POWER, O_SWITCH,
     O_LIN, O_HOST_METHOD, O_LIN_TOL, O_AMG_VARIANT, O_MG_SHIFT, O_MG_RECYCLE, O_MG_REBUILD, O_MG_STOP, O_MG_NU, O_MG_KCYCLE,
-    O_LIN_MAXIT, O_TRACE, O_MG_FLOAT,
+    O_LIN_MAXIT, O_TRACE, O_MG_FLOAT, O_MG_SMOOTHED,
     NB_OPTS
 };
 enum StepKind : int { STEP_TRIALS = 0, STEP_LIMITS = 1 };
@@ -580,6 +580,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
         if ( o[ O_MG_STOP ] > 0 ) lo.stop = int( o[ O_MG_STOP ] );
         if ( o[ O_MG_NU ] > 0 ) lo.nu = int( o[ O_MG_NU ] );
         if ( o[ O_MG_KCYCLE ] >= 0 ) lo.kcycle = int( o[ O_MG_KCYCLE ] );
+        if ( o[ O_MG_SMOOTHED ] >= 0 ) lo.smoothed = int( o[ O_MG_SMOOTHED ] );
         lo.trace = trace;
         if ( lin_kind == LIN_HOST ) {
             sp::LinearOptions hl;
@@ -969,6 +970,77 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
         cuda_check( cudaStreamSynchronize( queue.stream ), "sync ( stats )" );
     }
     tm_maj.release(); tm_diag.release(); tm_asm.release(); tm_lim.release();
+}
+
+// ---- the card's linear solver alone ( a test hook: `SdotPlanNd._card_linear_solves` ) -----------------------------------
+
+template<class T,class D>
+__global__ void __launch_bounds__( BLOCK ) read_as( SI n, Strided<T,1> src, D *dst ) {
+    const SI k = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( k < n ) dst[ k ] = D( src( k ) );
+}
+
+/// the options of `linear_solves`, ONE real tensor, in the order of `SdotPlanNd._card_linear_solves`
+enum LinTestOpt : int { LT_N = 0, LT_K, LT_METHOD, LT_TOL, LT_SMOOTHED, LT_FLOAT, LT_RECYCLE, LT_REBUILD, LT_KCYCLE, LT_NU, NB_LT_OPTS };
+
+template<class TV>
+void linear_solves_in( const CudaQueue &queue, auto &allocator, const CsrView<SI> &L, SI nnz, SI k, const double *b, double *d,
+                       std::vector<double> &its, const LinOptions &lo ) {
+    CardLinear<SI,TV> lin;
+    if ( ! lin.prepare( allocator, L.n, nnz, lo ) )
+        return;
+    for ( SI j = 0; j < k; ++j ) {
+        const int it0 = lin.st.nb_iter;
+        const bool ok = lin.solve( queue, allocator, L, b + j * L.n, d + j * L.n );
+        its[ j ] = ok ? double( lin.st.nb_iter - it0 ) : -1.0;
+    }
+}
+
+/// `k` systems `L d_j = b_j` with ONE laplacian ( `row`, `col`, `val`, `dia`: the CSR of `Laplacian2D.cuh` ), solved in sequence
+/// by ONE solver, as in a Newton solve ( the recycled start, the hierarchy per solve or reused ). `rhs`: the `k n` values of
+/// the `b_j` ( each of zero sum ); `opts`: `NB_LT_OPTS` reals. Out: `d` ( `k n`, each of zero mean ) and `its` ( `k`: the
+/// iterations of each solve, -1 for a failure ).
+void linear_solves( const CudaQueue &queue, const auto &row_in, const auto &col_in, const auto &val_in, const auto &dia_in, const auto &rhs_in,
+                    const auto &opts_in, auto &&d_out, auto &&its_out, auto &allocator ) {
+    auto vec = [&]( SI m ) { return static_cast<double *>( take( allocator, SI( sizeof( double ) ) * std::max<SI>( m, 1 ) ) ); };
+    std::vector<double> o( NB_LT_OPTS, 0.0 );
+    double *tmp = vec( NB_LT_OPTS );
+    if ( ! tmp ) return;
+    launch_kernel( queue, &read_strided<double>, 1, BLOCK, 0, SI( NB_LT_OPTS ), strided( opts_in ), tmp );
+    read_back( queue, o.data(), ( const double * ) tmp, SI( NB_LT_OPTS ) );
+    const SI n = SI( o[ LT_N ] ), k = SI( o[ LT_K ] );
+    SI *row = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * ( n + 1 ) ) );
+    if ( ! row ) return;
+    launch_kernel( queue, &read_as<std::remove_const_t<typename std::decay_t<decltype( row_in )>::TF>,SI>, blocks_for( n + 1 ), BLOCK, 0, n + 1, strided( row_in ), row );
+    SI nnz = 0;
+    read_back( queue, &nnz, ( const SI * ) row + n, 1 );
+    SI *col = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * std::max<SI>( nnz, 1 ) ) );
+    double *val = vec( nnz ), *dia = vec( n ), *b = vec( k * n ), *d = vec( k * n );
+    if ( ! col || ! val || ! dia || ! b || ! d ) return;
+    launch_kernel( queue, &read_as<std::remove_const_t<typename std::decay_t<decltype( col_in )>::TF>,SI>, blocks_for( nnz ), BLOCK, 0, nnz, strided( col_in ), col );
+    launch_kernel( queue, &read_strided<double>, blocks_for( nnz ), BLOCK, 0, nnz, strided( val_in ), val );
+    launch_kernel( queue, &read_strided<double>, blocks_for( n ), BLOCK, 0, n, strided( dia_in ), dia );
+    launch_kernel( queue, &read_strided<double>, blocks_for( k * n ), BLOCK, 0, k * n, strided( rhs_in ), b );
+    LinOptions lo;
+    lo.method = int( o[ LT_METHOD ] );
+    if ( o[ LT_TOL ] > 0 ) lo.tol = o[ LT_TOL ];
+    if ( o[ LT_SMOOTHED ] >= 0 ) lo.smoothed = int( o[ LT_SMOOTHED ] );
+    if ( o[ LT_RECYCLE ] >= 0 ) lo.recycle = int( o[ LT_RECYCLE ] );
+    if ( o[ LT_REBUILD ] > 0 ) lo.rebuild = int( o[ LT_REBUILD ] );
+    if ( o[ LT_KCYCLE ] >= 0 ) lo.kcycle = int( o[ LT_KCYCLE ] );
+    if ( o[ LT_NU ] > 0 ) lo.nu = int( o[ LT_NU ] );
+    const CsrView<SI> L{ n, row, col, val, dia };
+    std::vector<double> its( k, -1.0 );
+    if ( o[ LT_FLOAT ] != 0 && lo.method == 1 )
+        linear_solves_in<float>( queue, allocator, L, nnz, k, b, d, its, lo );
+    else
+        linear_solves_in<double>( queue, allocator, L, nnz, k, b, d, its, lo );
+    launch_kernel( queue, &write_strided<double>, blocks_for( k * n ), BLOCK, 0, k * n, ( const double * ) d, strided_out<double,1>( d_out ) );
+    double *hits = vec( k );
+    if ( ! hits ) return;
+    cuda_check( cudaMemcpyAsync( hits, its.data(), sizeof( double ) * k, cudaMemcpyHostToDevice, queue.stream ), "copy of the counts" );
+    launch_kernel( queue, &write_strided<double>, 1, BLOCK, 0, k, ( const double * ) hits, strided_out<double,1>( its_out ) );
+    cuda_check( cudaStreamSynchronize( queue.stream ), "sync ( counts )" );
 }
 
 } // namespace sdot::gpu2d

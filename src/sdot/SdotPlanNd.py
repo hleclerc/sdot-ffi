@@ -137,11 +137,47 @@ class _Options( Aggregate ):
 #: the card solver's options, ONE real tensor ( `gpu/Newton2D.cuh::Opt`, same order )
 _CARD_OPTIONS = [ "tol_abs", "tol_rel", "t_min", "mult_ok", "factor", "maxit", "max_backtracks", "step", "residual", "power", "switch",
                   "lin", "host_method", "lin_tol", "amg_variant", "mg_shift", "mg_recycle", "mg_rebuild", "mg_stop", "mg_nu", "mg_kcycle",
-                  "lin_maxit", "trace", "mg_float" ]
+                  "lin_maxit", "trace", "mg_float", "mg_smoothed" ]
 
 
-#: the precision of the card multigrid's levels by default ( the outer flexible CG is in double either way )
-_CARD_MG_PRECISION = "double"
+def _card_linear_solves( row, col, val, dia, rhs, method = "mg", tol = 1e-6, smoothed = None, precision = "float", recycle = 2, rebuild = 1,
+                         kcycle = -1, nu = 0 ):
+    """THE CARD'S LINEAR SOLVER ALONE ( a test hook, `gpu/Newton2D.cuh::linear_solves` ): the systems `L d_j = rhs[ j ]` ( each
+    `rhs[ j ]` of zero sum ) with ONE laplacian `L` given as the CSR of `Laplacian2D.cuh` ( `row`, `col`, `val > 0` the
+    off-diagonals, `dia` ), solved in sequence by ONE solver, as along a Newton solve ( the recycled start: `recycle`
+    solutions; a hierarchy every `rebuild` solves ). `method`: `"mg"` or `"cg"`; `smoothed`: the levels of the smoothed
+    aggregation ( `None`: the default ); `precision`: of the multigrid's levels. Returns `( d, its )`: the solutions ( zero
+    mean, `k x n` ) and the iterations of each solve ( -1: failed )."""
+    import numpy as np
+    rhs = np.atleast_2d( np.asarray( rhs, dtype = np.float64 ) )
+    k, n = rhs.shape
+    row = np.asarray( row, dtype = np.int64 ).reshape( -1 )[ :n + 1 ]
+    nnz = int( row[ n ] )
+    opts = [ n, k, 0 if method == "cg" else 1, tol, -1 if smoothed is None else smoothed, int( precision == "float" ), recycle, rebuild, kcycle, nu ]
+    def axis( m, name ):
+        return Axis( ShapeVar( int( m ) ), name = name )
+    solution = RealTensor[ axis( k * n, "num_lin_all" ) ]()
+    iterations = RealTensor[ axis( k, "num_lin_rhs" ) ]()
+    loom.ffi_call(
+        "sdotplan_card_linear_2d",
+        FfiCode.inline( "sdot::gpu2d::linear_solves( queue, args.inputs.row, args.inputs.col, args.inputs.val, args.inputs.dia, args.inputs.rhs, "
+                        "args.inputs.options, args.outputs.solution, args.outputs.iterations, args.allocator );",
+                        includes = [ "sdot/gpu/Newton2D.cuh" ], sources = [ "sdot/sdotplan/Linear.cpp" ], allocator = True ),
+        row = IntTensor[ axis( n + 1, "num_lin_row" ), dict( size = 64 ) ]( row ),
+        col = IntTensor[ axis( max( nnz, 1 ), "num_lin_nnz" ), dict( size = 64 ) ]( np.asarray( col, dtype = np.int64 ).reshape( -1 )[ :max( nnz, 1 ) ] ),
+        val = RealTensor[ axis( max( nnz, 1 ), "num_lin_val" ) ]( np.asarray( val, dtype = np.float64 ).reshape( -1 )[ :max( nnz, 1 ) ] ),
+        dia = RealTensor[ axis( n, "num_lin_dia" ) ]( np.asarray( dia, dtype = np.float64 ).reshape( -1 )[ :n ] ),
+        rhs = RealTensor[ axis( k * n, "num_lin_b" ) ]( rhs.reshape( -1 ) ),
+        options = RealTensor[ axis( len( opts ), "num_lin_opt" ) ]( np.asarray( opts, dtype = np.float64 ) ),
+        solution = loom.out( solution ),               # ( not `d`: a name loom's generated templates use )
+        iterations = loom.out( iterations ),
+    )
+    return np.asarray( solution.raw ).reshape( k, n ), np.asarray( iterations.raw ).reshape( -1 ).astype( int )
+
+
+#: the precision of the card multigrid's levels by default ( the outer flexible CG is in double either way ): float, the
+#: same iteration counts as double and 1.15-1.4x faster ( `calibration_lmo_today.md`, GPU step 5 )
+_CARD_MG_PRECISION = "float"
 
 
 def card_facet_capacity( nb_seeds ):
@@ -444,6 +480,7 @@ class SdotPlanNd:
         if mg_precision not in ( "float", "double" ):
             raise ValueError( f"mg_precision: 'float' or 'double' ( got { mg_precision !r } )" )
         put( "mg_float", int( mg_precision == "float" ) )
+        put( "mg_smoothed", -1 if getattr( tun, "mg_smoothed", None ) is None else tun.mg_smoothed )
         options = RealTensor[ Axis( ShapeVar( len( _CARD_OPTIONS ) ), name = "num_card_opt" ) ]( np.asarray( opts, dtype = np.float64 ) )
 
         weights = RealTensor[ pd.num_point ]()

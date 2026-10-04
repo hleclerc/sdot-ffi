@@ -75,10 +75,12 @@ class Tuning:
                   mg_pack = None, mg_recycle = None, mg_rebuild = None, mg_stop = None, mg_nu = None,
                   # ON A CUDA CARD ( `gpu/Linear2D.cuh` ): the levels accelerated by the K-cycle ( `None`: 2 ), and
                   # `linear_host = True` to solve on the host with the CPU solver named by `linear_solver` ( a copy of the
-                  # laplacian each way ) instead of the card's multigrid / CG; the card's multigrid defaults are those of
-                  # the old GPU campaign ( packets of 4, Chebyshev degree 1, recycling 2, a hierarchy per solve ); `mg_precision`
-                  # ( `"float"` / `"double"`, `None`: double -- float measured slower ) the precision of its levels, the outer iteration being in double
-                  mg_kcycle = None, linear_host = False, mg_precision = None,
+                  # laplacian each way ) instead of the card's multigrid / CG; the card's multigrid: packets of 4, the first
+                  # `mg_smoothed` levels by the smoothed aggregation ( `None`: 1; 0: the plain aggregation everywhere, the
+                  # multigrid of the old GPU campaign ), Chebyshev degree 1, K-cycle on the 2 levels after the smoothed ones,
+                  # recycling 2, a hierarchy per solve; `mg_precision` ( `"float"` / `"double"`, `None`: float ) the
+                  # precision of its levels, the outer iteration being in double ( `calibration_lmo_today.md`, GPU step 5 )
+                  mg_kcycle = None, linear_host = False, mg_precision = None, mg_smoothed = None,
                   # the scale of the width continuation ( § 9.2 : the ratio sqrt( 2 ) is measured )
                   conv_start = None, conv_ratio = 2 ** 0.5, conv_min = None, conv_threshold = 1e-2,
                   # the damping safeguards ( § 3 : `restart_factor = 4` is measured )
@@ -103,6 +105,7 @@ class Tuning:
         self.mg_kcycle         = mg_kcycle
         self.linear_host       = bool( linear_host )
         self.mg_precision      = mg_precision
+        self.mg_smoothed       = mg_smoothed
         self.conv_start        = conv_start
         self.conv_ratio        = conv_ratio
         self.conv_min          = conv_min

@@ -84,8 +84,10 @@ if p := bench( "newton",
                linear_host   = Param( "no", choices = [ "no", "yes" ], help = "ON THE CARD: the linear solver on the host ( the CPU's, through a copy )" ),
                mg_precision  = Param( "auto", choices = [ "auto", "float", "double" ], help = "ON THE CARD: the precision of the multigrid's levels" ),
                mg_kcycle     = Param( -1, help = "ON THE CARD: levels accelerated by the K-cycle ( -1: the default, 2 )" ),
+               mg_smoothed   = Param( -1, help = "ON THE CARD: levels passed on by the smoothed aggregation ( -1: the default, 1; 0: plain aggregation )" ),
                trace         = Param( "no", choices = [ "no", "yes" ], help = "print the solver's trace ( per iteration, per linear solve )" ),
                card_graphs   = Param( "yes", choices = [ "yes", "no" ], help = "ON THE CARD: the linear solver's iterations replayed from CUDA graphs ( no: plain launches, every kernel timed )" ),
+               lin_dump      = Param( "", help = "ON THE CARD: write every linear system to `<prefix>_<k>.bin` ( `SDOT_CARD_LIN_DUMP`, `Linear2D.cuh::dump_system` )" ),
                all_slots     = Param( "no", choices = [ "no", "yes" ], help = "ON THE CARD: print every timed kernel slot ( index, ms, launches, registers )" ),
                save_weights  = Param( "", help = "save the final weights ( .npy )" ),
                compare       = Param( "", help = "compare the final weights with a saved .npy ( max |w - w_ref| after the gauge, relative to 1 / n )" ) ):
@@ -94,6 +96,9 @@ if p := bench( "newton",
     if p.card_graphs == "no":
         import os
         os.environ[ "SDOT_CARD_GRAPHS" ] = "0"
+    if p.lin_dump:
+        import os
+        os.environ[ "SDOT_CARD_LIN_DUMP" ] = p.lin_dump
     if p.openmp >= 0:
         benchlib.set_openmp( p.openmp )
     import time
@@ -120,6 +125,7 @@ if p := bench( "newton",
                                            mg_pack = p.mg_pack or None, mg_recycle = None if p.mg_recycle < 0 else p.mg_recycle,
                                            mg_rebuild = p.mg_rebuild or None, mg_stop = p.mg_stop or None, mg_nu = p.mg_nu or None,
                                            mg_kcycle = None if p.mg_kcycle < 0 else p.mg_kcycle,
+                                           mg_smoothed = None if p.mg_smoothed < 0 else p.mg_smoothed,
                                            mg_precision = None if p.mg_precision == "auto" else p.mg_precision, linear_host = p.linear_host == "yes",
                                            memory = None if p.memory < 0 else p.memory ) )
 
