@@ -787,6 +787,33 @@ if test( "the_accelerator_survives_the_degenerate_layouts" ):
     assert numpy.allclose( _measures( plain ), _measures( fast ), atol = 1e-9 )
 
 
+if test( "the_accelerator_survives_concurrent_bisectors" ):
+    # a seed in the middle of a ring of `k` seeds: the bisectors of the ring seeds with one another ALL go through
+    # the centre, and the tree proposes them BEFORE the centre seed ( the closest boxes first ). The cell of a ring
+    # seed is then, for a while, a fan of vertices within 1e-14 of the centre, and the next ring bisector passes
+    # through them: their signs are noise, the outside comes in several runs, and the cut took them as one
+    # ( a NaN or a wrong area, on every device: the register kernel on a CPU, the memory one on a GPU ). The plain
+    # storage cuts by the centre first and never sees it. Both kernels: the float one cut wrong too ( NaN, the sum
+    # of the measures off by 4e-3 ).
+    def ring( k, rng, n_back = 2000 ):
+        a = 2 * numpy.pi * ( numpy.arange( k ) + rng.uniform( -0.1, 0.1, k ) ) / k
+        r = 0.5 + 0.2 * numpy.stack( [ numpy.cos( a ), numpy.sin( a ) ], axis = 1 )
+        back = rng.uniform( 0.001, 0.999, size = ( n_back, 2 ) )
+        return numpy.concatenate( [ [ [ 0.5, 0.5 ] ], r, back[ numpy.linalg.norm( back - 0.5, axis = 1 ) > 0.3 ] ] )
+
+    box2 = box_half_spaces( [ 0, 0 ], [ 1, 1 ] )
+    for seed, k in ( ( 10, 300 ), ( 2, 300 ), ( 3, 100 ), ( 4, 40 ) ):
+        pos = ring( k, numpy.random.default_rng( seed ) )
+        ref = _measures( PowerDiagram( pos, boundaries = box2, accelerator = "plain" ) )
+        assert abs( ref[ 0 ] - k * 0.1 ** 2 * numpy.tan( numpy.pi / k ) ) < 0.2 * ref[ 0 ]   # ~ the k-gon of apothem 0.1
+        for kernel, tol in ( ( "FP64", 1e-9 ), ( "FP32", 1e-4 ) ):
+            m = _measures( PowerDiagram( pos, boundaries = box2, accelerator = AaBsp( pos ), kernel_dtype = kernel ) )
+            assert not numpy.isnan( m ).any(), ( seed, k, kernel, numpy.flatnonzero( numpy.isnan( m ) ) )
+            gap = numpy.abs( m - ref ) / ref
+            assert gap.max() < tol, ( seed, k, kernel, gap.argmax(), gap.max() )
+            assert abs( m.sum() - 1 ) < ( 1e-12 if kernel == "FP64" else 1e-6 ), ( seed, k, kernel, m.sum() )
+
+
 if test( "an_unbounded_diagram_falls_back_to_the_full_sweep" ):
     # without a domain, a cell is not the hull of its vertices as long as it is not
     # bounded, so there is nothing to prune against: the walk must visit everything, and the

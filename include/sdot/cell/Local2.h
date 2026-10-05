@@ -222,6 +222,19 @@ struct Local2 {
             const int q = i ? i - 1 : nb - 1;
             if ( s[ i ] > 0 && ! ( s[ q ] > 0 ) ) { i1 = i; break; }
         }
+        // ... in exact arithmetic. In the kernel's float a plane that passes through vertices that are ON it
+        // ( concurrent bisectors: seeds on a circle around another one, whose bisectors all go through its
+        // centre ) sees their signs as noise, and the outside comes in SEVERAL runs -- taken as one, the
+        // reassembly reads an inside anchor that is outside ( `0 / 0` ) or drops vertices. The run that holds
+        // the farthest vertex is then the cut; the others are on the plane, and stay ( `Cell2D.cuh::main_run`,
+        // the card's ). The check walks the run only, and stops at its first hole.
+        for ( int o = 1, i = i1 + 1; o < nb_out; ++o, ++i ) {
+            if ( i == nb ) i = 0;
+            if ( ! ( s[ i ] > 0 ) ) {
+                main_run( i1, nb_out );
+                break;
+            }
+        }
 
         const int nb_in  = nb - nb_out;
         const int new_nb = nb_in + 2;
@@ -280,6 +293,21 @@ struct Local2 {
                 has_planes = false;                      // nothing left to push back: we no longer keep them
         }
         return CutStatus::CUT;
+    }
+
+    /// the rare path of `cut_impl`: the cyclic run of `s > 0` that holds the largest `s` ( `s` up to date ),
+    /// as its first vertex and its length. There is an inside vertex ( `cut_impl` returned on an empty cell ).
+    HD void main_run( int &i1, int &nb_out ) const {
+        int a = 0;
+        for ( int i = 1; i < nb; ++i )
+            a = s[ i ] > s[ a ] ? i : a;
+        i1 = a;
+        for ( int q = a ? a - 1 : nb - 1; s[ q ] > 0; q = q ? q - 1 : nb - 1 )
+            i1 = q;
+        nb_out = 1;
+        for ( int q = a + 1 < nb ? a + 1 : 0; s[ q ] > 0; q = q + 1 < nb ? q + 1 : 0 )
+            ++nb_out;
+        nb_out += ( a - i1 + nb ) % nb;
     }
 
     // ---- the replacement simplex ---------------------------------------------------------------

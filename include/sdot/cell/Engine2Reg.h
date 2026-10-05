@@ -67,7 +67,7 @@ namespace engine2 {
 
 enum : int {
     FINISHED    = -2,   ///< the supplier has nothing left: the cell is finished, at `NB` vertices
-    OVERFLOWED = -1,   ///< beyond eight: `Local2` carries the eight vertices, and `pending` the cut
+    OVERFLOWED = -1,   ///< beyond eight ( or a cut of several outside runs ): `Local2` carries the vertices, and `pending` the cut
     EMPTY    =  0,   ///< a half-plane took everything away
 };
 
@@ -103,6 +103,17 @@ template<int NB,class TK,class Provider>
 
         // ---- THE TWO ENDS OF THE OUTSIDE RANGE.
         const unsigned prev = ( ( m << 1 ) | ( m >> ( NB - 1 ) ) ) & valid;
+        if ( const unsigned starts = m & ~prev; __builtin_expect( ( starts & ( starts - 1 ) ) != 0, 0 ) ) {
+            // SEVERAL outside runs: the signs of vertices that are on the plane in exact arithmetic are noise
+            // ( concurrent bisectors, see `Local2::cut_impl` ). The memory cut knows how to pick the run that
+            // matters: this cut goes there, by the overflow's door ( no call in the loop, the registers stay )
+            a.nb = NB;
+            pending = p;
+            vx.store_unaligned( a.vx );
+            vy.store_unaligned( a.vy );
+            cid.store_unaligned( reinterpret_cast<asimd::SI32 *>( a.cid ) );
+            return OVERFLOWED;
+        }
         const unsigned next = ( ( m >> 1 ) | ( m << ( NB - 1 ) ) ) & valid;
         const int i1 = __builtin_ctz( m & ~prev );          // first OUTSIDE of the range
         const int j2 = __builtin_ctz( m & ~next );          // last OUTSIDE
@@ -157,7 +168,8 @@ template<int NB,class TK,class Provider>
     }
 }
 
-/// THE EXCURSION, in place in `Local2`, until the cell drops back to eight vertices.
+/// THE EXCURSION, in place in `Local2`, until the cell drops back to eight vertices ( or less: a cut of several
+/// outside runs comes here from a smaller cell, and goes back at once ).
 /// Returns the new size ( and reloads the registers ), `EMPTY`, `FINISHED` -- or `NO_ROOM` of
 /// `CutStatus` ( > 8 ) if the capacity is not enough.
 template<class TK,class Provider>
