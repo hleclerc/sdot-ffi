@@ -86,8 +86,16 @@ __global__ void __launch_bounds__( BLOCK ) blur_norms( SI len, SI r, const doubl
     wsum[ p ] = s;
 }
 
-/// one axis of the separable filter: `dst = sum_k ker src( . + k ) / wsum`, in the order of the CPU's loop
-__global__ void __launch_bounds__( BLOCK ) blur_axis( SI nx, SI ny, int axis, SI r, const double *ker, const double *wsum, const double *src, double *dst ) {
+/// a flat buffer of doubles, read like the input ( `Strided` )
+struct FlatDoubles {
+    const double *p;
+    __device__ __forceinline__ double operator()( SI k ) const { return p[ k ]; }
+};
+
+/// one axis of the separable filter: `dst = sum_k ker src( . + k ) / wsum`, in the order of the CPU's loop ( `src`: the
+/// input as given, or the other axis's output )
+template<class Src>
+__global__ void __launch_bounds__( BLOCK ) blur_axis( SI nx, SI ny, int axis, SI r, const double *ker, const double *wsum, Src src, double *dst ) {
     const SI flat = SI( blockIdx.x ) * BLOCK + threadIdx.x;
     if ( flat >= nx * ny )
         return;
@@ -95,7 +103,7 @@ __global__ void __launch_bounds__( BLOCK ) blur_axis( SI nx, SI ny, int axis, SI
     const SI p = axis ? j : i, len = axis ? ny : nx, stride = axis ? nx : 1;
     const SI lo = -r > -p ? -r : -p, hi = r < len - 1 - p ? r : len - 1 - p;
     double s = 0;
-    for ( SI k = lo; k <= hi; ++k ) s += ker[ k + r ] * src[ flat + k * stride ];
+    for ( SI k = lo; k <= hi; ++k ) s += ker[ k + r ] * double( src( flat + k * stride ) );
     dst[ flat ] = s / wsum[ p ];
 }
 
@@ -135,32 +143,34 @@ struct ConstDensityHost {
     void   at( const CudaQueue &, double, bool ) {}
 };
 
-/// an image ( see the header ): `geom` = `x0, y0, hx, hy, nx, ny`
+/// an image ( see the header ): `geom` = `x0, y0, hx, hy, nx, ny`. Four doubles per pixel: the density at the current width
+/// `v` and the three prefix sums ( `s1` is the blur's scratch between the two axes: the prefix sums come after ). The input
+/// is read where it is, at each width ( the continuation goes from wide to sharp: each stage starts again from it ). `v` is
+/// kept rather than taken from the differences of `s0`: a zero pixel stays an exact zero ( the laplacian's facets ).
+template<class TFV>
 struct ImageDensityHost {
     using Dev = DensImage;
     Dev     dev{};
     static constexpr bool possible = true;
     SI      nx = 0, ny = 0;
     double  x0 = 0, y0 = 0, hx = 1, hy = 1;
-    double *v0 = nullptr, *v = nullptr, *tmp = nullptr, *s0 = nullptr, *s1 = nullptr, *s2 = nullptr, *ker = nullptr, *wsum = nullptr;
+    Strided<TFV,1> src{};
+    double *v = nullptr, *s0 = nullptr, *s1 = nullptr, *s2 = nullptr, *ker = nullptr, *wsum = nullptr;
     double  cur = -1;                                    ///< the width of what `v` holds ( -1: nothing yet )
     bool    cur_moments = false;
 
     template<class In>
-    bool prepare( const CudaQueue &queue, auto &allocator, const In &in, const double *geom ) {
+    bool prepare( const CudaQueue &, auto &allocator, const In &in, const double *geom ) {
         x0 = geom[ 0 ]; y0 = geom[ 1 ]; hx = geom[ 2 ]; hy = geom[ 3 ];
         nx = SI( geom[ 4 ] ); ny = SI( geom[ 5 ] );
         const SI np = nx * ny, nt = ( nx + 1 ) * ny;
         auto vec = [&]( SI m ) { return static_cast<double *>( take( allocator, SI( sizeof( double ) ) * std::max<SI>( m, 1 ) ) ); };
-        v0 = vec( np ); v = vec( np ); tmp = vec( np );
+        v = vec( np );
         s0 = vec( nt ); s1 = vec( nt ); s2 = vec( nt );
         const SI kmax = 2 * std::max( nx, ny ) + 1;
         ker = vec( kmax ); wsum = vec( std::max( nx, ny ) );
-        if ( ! v0 || ! v || ! tmp || ! s0 || ! s1 || ! s2 || ! ker || ! wsum )
-            return false;
-        using TFV = std::remove_const_t<typename std::decay_t<decltype( in.values )>::TF>;
-        launch_kernel( queue, &gather_doubles<TFV>, blocks_for( np ), BLOCK, 0, np, strided( in.values ), v0 );
-        return true;
+        src = strided( in.values );
+        return v && s0 && s1 && s2 && ker && wsum;
     }
 
     /// `Convolved< Image >::step( a ) / 4`, the smallest
@@ -170,20 +180,28 @@ struct ImageDensityHost {
         bool tables = false;
         if ( s != cur ) {
             const SI np = nx * ny;
-            cuda_check( cudaMemcpyAsync( v, v0, sizeof( double ) * np, cudaMemcpyDeviceToDevice, queue.stream ), "copy of the image" );
-            if ( s > 0 ) {
-                for ( int a = 0; a < 2; ++a ) {
-                    const SI len = a ? ny : nx;
-                    const double sp = s / ( a ? hy : hx );
-                    if ( ! ( sp > 1e-3 ) )
-                        continue;
-                    const SI r = std::min<SI>( SI( std::ceil( 4 * sp ) ), len );
-                    launch_kernel( queue, &blur_taps, blocks_for( 2 * r + 1 ), BLOCK, 0, r, sp, ker );
-                    launch_kernel( queue, &blur_norms, blocks_for( len ), BLOCK, 0, len, r, ( const double * ) ker, wsum );
-                    launch_kernel( queue, &blur_axis, blocks_for( np ), BLOCK, 0, nx, ny, a, r, ( const double * ) ker, ( const double * ) wsum,
-                                   ( const double * ) v, tmp );
-                    std::swap( v, tmp );
-                }
+            // the axes that blur ( axis 0 first, as the CPU )
+            int axes[ 2 ], na = 0;
+            double sps[ 2 ];
+            for ( int a = 0; a < 2; ++a ) {
+                const double sp = s > 0 ? s / ( a ? hy : hx ) : 0;
+                if ( sp > 1e-3 ) { sps[ na ] = sp; axes[ na++ ] = a; }
+            }
+            if ( na == 0 )
+                launch_kernel( queue, &gather_doubles<TFV>, blocks_for( np ), BLOCK, 0, np, src, v );
+            for ( int q = 0; q < na; ++q ) {
+                const int a = axes[ q ];
+                const SI len = a ? ny : nx;
+                const SI r = std::min<SI>( SI( std::ceil( 4 * sps[ q ] ) ), len );
+                double *dst = q + 1 == na ? v : s1;
+                launch_kernel( queue, &blur_taps, blocks_for( 2 * r + 1 ), BLOCK, 0, r, sps[ q ], ker );
+                launch_kernel( queue, &blur_norms, blocks_for( len ), BLOCK, 0, len, r, ( const double * ) ker, wsum );
+                if ( q == 0 )
+                    launch_kernel( queue, &blur_axis<Strided<TFV,1>>, blocks_for( np ), BLOCK, 0, nx, ny, a, r, ( const double * ) ker,
+                                   ( const double * ) wsum, src, dst );
+                else
+                    launch_kernel( queue, &blur_axis<FlatDoubles>, blocks_for( np ), BLOCK, 0, nx, ny, a, r, ( const double * ) ker,
+                                   ( const double * ) wsum, FlatDoubles{ s1 }, dst );
             }
             cur = s;
             tables = true;
@@ -244,7 +262,7 @@ struct GaussDensityHost {
 
 /// the host class of what the call hands over: a 0-d tensor ( or a number ) is a constant
 template<class In> struct DensityHostOf { using type = ConstDensityHost; };
-template<class V> struct DensityHostOf<ImageIn<V>> { using type = ImageDensityHost; };
+template<class V> struct DensityHostOf<ImageIn<V>> { using type = ImageDensityHost<std::remove_const_t<typename V::TF>>; };
 template<class P,class S,class M> struct DensityHostOf<GaussIn<P,S,M>> { using type = GaussDensityHost; };
 
 } // namespace sdot::gpu2d
