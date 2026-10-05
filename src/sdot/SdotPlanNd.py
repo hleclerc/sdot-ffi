@@ -44,17 +44,26 @@ domain -- and reports it ( `stats[ "start" ]` ). See `sdotplan/Solve.h`.
 
 = What the solution CARRIES, and why it is not just a weight vector
 
-`weights` is the answer when the seeds are distinct. When two seeds are MERGED to `1e-8`,
-there is no pair of `double`s that encodes the plane separating them to within `1e-9`: the bench
+`weights` is the answer when the seeds are distinct. When two seeds are `1e-8` apart, there is
+no pair of `double`s that encodes the plane separating them to within `1e-9`: the bench
 measured and computed it ( README § 23.11 ), and that is why a solver whose interface is `w`
-plateaus around `1e-6` on a degenerate cloud. The solution therefore ALSO carries the aggregate
--- `clusters`, `cluster_nu` -- even when there is no cluster, so that the rule is readable once
-and for all: if the consumer wants CELLS, it takes the reduced diagram plus the planes, and
-everything is exact; if it wants WEIGHTS, it accepts the floor `eps |w| / ( 2 delta h )`.
+plateaus around `1e-6` on a degenerate cloud. Such seeds are AGGREGATED ( `Iterative( aggregate =
+True )`, the default; `sdotplan/Aggregation.h` ): a pair is merged when one ulp of its weights moves
+more than `tol / 4` of mass between them ( read on the diagram: the facet's coefficient of the
+laplacian times the spacing of the doubles at the weights ), exact duplicates are merged and kept
+empty, the tests read the mass of each cluster, and the merged cells are re-split by their local
+problem once the aggregated problem has converged. `stats[ "status" ]` is then
+`"converged (aggregated)"`, `stats[ "residual" ]` the aggregated problem's residual and
+`stats[ "residual_full" ]` the full one's -- the floor of the doubles, which no weight vector beats.
+`clusters` says which seeds were merged ( `None` when none was ).
 
 What it does not cost: the TRANSPORT COST is blind to this degeneracy ( § 23.12, relative gap
 `1.2e-17` ), so anything that is a sum weighted by the masses -- the cost, the total mass, a
-global moment -- need know nothing about it.
+global moment -- need know nothing about it. What stays APPROXIMATE for the members of a cluster:
+their own masses and barycentres ( `cell_masses`, `barycenters`: those of the returned weights,
+within the floor for near-coincident seeds; an exact duplicate's cell is EMPTY, its representative's
+cell holding the mass of both ), hence their part of `cost_and_position_grad` ( exact for the
+cluster as a whole, not split between its members ).
 
 = A single diagram
 
@@ -84,17 +93,54 @@ from .PowerDiagram import PowerDiagram
 # what `stats` carries, in the order of `sdotplan/Solve.h::Stat`
 _STATS = [ "status", "residual", "residual0", "nb_iter", "nb_diag", "nb_backtracks", "t_majorant", "t_diag", "t_asm", "t_lin", "t_lim", "eps",
            "domain_mass", "nb_overflowed", "nb_cell_lim", "nb_limit_rounds", "lin_nb_hierarchies", "lin_nb_iter", "lin_worst", "start", "t_total",
-           "nb_continuation_steps", "min_start_mass", "it_switch", "it_double", "scratch_bytes" ]
+           "nb_continuation_steps", "min_start_mass", "it_switch", "it_double", "scratch_bytes",
+           "nb_clusters", "nb_aggregated", "nb_duplicates", "residual_full", "nb_polish" ]
 # one row of `history`, in the order of `sdotplan/Solve.h::Hist`
 _HISTORY = [ "step", "t", "residual_l2", "min_measure", "max_abs_residual", "nb_diag", "nb_evals", "s" ]
 _STATUS = { 0: "running", 1: "converged", 2: "max iterations", 3: "stagnation", 4: "linear solver failure", 5: "card capacity",
-            6: "failure" }
+            6: "failure", 7: "converged (aggregated)" }
 _START = { 0: "weights0", 1: "voronoi", 2: "similarity" }
 _LIN = { "auto": 0, "cholesky": 1, "amg": 2, "cg": 3, "mg": 4 }
 _AMG_VARIANT = { "auto": -1, "sa_spai0": 0, "sa_gs": 1, "rs_gs": 2 }
 _STEP = { "trials": 0, "limits": 1 }
 _RESIDUAL = { "lin": 0, "log": 1, "power": 2 }
 _CONTINUATION = { "never": 0, "auto": 1, "always": 2 }
+
+#: THE AGGREGATION ( `sdotplan/Aggregation.h` ): a pair is merged when one ulp of its weights moves more than `tol / margin` of
+#: mass between them -- a pair lands at best within half an ulp step ( 0.43 of it measured on `lines_equal` ), 4 leaves room
+#: for Newton's own landing ( `Tuning( aggregation_margin = ... )` )
+_AGGREGATE_MARGIN = 4.0
+#: exact duplicates: `w_dup = w_rep - gap`, `gap` this fraction of the squared extent of the cloud -- any gap empties the cell of
+#: a duplicate, this one is far above the rounding of the cells' cuts ( the generic 3D cell mistakes a gap under ~1e-14 |p|^2 )
+_DUPLICATE_GAP = 1e-6
+
+
+def exact_duplicates( positions ):
+    """THE EXACT DUPLICATES of a cloud `[ n, d ]` ( a host array ): `( dup, rep )`, each duplicate and the smallest index of
+    the seeds at the same position ( empty arrays when there is none ). A hash of the coordinates' bits, sorted: 2.8 ms for
+    1e5 seeds, 22 ms for 1e6 ( M-series ); the exact grouping only runs when two hashes collide."""
+    import numpy as np
+    P = np.ascontiguousarray( np.asarray( positions, dtype = np.float64 ) ) + 0.0       # ( `+ 0.0`: -0.0 and 0.0 alike )
+    n = P.shape[ 0 ]
+    none = ( np.zeros( 0, dtype = np.int64 ), np.zeros( 0, dtype = np.int64 ) )
+    if n < 2:
+        return none
+    bits = P.reshape( n, -1 ).view( np.uint64 )
+    h = np.zeros( n, dtype = np.uint64 )
+    for k, mul in zip( range( bits.shape[ 1 ] ), ( 0x9E3779B97F4A7C15, 0xC2B2AE3D27D4EB4F, 0x165667B19E3779F9, 0xD6E8FEB86659FD93 ) ):
+        h ^= bits[ :, k ] * np.uint64( mul )
+        h ^= h >> np.uint64( 29 )
+    s = np.sort( h )
+    if not ( s[ 1: ] == s[ :-1 ] ).any():
+        return none
+    _, inv = np.unique( P.reshape( n, -1 ), axis = 0, return_inverse = True )
+    inv = inv.reshape( -1 )
+    first = np.full( int( inv.max() ) + 1, n, dtype = np.int64 )
+    np.minimum.at( first, inv, np.arange( n, dtype = np.int64 ) )
+    rep = first[ inv ]
+    dup = np.nonzero( rep != np.arange( n ) )[ 0 ]
+    return dup.astype( np.int64 ), rep[ dup ].astype( np.int64 )
+
 
 #: the old arguments of `SdotPlanNd( src, dst, ... )`, and where they live now -- read by the
 #: deprecated path ( see `__init__` )
@@ -134,6 +180,9 @@ class _Options( Aggregate ):
     trace          : IntTensor
     continuation   : IntTensor
     cap0           : IntTensor
+    agg_margin     : RealTensor
+    agg_gap        : RealTensor
+    agg_nb_dups    : IntTensor
     kernel_fp_size : CtShapeVar
 
 
@@ -142,7 +191,7 @@ _CARD_OPTIONS = [ "tol_abs", "tol_rel", "t_min", "mult_ok", "factor", "maxit", "
                   "lin", "host_method", "lin_tol", "amg_variant", "mg_shift", "mg_recycle", "mg_rebuild", "mg_stop", "mg_nu", "mg_kcycle",
                   "lin_maxit", "trace", "mg_float", "mg_smoothed",
                   "continuation", "conv_threshold", "conv_s0", "conv_ratio", "conv_min", "conv_possible", "min_scale",
-                  "img_x0", "img_y0", "img_hx", "img_hy", "img_nx", "img_ny" ]
+                  "img_x0", "img_y0", "img_hx", "img_hy", "img_nx", "img_ny", "agg_margin", "agg_gap", "agg_nb_dups" ]
 
 
 def _card_linear_solves( row, col, val, dia, rhs, method = "mg", tol = 1e-6, smoothed = None, precision = "float", recycle = 2, rebuild = 1,
@@ -333,6 +382,8 @@ class SdotPlanNd:
 
         #: the target masses, indexed like the cells
         self._masses = RealTensor[ pd.num_point ]( src_dist.weights.raw )
+        # THE AGGREGATION ( `sdotplan/Aggregation.h` ): its margin, and the exact duplicates, found here
+        self._aggregation_inputs( pos_raw, settings, n )
 
         if on_card:
             return self._build_card( pd, settings, step, verbose )
@@ -347,6 +398,7 @@ class SdotPlanNd:
             mg_pack = int( tun.mg_pack or 0 ), mg_recycle = -1 if tun.mg_recycle is None else int( tun.mg_recycle ), mg_rebuild = int( tun.mg_rebuild or 0 ), mg_stop = int( tun.mg_stop or 0 ), mg_nu = int( tun.mg_nu or 0 ),
             step = _STEP[ step ], residual = _RESIDUAL[ tun.residual ], trace = int( bool( verbose ) ), continuation = _CONTINUATION[ settings.continuation ],
             cap0 = int( pd._scratch_capacity ),
+            agg_margin = self._agg_margin, agg_gap = self._agg_gap, agg_nb_dups = self._agg_nb_dups,
             kernel_fp_size = fp_size( pd.kernel_dtype ),
         )
 
@@ -359,6 +411,7 @@ class SdotPlanNd:
         cell_masses = RealTensor[ pd.num_point ]()
         barycenters = RealTensor[ pd.num_point, pd.dim ]()
         cost        = RealTensor()
+        clusters    = IntTensor[ pd.num_point ]()
         stats = RealTensor[ Axis( ShapeVar( len( _STATS ) ), name = "num_stat" ) ]()
         w0 = RealTensor[ pd.num_point ]( pd.weights.raw )
 
@@ -397,13 +450,15 @@ class SdotPlanNd:
                     "os.lin_options.mg_pack = int( SI( inputs.options.mg_pack ) ); os.lin_options.mg_recycle = int( SI( inputs.options.mg_recycle ) ); os.lin_options.mg_rebuild = int( SI( inputs.options.mg_rebuild ) ); os.lin_options.mg_stop = int( SI( inputs.options.mg_stop ) ); os.lin_options.mg_nu = int( SI( inputs.options.mg_nu ) );",
                     "os.continuation = int( SI( inputs.options.continuation ) ); os.continuation_threshold = double( inputs.options.conv_threshold );",
                     "os.conv_s0 = double( inputs.options.conv_s0 ); os.conv_ratio = double( inputs.options.conv_ratio ); os.conv_min = double( inputs.options.conv_min );",
-                    f"sdotplan::solve<TK_sdotplan>( queue, pd_sdotplan, inputs.power_diagram, inputs.dom_cell, { dist_expr }, inputs.nu, inputs.w0, os, "
-                    "outputs.weights, outputs.history, outputs.stats, outputs.cell_masses, outputs.barycenters, outputs.cost );",
+                    "os.agg_margin = double( inputs.options.agg_margin ); os.agg_gap = double( inputs.options.agg_gap ); os.agg_nb_dups = SI( inputs.options.agg_nb_dups );",
+                    f"sdotplan::solve<TK_sdotplan>( queue, pd_sdotplan, inputs.power_diagram, inputs.dom_cell, { dist_expr }, inputs.nu, inputs.w0, inputs.dups, os, "
+                    "outputs.weights, outputs.history, outputs.stats, outputs.cell_masses, outputs.barycenters, outputs.cost, outputs.clusters );",
                 ] ) ),
             power_diagram = pd,
             dom_cell = dom,
             nu = self._masses,
             w0 = w0,
+            dups = self._agg_dups,
             options = options,
             weights = loom.out( weights ),
             # `nb_steps` is WRITTEN by the kernel ( the number of accepted steps ), so it must be
@@ -417,6 +472,7 @@ class SdotPlanNd:
             cell_masses = loom.out( cell_masses ),
             barycenters = loom.out( barycenters ),
             cost = loom.out( cost ),
+            clusters = loom.out( clusters ),
             has_dynamic_capacity = False,
             **pd_kwargs,
             **dist_kwargs,
@@ -431,8 +487,40 @@ class SdotPlanNd:
         self.barycenters = barycenters
         #: the transport cost `W_2^2` ( a scalar `Tensor`: `float( sol.cost )` for the number )
         self.cost = cost
+        self._clusters = clusters
         self._read_stats( stats, settings )
         self._read_history( history, settings, pd )
+
+    def _aggregation_inputs( self, pos_raw, settings, n ):
+        """THE AGGREGATION'S INPUTS ( `sdotplan/Aggregation.h` ): `_agg_margin` ( 0: off ), and the EXACT DUPLICATES, which the
+        diagram cannot see ( no plane between two equal points ): `_agg_dups` ( `2 k` values, the pairs `( dup, rep )`, one
+        dummy pair when there is none ), `_agg_nb_dups`, `_agg_gap`. Found by a hash of the positions when they are readable on the host;
+        traced positions ( `jax.jit` ) are not checked ( `stats[ "duplicates" ]` says so ). The near-coincident pairs are
+        found by the solver itself, on its diagrams."""
+        import numpy as np
+        self._agg_margin, self._agg_gap, self._agg_nb_dups = 0.0, 0.0, 0
+        self._dup_note = "not checked ( aggregate = False )"
+        dup = rep = np.zeros( 0, dtype = np.int64 )
+        if settings.aggregate:
+            margin = getattr( settings.tuning, "aggregation_margin", None )
+            self._agg_margin = float( _AGGREGATE_MARGIN if margin is None else margin )
+            if driver.is_traced( pos_raw ):
+                self._dup_note = "not checked ( traced positions )"
+            else:
+                P = np.asarray( pos_raw.cpu() if hasattr( pos_raw, "cpu" ) and not isinstance( pos_raw, np.ndarray ) else pos_raw,
+                                dtype = np.float64 ).reshape( n, -1 )
+                dup, rep = exact_duplicates( P )
+                self._dup_note = "checked"
+                if len( dup ):
+                    ext = P.max( axis = 0 ) - P.min( axis = 0 )
+                    scale2 = max( float( ( P * P ).sum( axis = 1 ).max() ), float( ( ext * ext ).sum() ) )
+                    self._agg_gap = _DUPLICATE_GAP * ( scale2 if scale2 > 0 else 1.0 )
+                    self._agg_nb_dups = len( dup )
+        k = max( len( dup ), 1 )
+        rows = np.zeros( ( k, 2 ), dtype = np.int64 )
+        rows[ :len( dup ), 0 ] = dup
+        rows[ :len( dup ), 1 ] = rep
+        self._agg_dups = IntTensor[ Axis( ShapeVar( 2 * k ), name = "num_dup" ), dict( size = 64 ) ]( rows.reshape( -1 ) )
 
     @staticmethod
     def _card_memory_kw( n, settings ):
@@ -562,6 +650,7 @@ class SdotPlanNd:
         put( "conv_possible", int( dens.get( "conv_possible", True ) ) ); put( "min_scale", dens.get( "min_scale", 0.0 ) )
         for name, v in zip( ( "img_x0", "img_y0", "img_hx", "img_hy", "img_nx", "img_ny" ), dens.get( "geom", [ 0.0 ] * 6 ) ):
             put( name, v )
+        put( "agg_margin", self._agg_margin ); put( "agg_gap", self._agg_gap ); put( "agg_nb_dups", self._agg_nb_dups )
         options = RealTensor[ Axis( ShapeVar( len( _CARD_OPTIONS ) ), name = "num_card_opt" ) ]( np.asarray( opts, dtype = np.float64 ) )
 
         weights = RealTensor[ pd.num_point ]()
@@ -569,6 +658,7 @@ class SdotPlanNd:
         cell_masses = RealTensor[ pd.num_point ]()
         barycenters = RealTensor[ pd.num_point, pd.dim ]()
         cost        = RealTensor()
+        clusters    = IntTensor[ pd.num_point ]()
         stats = RealTensor[ Axis( ShapeVar( len( _STATS ) ), name = "num_stat" ) ]()
         w0 = RealTensor[ pd.num_point ]( pd.weights.raw )
         work = _CardSolveWork()
@@ -595,15 +685,16 @@ class SdotPlanNd:
         loom.ffi_call(
             name,
             FfiCode.inline(
-                f"sdot::gpu2d::solve<{ variant }>( queue, args.inputs.power_diagram, args.inputs.nu, args.inputs.w0, args.inputs.options, "
+                f"sdot::gpu2d::solve<{ variant }>( queue, args.inputs.power_diagram, args.inputs.nu, args.inputs.w0, args.inputs.dups, args.inputs.options, "
                 "args.outputs.weights, args.outputs.history, args.outputs.stats, args.outputs.cell_masses, args.outputs.barycenters, "
-                "args.outputs.cost, args.outputs.sorted_weights_out, args.outputs.node_wa_out, args.outputs.node_wb_out, args.outputs.work, "
+                "args.outputs.cost, args.outputs.clusters, args.outputs.sorted_weights_out, args.outputs.node_wa_out, args.outputs.node_wb_out, args.outputs.work, "
                 f"args.errors, args.allocator, { dens_expr }, { limits } );",
                 includes = [ "sdot/gpu/Newton2D.cuh" ], sources = [ "sdot/sdotplan/Linear.cpp" ], allocator = True ),
             failures = pd._card_failures(),
             power_diagram = pd,
             nu = self._masses,
             w0 = w0,
+            dups = self._agg_dups,
             options = options,
             **dens_args,
             weights = loom.out( weights ),
@@ -614,6 +705,7 @@ class SdotPlanNd:
             cell_masses = loom.out( cell_masses ),
             barycenters = loom.out( barycenters ),
             cost = loom.out( cost ),
+            clusters = loom.out( clusters ),
             work = loom.out( work, capacities = { "nb_facets": card_facet_capacity( n ) } ),
             **pd_kwargs,
         )
@@ -622,6 +714,7 @@ class SdotPlanNd:
         self.cell_masses = cell_masses
         self.barycenters = barycenters
         self.cost = cost
+        self._clusters = clusters
         self._read_stats( stats, settings )
         self._read_history( history, settings, pd )
 
@@ -634,11 +727,11 @@ class SdotPlanNd:
         explicitly through `ot_plan`, we raise, because they believe they are warm-starting and
         are not.
 
-        The CLUSTERS are not yet taken back: there are none ( aggregation is step 7 of
-        `notes/2026-10-02-sdotplan.md` ). When they arrive, this is where they go through -- and
-        that is why the start is a plan and not a weight vector: `plan.clusters` and the
-        positions it was solved for are what allows not re-detecting the clusters when the seeds
-        have not moved ( README § 23.11, § 23.8 )."""
+        The CLUSTERS are not taken back: each solve finds them again ( the exact duplicates by a
+        hash of the positions, the near-coincident pairs on its own diagrams, from the first
+        iteration when the inherited weights already put them past the criterion --
+        `sdotplan/Aggregation.h` ). This is where they would go through, should the detection ever
+        cost something: `plan.clusters` and the positions it was solved for."""
         n_plan = int( plan.weights.shape[ 0 ] )
         n = int( src_dist.nb_diracs.value )
         if n_plan != n:
@@ -655,7 +748,7 @@ class SdotPlanNd:
         if driver.is_traced( st ):
             # under a trace ( `jax.jit` ): the numbers are tracers, kept as such -- nothing is read on the host
             self.stats = { name: st[ k ] for k, name in enumerate( _STATS ) }
-            self.stats[ "aggregation" ] = "requested, not wired yet ( step 7 )" if settings.aggregate else "not requested"
+            self.stats[ "duplicates" ] = self._dup_note
             self.stats[ "warm_start" ] = self._warm_start
             return
         self.stats = { name: float( st[ k ] ) for k, name in enumerate( _STATS ) }
@@ -664,13 +757,19 @@ class SdotPlanNd:
         self.stats[ "it_double" ] = int( self.stats[ "it_double" ] )
         self.stats[ "start" ] = _START.get( int( self.stats[ "start" ] ), "?" )
         for name in ( "nb_iter", "nb_diag", "nb_backtracks", "nb_overflowed", "nb_cell_lim", "nb_limit_rounds",
-                      "lin_nb_hierarchies", "lin_nb_iter", "nb_continuation_steps", "scratch_bytes" ):
+                      "lin_nb_hierarchies", "lin_nb_iter", "nb_continuation_steps", "scratch_bytes",
+                      "nb_clusters", "nb_aggregated", "nb_duplicates", "nb_polish" ):
             self.stats[ name ] = int( self.stats[ name ] )
-        # aggregation: REQUESTED here, not yet done by the C++ ( step 7 of
-        # `notes/2026-10-02-sdotplan.md` ) -- and that is reported rather than kept quiet, because a
-        # degenerate cloud then plateaus around `1e-6` without the slightest message ( README § 23.11 ).
-        self.stats[ "aggregation" ] = ( "requested, not wired yet ( step 7 )" if settings.aggregate
-                                       else "not requested" )
+        #: THE AGGREGATION ( `sdotplan/Aggregation.h` ), said in words: what was merged, and whether the exact duplicates were
+        #: looked for ( `duplicates` ). `residual` is the aggregated problem's residual, `residual_full` the full one's.
+        if not settings.aggregate:
+            self.stats[ "aggregation" ] = "off"
+        elif self.stats[ "nb_clusters" ] == 0:
+            self.stats[ "aggregation" ] = "none"
+        else:
+            self.stats[ "aggregation" ] = ( f"{ self.stats[ 'nb_aggregated' ] } seeds in { self.stats[ 'nb_clusters' ] } clusters "
+                                            f"( { self.stats[ 'nb_duplicates' ] } exact duplicates ), re-split in { self.stats[ 'nb_polish' ] } diagrams" )
+        self.stats[ "duplicates" ] = self._dup_note
         #: what the warm start provided: `"ot_plan"`, `"weights0"`, or `"none"` ( and why )
         self.stats[ "warm_start" ] = self._warm_start
 
@@ -695,16 +794,22 @@ class SdotPlanNd:
 
     @property
     def converged( self ):
-        return self.stats[ "status" ] == "converged"
+        """the test passed -- by the full problem, or by the aggregated one ( `"converged (aggregated)"`: the seeds that the
+        doubles cannot separate answer as a cluster, see the module docstring )"""
+        return self.stats[ "status" ] in ( "converged", "converged (aggregated)" )
 
     @property
     def clusters( self ):
-        """Which CLUSTER each dirac belongs to, or `None` when none was merged.
+        """Which CLUSTER each dirac belongs to -- `[ n ]`, the smallest index of its cluster ( itself when it is alone ) -- or
+        `None` when none was merged.
 
-        `None` is the common case and it means "the weights suffice". As soon as there are
-        clusters, it is the pair ( reduced diagram, cutting planes ) that carries the accuracy and
-        not `weights` -- see the module docstring and README § 23.11."""
-        return None
+        `None` is the common case and it means "the weights suffice". As soon as there are clusters, the masses of the
+        members are only within the floor of the doubles ( `stats[ "residual_full" ]` ), an exact duplicate's cell being
+        empty -- see the module docstring and README § 23.11."""
+        nb = self.stats[ "nb_clusters" ]
+        if not driver.is_traced( nb ) and int( nb ) == 0:
+            return None
+        return self._clusters
 
     @property
     def target_masses( self ) -> Tensor:

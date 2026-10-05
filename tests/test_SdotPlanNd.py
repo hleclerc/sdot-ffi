@@ -1173,3 +1173,165 @@ if p := experiment( "ot 2D newton scattered",
 
     plan = OtProblem( src, dst ).solve( Iterative( max_iter = p.max_iter, keep_weights = True ), verbose = True )
     _report( p, plan, pos, "ot_2d_newton_scattered" )
+
+
+# ---- THE AGGREGATION of near-coincident seeds ( `sdotplan/Aggregation.h` ) ----------------------------------------------
+#
+# Two seeds `delta` apart are split by a plane whose offset is `( w_i - w_j ) / 2 delta`: below some `delta`, no weight
+# vector reaches the tolerance there, and the solve stagnated. Merged, the tests read the mass of the cluster, the plane
+# inside it placed as well as the doubles let it ( `stats[ "residual_full" ]` ). Exact duplicates are merged too, their
+# cells kept empty, their representative carrying their mass.
+
+def _degenerate_clouds( d, seed ):
+    """`{ name: ( positions, groups ) }`: a uniform cloud with seeds moved onto others; `groups` the expected clusters
+    ( `( members, exact )`, `exact`: equal positions )"""
+    rng = numpy.random.default_rng( seed )
+    n = 400 if d == 2 else 600
+    base = rng.uniform( 0.05, 0.95, size = ( n, d ) )
+    unit = numpy.ones( d ) / d ** 0.5
+    side = numpy.eye( d )[ 0 ]
+    def moved( *moves ):
+        pos = base.copy()
+        groups = []
+        for members, offsets in moves:
+            for m, off in zip( members[ 1: ], offsets ):
+                pos[ m ] = pos[ members[ 0 ] ] + off
+            groups.append( ( members, all( not numpy.any( off ) for off in offsets ) ) )
+        return pos, groups
+    # ( a triple is not ALIGNED here: the middle seed of three aligned 1e-10 apart starts with a Voronoi cell of 5e-9 of its
+    # target, whose log step is refused: see `a_refused_log_step_falls_back_on_the_lin_residual` )
+    return {
+        "exact pair":         moved( ( [ 5, 7 ], [ 0.0 * unit ] ) ),
+        "exact triple":       moved( ( [ 3, 11, 29 ], [ 0.0 * unit, 0.0 * unit ] ) ),
+        "pair at 1e-9":       moved( ( [ 5, 7 ], [ 1e-9 * unit ] ) ),
+        "pair at 1e-12":      moved( ( [ 8, 2 ], [ 1e-12 * unit ] ) ),
+        "triple at 1e-10":    moved( ( [ 4, 9, 13 ], [ 1e-10 * unit, 2e-10 * side ] ) ),
+        "pair and duplicate": moved( ( [ 1, 6 ], [ 3e-10 * unit ] ), ( [ 12, 15, 30 ], [ 0.0 * unit, 2e-10 * side ] ) ),
+    }
+
+
+def _check_aggregated( name, plan, pos, groups, tol ):
+    """the plan of a cloud whose `groups` the doubles cannot separate: converged ( aggregated, unless only exact duplicates ),
+    the clusters found, each cluster's mass its target, every other cell its own, an exact duplicate's cell empty"""
+    n = len( pos )
+    st = plan.stats
+    nu = numpy.asarray( plan.target_masses ).reshape( -1 )
+    m = numpy.asarray( plan.cell_masses ).reshape( -1 )
+    print( f"  { name }: { st[ 'status' ] }, { st[ 'nb_iter' ] } it / { st[ 'nb_diag' ] } diag, aggregated { st[ 'residual' ] * n :.1e} "
+           f"full { st[ 'residual_full' ] * n :.1e} ( relative ), { st[ 'aggregation' ] }" )
+    assert plan.converged, ( name, st )
+    only_exact = all( exact for _, exact in groups )
+    assert st[ "status" ] == ( "converged" if only_exact else "converged (aggregated)" ), ( name, st[ "status" ] )
+    assert st[ "residual" ] <= tol, ( name, st[ "residual" ] )
+    cl = numpy.asarray( plan.clusters ).reshape( -1 )
+    alone = numpy.ones( n, dtype = bool )
+    for members, exact in groups:
+        assert ( cl[ members ] == min( members ) ).all(), ( name, members, cl[ members ] )
+        alone[ members ] = False
+        # the cluster's mass is its target ( the test reads each member's SHARE of the cluster's gap: `k` members, `k tol` )
+        assert abs( m[ members ].sum() - nu[ members ].sum() ) <= len( members ) * tol * ( 1 + 1e-9 ), ( name, members, m[ members ].sum() - nu[ members ].sum() )
+        if exact:                                # the duplicates' cells are empty, their representative holds the mass
+            assert ( m[ members[ 1: ] ] == 0 ).all() and ( numpy.asarray( plan.weights ).reshape( -1 )[ members[ 1: ] ] <
+                                                            numpy.asarray( plan.weights ).reshape( -1 )[ members[ 0 ] ] ).all(), name
+    assert ( cl[ alone ] == numpy.arange( n )[ alone ] ).all(), name
+    assert numpy.abs( m[ alone ] - nu[ alone ] ).max() <= tol, ( name, numpy.abs( m[ alone ] - nu[ alone ] ).max() )
+    assert st[ "nb_clusters" ] == len( groups ) and st[ "nb_aggregated" ] == sum( len( g ) for g, _ in groups ), ( name, st[ "aggregation" ] )
+
+
+if test( "the_aggregation_merges_what_the_doubles_cannot_separate" ):
+    need( "cpu" )
+    for d, steps in ( ( 2, ( "trials", "limits" ) ), ( 3, ( "trials", ) ) ):
+        for name, ( pos, groups ) in _degenerate_clouds( d, 17 ).items():
+            n = len( pos )
+            tol = 1e-11 / n
+            for step in steps:
+                it = Iterative( tol = tol, max_iter = 60, tuning = Tuning( step = step ) )
+                plan = OtProblem( SumOfDiracs( pos ), _box_target() if d == 2 else Image( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0 ] * 3, frame = numpy.eye( 3 ) ) ).solve( it )
+                _check_aggregated( f"{ d }D { name } { step }", plan, pos, groups, tol )
+                # without the aggregation: the floor ( or worse: two equal points count their cell twice )
+                it = Iterative( tol = tol, max_iter = 60, aggregate = False, tuning = Tuning( step = step ) )
+                off = OtProblem( SumOfDiracs( pos ), _box_target() if d == 2 else Image( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0 ] * 3, frame = numpy.eye( 3 ) ) ).solve( it )
+                assert not off.converged and off.stats[ "aggregation" ] == "off" and off.clusters is None, ( name, off.stats[ "status" ] )
+
+
+if test( "a_refused_log_step_falls_back_on_the_lin_residual" ):
+    need( "cpu" )
+    # three ALIGNED seeds 1e-10 apart: the middle Voronoi cell holds 5e-9 of its target. The log residual asks it for
+    # `a ( c - log x )`, 1e-10 next to the others' 1e-3, which the linear solver loses; and at the Voronoi start ( weights 0 )
+    # the aggregation cannot see the cluster yet. Its merit refuses every step ( it stagnated in 1 it / 35 diagrams, the merit
+    # flat under the 1e-8 floor of `g( a / nu )` ): the iteration is done again in lin, which converges, aggregated
+    rng = numpy.random.default_rng( 17 )
+    n = 400
+    pos = rng.uniform( 0.05, 0.95, size = ( n, 2 ) )
+    unit = numpy.ones( 2 ) / 2 ** 0.5
+    pos[ 9 ] = pos[ 4 ] + 1e-10 * unit
+    pos[ 13 ] = pos[ 4 ] - 2e-10 * unit
+    tol = 1e-11 / n
+    for step in ( "trials", "limits" ):
+        runs = { r: OtProblem( SumOfDiracs( pos ), _box_target() ).solve( Iterative( tol = tol, continuation = "never", tuning = Tuning( step = step, residual = r ) ) )
+                 for r in ( "log", "lin" ) }
+        _check_aggregated( f"aligned triple { step } log", runs[ "log" ], pos, [ ( [ 4, 9, 13 ], False ) ], tol )
+        _check_aggregated( f"aligned triple { step } lin", runs[ "lin" ], pos, [ ( [ 4, 9, 13 ], False ) ], tol )
+        log, lin = runs[ "log" ].stats, runs[ "lin" ].stats
+        assert log[ "it_switch" ] == 0, ( step, log[ "it_switch" ] )
+        # the same iterations as lin; the refused log trials on top ( 3 diagrams with the limits, 8 with the trials )
+        assert log[ "nb_iter" ] == lin[ "nb_iter" ] and log[ "nb_diag" ] <= lin[ "nb_diag" ] + 10, ( step, log[ "nb_diag" ], lin[ "nb_diag" ] )
+
+
+if test( "the_aggregation_changes_nothing_without_such_seeds" ):
+    need( "cpu" )
+    # a cloud whose pairs the doubles separate: the same plan to the bit, the same counts, no cluster -- in 2D ( both steps )
+    # and in 3D, and with a tolerance under what any mass can reach ( `MEASURE_PRECISION`: no merge either )
+    for d, step, tol in ( ( 2, "limits", 1e-12 ), ( 2, "trials", 1e-17 ), ( 3, "trials", 1e-12 ) ):
+        rng = numpy.random.default_rng( 23 + d )
+        n = 3000
+        pos = rng.uniform( 0.001, 0.999, size = ( n, d ) )
+        target = _box_target() if d == 2 else Image( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0 ] * 3, frame = numpy.eye( 3 ) )
+        plans = [ OtProblem( SumOfDiracs( pos ), target ).solve( Iterative( tol = tol / n, max_iter = 60, aggregate = agg, tuning = Tuning( step = step ) ) )
+                  for agg in ( True, False ) ]
+        on, off = plans
+        assert tol < 1e-15 or on.stats[ "status" ] == "converged", on.stats
+        assert on.clusters is None and on.stats[ "aggregation" ] == "none" and on.stats[ "duplicates" ] == "checked", on.stats
+        assert numpy.array_equal( numpy.asarray( on.weights ), numpy.asarray( off.weights ) ), d
+        for k in ( "nb_iter", "nb_diag", "residual", "residual_full" ):
+            assert on.stats[ k ] == off.stats[ k ], ( d, k, on.stats[ k ], off.stats[ k ] )
+
+
+if test( "the_card_aggregates_as_the_cpu" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    import jax
+    for name, ( pos, groups ) in _degenerate_clouds( 2, 17 ).items():
+        n = len( pos )
+        # ( a pair 1e-12 apart: the card's cells, cut in each seed's frame, place the merged cell to ~5e-11 of its mass -- the
+        # CPU's to 5e-14 )
+        tol = ( 1e-9 if "1e-12" in name else 1e-11 ) / n
+        for step, precision in ( ( "limits", "fp64" ), ( "trials", "fp64" ), ( "limits", "auto" ) ):
+            it = Iterative( tol = tol, max_iter = 60, precision = precision, tuning = Tuning( step = step ) )
+            plan = OtProblem( SumOfDiracs( pos ), _box_target() ).solve( it )
+            _check_aggregated( f"card { name } { step } { precision }", plan, pos, groups, tol )
+            # the cells of the card's weights, measured by the generic path: each cluster's mass, every other cell's
+            g = _generic_measures( pos, numpy.asarray( plan.weights ).reshape( -1 ) )
+            nu = numpy.asarray( plan.target_masses ).reshape( -1 )
+            alone = numpy.ones( n, dtype = bool )
+            for members, _ in groups:
+                alone[ members ] = False
+                assert abs( g[ members ].sum() - nu[ members ].sum() ) < 1e-8 / n, ( name, g[ members ].sum() - nu[ members ].sum() )
+            assert numpy.abs( g[ alone ] - nu[ alone ] ).max() < 1e-8 / n, name
+        # under `jax.jit` ( the masses traced, the positions constant: the duplicates are still found ): the eager plan
+        def solve( masses ):
+            plan = OtProblem( SumOfDiracs( pos, masses ), _box_target() ).solve( Iterative( tol = tol, max_iter = 60 ) )
+            return plan.weights.raw, plan.stats[ "nb_clusters" ], plan.stats[ "status" ]
+        we, ce, se = solve( numpy.ones( n ) )
+        wj, cj, sj = jax.jit( solve )( numpy.ones( n ) )
+        assert numpy.array_equal( numpy.asarray( wj ), numpy.asarray( we ) ) and float( cj ) == float( ce ) == len( groups ), name
+    # a cloud without such seeds: the same plan as without the aggregation, to the bit ( at 1e-12 relative, the bound of
+    # `TAU_REL_MIN`, the mixed kernel merges one ordinary pair of this cloud: the floor of its weights is then within 4 of the
+    # tolerance -- the status stays `converged` )
+    rng = numpy.random.default_rng( 29 )
+    pos = rng.uniform( 0.001, 0.999, size = ( 4000, 2 ) )
+    on, off = [ OtProblem( SumOfDiracs( pos ), _box_target() ).solve( Iterative( tol = 1e-10 / 4000, max_iter = 60, aggregate = agg ) ) for agg in ( True, False ) ]
+    assert on.clusters is None and on.stats[ "status" ] == "converged", on.stats
+    assert numpy.array_equal( numpy.asarray( on.weights ), numpy.asarray( off.weights ) )
+    assert ( on.stats[ "nb_iter" ], on.stats[ "nb_diag" ] ) == ( off.stats[ "nb_iter" ], off.stats[ "nb_diag" ] )

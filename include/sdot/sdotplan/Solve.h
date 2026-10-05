@@ -57,6 +57,9 @@ struct SolverOptions {
     double conv_s0 = 0;              ///< the first width ( 0: half the diameter of the domain )
     double conv_ratio = 1.4142135623730951;
     double conv_min = 0;             ///< the last width before 0 ( 0: the scale of the distribution )
+    double agg_margin = 0;           ///< the aggregation of near-coincident seeds ( `Aggregation.h` ): `kappa`, 0 to switch it off
+    double agg_gap = 0;              ///< ... `w_dup = w_rep - gap` for the exact duplicates
+    SI     agg_nb_dups = 0;          ///< ... how many rows of `dups_in` are exact duplicates
 };
 
 /// the weights of the Voronoi of a SIMILITUDE of the cloud that fits it in the box `[ lo, hi ]`: the box
@@ -99,12 +102,14 @@ inline double minimum( const std::vector<double> &v ) {
 }
 
 /// THE SOLVER. `pd` carries WRITABLE weights and majorants ( `with_weights` ); `nu` and `w0`
-/// are in user order. `weights` ( user order ), `hist` ( `nb_steps`, `rows [ step,
-/// NB_HIST ]`, `weights [ step, n ]` optional ), `stats`, `masses [ n ]`, `bary [ n, D ]` and
-/// `cost` ( cost ) are the outputs.
+/// are in user order. `dups_in` ( `2 k` values, the first `o.agg_nb_dups` pairs ): the exact duplicates, `( dup, rep )`.
+/// `weights` ( user order ), `hist` ( `nb_steps`, `rows [ step,
+/// NB_HIST ]`, `weights [ step, n ]` optional ), `stats`, `masses [ n ]`, `bary [ n, D ]`,
+/// `cost` ( cost ) and `clusters [ n ]` ( the representative of each seed's cluster, itself if alone ) are the outputs.
 template<class TK>
 void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom, const auto &dist, const auto &nu_in, const auto &w0_in,
-               const SolverOptions &o, auto &&weights, auto &&hist, auto &&stats, auto &&masses, auto &&bary, auto &&cost ) {
+            const auto &dups_in, const SolverOptions &o, auto &&weights, auto &&hist, auto &&stats, auto &&masses, auto &&bary, auto &&cost,
+            auto &&clusters ) {
     using PD = DECAYED_TYPE_OF( pd );
     using Dist = DECAYED_TYPE_OF( dist );
     constexpr int D = PD::ct_dim;
@@ -116,6 +121,17 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
     auto lin = linear_solver( o.lin, n, D, o.lin_options );
     lin->order( bal.rank_of );                           // the tree order, for the aggregation of the multigrid
     Newton<decltype( bal )> newton( bal, *lin, o.newton );
+    // ---- the aggregation ( `Aggregation.h` ): its settings, the exact duplicates given by the caller
+    newton.agg.init( n );
+    newton.agg.margin = o.agg_margin;
+    newton.agg.gap = o.agg_gap;
+    newton.agg.tol_abs = o.newton.tol_abs;
+    newton.agg.tol_rel = o.newton.tol_rel;
+    if ( o.agg_nb_dups > 0 ) {
+        std::vector<SI> dup( o.agg_nb_dups ), rep( o.agg_nb_dups );
+        for ( SI k = 0; k < o.agg_nb_dups; ++k ) { dup[ k ] = SI( dups_in( 2 * k ) ); rep[ k ] = SI( dups_in( 2 * k + 1 ) ); }
+        newton.agg.set_duplicates( dup, rep );
+    }
 
     // ---- the history, one row per accepted step
     SI nb_steps = 0;
@@ -183,26 +199,28 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
     bal.dist = &conv.at( s_current );
     newton.measures_and_facets( w, a, fa );
     const double nu_min = minimum( nu );
-    if ( given && minimum( a ) < 1e-3 * nu_min ) {       // a warm start that empties a cell: the Voronoi, if it does better
+    // ( the smallest masses below leave the exact duplicates out: their cells are empty by construction )
+    auto min_mass = [&]( const std::vector<double> &m ) { return newton.agg.floor_min( m ); };
+    if ( given && min_mass( a ) < 1e-3 * nu_min ) {      // a warm start that empties a cell: the Voronoi, if it does better
         std::vector<double> w0( n, 0.0 ), a0;
         std::vector<Facet> fa0;
         newton.measures_and_facets( w0, a0, fa0 );
-        if ( minimum( a0 ) > minimum( a ) ) { w.swap( w0 ); a.swap( a0 ); fa.swap( fa0 ); start = START_VORONOI; }
+        if ( min_mass( a0 ) > min_mass( a ) ) { w.swap( w0 ); a.swap( a0 ); fa.swap( fa0 ); start = START_VORONOI; }
         else newton.bal.set_weights( w );
     }
     if constexpr ( DECAYED_TYPE_OF( pd.box_min )::is_valid ) {
-        if ( minimum( a ) <= 0 ) {                       // seeds outside the domain: the similarity
+        if ( min_mass( a ) <= 0 ) {                      // seeds outside the domain: the similarity
             double lo[ D ], hi[ D ];
             for ( int d = 0; d < D; ++d ) { lo[ d ] = double( pd.box_min( d ) ); hi[ d ] = double( pd.box_max( d ) ); }
             std::vector<double> w1, a1;
             std::vector<Facet> fa1;
             similarity<D>( pd, lo, hi, w1 );
             newton.measures_and_facets( w1, a1, fa1 );
-            if ( minimum( a1 ) > minimum( a ) ) { w.swap( w1 ); a.swap( a1 ); fa.swap( fa1 ); start = START_SIMILARITY; }
+            if ( min_mass( a1 ) > min_mass( a ) ) { w.swap( w1 ); a.swap( a1 ); fa.swap( fa1 ); start = START_SIMILARITY; }
             else newton.bal.set_weights( w );
         }
     }
-    const double min_start_mass = minimum( a );
+    const double min_start_mass = min_mass( a );
     // AUTO: the density is missing where cells are -> the continuation, from the same start
     if ( o.continuation == SolverOptions::AUTO && Convolved<Dist>::possible && scales.size() == 1
       && ( min_start_mass < o.continuation_threshold * nu_min ) ) {
@@ -261,6 +279,7 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
         total.nb_limit_rounds += newton.st.nb_limit_rounds;
         total.t_asm += newton.st.t_asm;
         total.t_lim += newton.st.t_lim;
+        total.nb_polish += newton.st.nb_polish;
         if ( step == 0 ) { total.residual0 = newton.st.residual0; total.eps = newton.st.eps; total.it_switch = newton.st.it_switch; }
         total.status = newton.st.status;
         total.residual = newton.st.residual;
@@ -269,6 +288,16 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
         newton.st = NewtonStats{};
     }
     hist.nb_steps.set( nb_steps );
+
+    // THE FULL PROBLEM'S RESIDUAL, and the status when only the aggregated problem passed the test
+    double full = total.residual, full_rel = 0;
+    if ( newton.agg.any() ) {
+        newton.agg.full_residual( a, newton.nu, full, full_rel );
+        if ( total.status == NewtonStats::CONVERGED && ! newton.agg.converged( full, full_rel ) )
+            total.status = S_CONVERGED_AGGREGATED;
+    }
+    for ( SI i = 0; i < n; ++i )
+        clusters( i ) = newton.agg.any() && newton.agg.cluster_of[ i ] >= 0 ? newton.agg.cl_members[ newton.agg.cl_begin[ newton.agg.cluster_of[ i ] ] ] : i;
 
     for ( SI i = 0; i < n; ++i )
         weights( i ) = w[ i ];
@@ -326,6 +355,11 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
     put( IT_SWITCH, double( total.it_switch ) );
     put( IT_DOUBLE, 0 );                                 // ( one kernel: the card's mixed precision only )
     put( SCRATCH_BYTES, 0 );                             // ( the card's pool only )
+    put( NB_CLUSTERS, double( newton.agg.nb_clusters() ) );
+    put( NB_AGGREGATED, double( newton.agg.nb_aggregated() ) );
+    put( NB_DUPLICATES, double( newton.agg.dups.size() ) );
+    put( RESIDUAL_FULL, full );
+    put( NB_POLISH, double( total.nb_polish ) );
 }
 
 } // namespace sdotplan

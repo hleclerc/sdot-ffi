@@ -89,8 +89,9 @@ class Tuning:
                   # `max|a-nu|/nu <= residual_switch` ( the old default, -50 % of the diagrams on the hard
                   # cases ), `lin` ( the previous behaviour ), or `power` ( `g_p`, `p = residual_power` )
                   residual = "log", residual_power = 0.5, residual_switch = 2.0,
-                  # the aggregation ( § 23.5 : trouble starts around 0.2 % of the median spacing )
-                  delta_aggregation = None,
+                  # the aggregation of near-coincident seeds ( `sdotplan/Aggregation.h` ): a pair is merged when one ulp of its
+                  # weights moves more than `tol / aggregation_margin` of mass between them ( `None`: 4 )
+                  aggregation_margin = None,
                   # the machine : the spatial accelerator, the neighbour memory ( § 11 ), the scratch ( § 18.2 )
                   accelerator = None, memory = None, scratch_capacity = None ):
         self.step              = step
@@ -117,7 +118,7 @@ class Tuning:
         self.residual          = residual
         self.residual_power    = residual_power
         self.residual_switch   = residual_switch
-        self.delta_aggregation = delta_aggregation
+        self.aggregation_margin = aggregation_margin
         self.accelerator       = accelerator
         self.memory            = memory
         self.scratch_capacity  = scratch_capacity
@@ -157,11 +158,16 @@ class Iterative:
     refuses well before the tolerance. The `fp32 -> fp64` switch is STRUCTURAL
     ( § 19.10 ) and therefore belongs to the C++, not to the caller.
 
-    `aggregate` : MERGE diracs that are too close before solving ( § 23.6 ). On, because
-    the alternative is a SILENT floor at `1e-6` on a degenerate cloud : without it,
-    `lines sigma = 0.005` stagnates at `2.35e-6` in 113 diagrams ; with it, it converges to `2.00e-7` in
-    78. Detection costs 4 % of a diagram in 2D, 1 % in 3D ( § 23.8 ). The solution then carries
-    the aggregate, which is why `SdotPlanNd` has clusters even when there are none ( § 23.11 ).
+    `aggregate` : MERGE the diracs that the doubles cannot separate ( § 23.6 - § 23.12, `sdotplan/Aggregation.h` ). Two
+    seeds `delta` apart are split by a plane whose offset is `( w_i - w_j ) / 2 delta`: when one ulp of their weights moves
+    more than a quarter of the tolerance between them, no weight vector can reach `tol` there, and the pair is merged --
+    the tests then read the mass of the cluster, the full Newton direction still places the plane between its members as
+    well as the doubles let it, and once the aggregated problem has converged each merged cell is re-split by its local
+    problem. Exact duplicates ( equal positions ) are merged too, their cells kept empty, their representative carrying
+    their mass. On, because the alternative is a SILENT floor : `lines_equal` ( a pair `1e-8` apart ) stagnated at
+    `2.35e-6` relative; with it, `stats[ "status" ]` says `converged (aggregated)` and `stats[ "residual_full" ]` gives
+    what is left of the full problem ( the floor of the doubles ). Nothing changes, and nothing is paid, on a cloud whose
+    pairs the doubles separate. `SdotPlanNd.clusters` says which seeds were merged.
 
     `keep_weights` : keep the weights of EVERY step in `history`, to replay the descent ( an
     array `[ step, n ]`, which one does not always want ).

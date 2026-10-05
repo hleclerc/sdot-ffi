@@ -75,6 +75,7 @@ if p := bench( "newton",
                rtol          = Param( 1e-6, help = "stop on max|a-nu|/nu <= rtol ( the campaign: 1e-6 )" ),
                tol           = Param( 0.0, help = "or on max|a-nu| <= tol, in normalized masses ( 0: off ); the library's default is 1e-8" ),
                max_iter      = Param( 100, help = "Newton steps, at most" ),
+               aggregate     = Param( "yes", choices = [ "yes", "no" ], help = "merge the seeds the doubles cannot separate ( `sdotplan/Aggregation.h`, the library's default: yes )" ),
                continuation  = Param( "default", choices = [ "default", "never", "auto", "always" ], help = "width continuation ( default: never on Lebesgue -- the old Newton has none --, always on a density, as § 9 / § 12 )" ),
                conv_start    = Param( 0.5, help = "DENSITY: the first width of the continuation ( § 9: 0.5; 0: half the diameter of the domain )" ),
                sigma         = Param( 0.02, help = "DENSITY gauss4: the scale of the widths ( § 9: 0.05, 0.02, 0.01 )" ),
@@ -137,7 +138,7 @@ if p := bench( "newton",
         return Iterative( tol = p.tol, max_iter = max_iter, continuation = continuation,
                           precision = { "double": "fp64", "float": "fp32", "mixed": "mixed" }[ p.kernel ],
                           weights0 = w_file[ :n_points ] if p.start == "file" else None,
-                          aggregate = False,            # not wired yet in the C++ ( see README, gap list )
+                          aggregate = p.aggregate == "yes",
                           tuning = Tuning( step = p.step, linear_solver = p.linear_solver, mass_rtol = p.rtol,
                                            residual = p.residual, residual_power = p.residual_power, residual_switch = p.residual_switch,
                                            restart_factor = p.restart_factor, amg_variant = p.amg_variant, linear_tol = p.linear_tol or None,
@@ -212,7 +213,8 @@ if p := bench( "newton",
             st = dict( raw )
             st[ "status" ] = _STATUS.get( int( raw[ "status" ] ), "?" )
             st[ "start" ] = _START.get( int( raw[ "start" ] ), "?" )
-            for key in ( "nb_iter", "nb_diag", "nb_backtracks", "lin_nb_iter", "lin_nb_hierarchies", "it_switch", "nb_limit_rounds", "it_double" ):
+            for key in ( "nb_iter", "nb_diag", "nb_backtracks", "lin_nb_iter", "lin_nb_hierarchies", "it_switch", "nb_limit_rounds", "it_double",
+                         "nb_clusters", "nb_aggregated", "nb_duplicates", "nb_polish" ):
                 st[ key ] = int( raw[ key ] )
             wall = jit_wall
         final_w = numpy.asarray( jit_out[ 0 ] ).reshape( -1 )
@@ -250,7 +252,10 @@ if p := bench( "newton",
     res_rel = st[ "residual" ] * n                    # max|a - nu| / nu, with nu = 1 / n
     p.results.update( n = n, dim = d, threads = benchlib.nb_threads(), kernel = p.kernel, step = p.step,
                       residual = p.residual, linear_solver = p.linear_solver, amg_variant = p.amg_variant, linear_tol = p.linear_tol,
-                      it_switch = st[ "it_switch" ], lin_nb_hierarchies = st[ "lin_nb_hierarchies" ], status = st[ "status" ], converged = int( st[ "status" ] == "converged" ),
+                      it_switch = st[ "it_switch" ], lin_nb_hierarchies = st[ "lin_nb_hierarchies" ], status = st[ "status" ],
+                      converged = int( st[ "status" ] in ( "converged", "converged (aggregated)" ) ),
+                      aggregate = p.aggregate, nb_clusters = st[ "nb_clusters" ], nb_aggregated = st[ "nb_aggregated" ], nb_duplicates = st[ "nb_duplicates" ],
+                      nb_polish = st[ "nb_polish" ], residual_full_rel = st[ "residual_full" ] * n,
                       iterations = st[ "nb_iter" ], diagrams = st[ "nb_diag" ], backtracks = st[ "nb_backtracks" ],
                       t_total_wall = wall, t_total_cpp = st[ "t_total" ], t_diag = st[ "t_diag" ], t_majorant = st[ "t_majorant" ],
                       t_asm = st[ "t_asm" ], t_lin = st[ "t_lin" ], t_lim = st[ "t_lim" ],
@@ -293,7 +298,9 @@ if p := bench( "newton",
     if density:
         print( f"  density { name }, continuation { continuation }: { st[ 'nb_continuation_steps' ] } stages; cost { float( numpy.asarray( sol.cost ) ) if sol else float( 'nan' ) :.12e}" )
     print( f"  min of { p.reps } ( warm-up apart ); residual max|a-nu|/nu = { res_rel :.2e}; start { st[ 'start' ] }; switch at it { st[ 'it_switch' ] }; backtracks { st[ 'nb_backtracks' ] }; "
-           f"linear iterations { st[ 'lin_nb_iter' ] }; C++ total { st[ 't_total' ] :.3f} s"
+           f"linear iterations { st[ 'lin_nb_iter' ] }; C++ total { st[ 't_total' ] :.3f} s; "
+           f"aggregation { p.aggregate }: { st[ 'nb_aggregated' ] } seeds in { st[ 'nb_clusters' ] } clusters ( { st[ 'nb_duplicates' ] } duplicates ), "
+           f"re-split { st[ 'nb_polish' ] } diag, full residual { st[ 'residual_full' ] * n :.2e}"
            + ( f"; witness { witness :.1e}" if witness is not None else "" ) )
     if ref:
         print( f"  old ( { variant } ): { ref[ 'iterations' ] } it, { ref[ 'diagrams' ] } diag, { ref[ 'seconds' ] } s -- { ref[ 'source' ] }" )

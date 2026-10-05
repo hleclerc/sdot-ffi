@@ -68,6 +68,7 @@
 #include "Sweep.h"
 #include "Linear.h"
 #include "Report.h"
+#include "Aggregation.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -110,6 +111,7 @@ struct NewtonStats {
     SI     nb_cell_lim = 0;      ///< cells computed by the limits passes, in all
     int    nb_limit_rounds = 0;   ///< LIMITS: trials corrected by local limits
     double t_asm = 0, t_lin = 0, t_lim = 0;
+    int    nb_polish = 0;        ///< diagrams of the re-splitting of the clusters ( `Aggregation.h` )
     static const char *text( int status ) {
         switch ( status ) {
             case CONVERGED:      return "CONVERGED";
@@ -148,6 +150,7 @@ struct Newton {
     int                 res_cur = NewtonOptions::LIN;   ///< the residual IN USE ( `switch_residual` changes it )
     double              beta;            ///< LIMITS: the next trial -- KEPT from one `solves` to the next ( the
                                          ///< steps of a continuation: a close start accepts `t = 1` right away )
+    Aggregation         agg;             ///< the clusters of near-coincident seeds ( `Aggregation.h` ): the tests read their masses
 
     Newton( Bal &bal, LinearSolver &lin, NewtonOptions o = {} ) : bal( bal ), lin( lin ), o( o ), beta( o.beta0 ) {}
 
@@ -173,22 +176,29 @@ struct Newton {
     /// the right-hand side of Newton for the residual in use: `b_i = nu_i / g'( x_i ) ( c - g( x_i ) )`;
     /// LIN gives `nu - a`
     void rhs( const std::vector<double> &A, std::vector<double> &b ) const {
+        if ( agg.has_dups() ) { rhs_on( A, agg.nu_e, b ); return; }
+        rhs_on( A, nu, b );
+    }
+    /// ... for the targets `N` ( `N_i = 0`: an exact duplicate, whose weight follows its representative: `b_i = 0` )
+    void rhs_on( const std::vector<double> &A, const std::vector<double> &N, std::vector<double> &b ) const {
         const SI n = SI( A.size() );
         b.assign( n, 0.0 );
         if ( res_cur == NewtonOptions::LIN ) {
-            for ( SI i = 0; i < n; ++i ) b[ i ] = nu[ i ] - A[ i ];
+            for ( SI i = 0; i < n; ++i ) b[ i ] = N[ i ] > 0 ? N[ i ] - A[ i ] : 0.0;
             return;
         }
         double su = 0, sug = 0;
         for ( SI i = 0; i < n; ++i ) {
-            const double x = A[ i ] / nu[ i ], u = nu[ i ] / gp_of( x, res_cur, o.power );
+            if ( ! ( N[ i ] > 0 ) ) continue;
+            const double x = A[ i ] / N[ i ], u = N[ i ] / gp_of( x, res_cur, o.power );
             su += u;
             sug += u * g_of( x, res_cur, o.power );
         }
         const double c = sug / su;
         for ( SI i = 0; i < n; ++i ) {
-            const double x = A[ i ] / nu[ i ];
-            b[ i ] = nu[ i ] / gp_of( x, res_cur, o.power ) * ( c - g_of( x, res_cur, o.power ) );
+            if ( ! ( N[ i ] > 0 ) ) continue;
+            const double x = A[ i ] / N[ i ];
+            b[ i ] = N[ i ] / gp_of( x, res_cur, o.power ) * ( c - g_of( x, res_cur, o.power ) );
         }
     }
 
@@ -221,8 +231,9 @@ struct Newton {
         return std::sqrt( s );
     }
 
-    /// THE MEASURES AND THE FACETS for the weights `W`
-    void measures_and_facets( const std::vector<double> &W, std::vector<double> &res, std::vector<Facet> &f ) {
+    /// THE MEASURES AND THE FACETS for the weights `W` ( the exact duplicates' weights tied to their representatives' first )
+    void measures_and_facets( std::vector<double> &W, std::vector<double> &res, std::vector<Facet> &f ) {
+        agg.tie( W );
         bal.set_weights( W );
         bal.measures( res, &f );
     }
@@ -231,9 +242,10 @@ struct Newton {
     /// Returns `true` if the stopping criterion is reached. The diagram carries the ACCEPTED weights on output.
     bool solves( const std::vector<double> &w_init, bool already_measured = false ) {
         const SI n = bal.n();
-        std::vector<double> a2, b, w2;
-        std::vector<Facet> fa2;
+        std::vector<double> a2, b, w2, ae, ae2;
+        std::vector<Facet> fa2, fa_lin;
         Laplacian L;
+        agg.prepare( nu );
 
         w = w_init;
         const double gauge = w[ 0 ];
@@ -248,12 +260,14 @@ struct Newton {
         double eps = 0;
         res_cur = o.residual;                            // ... that `switch_residual` brings back to LIN
         for ( int it = 0; it < o.maxit; ++it ) {
+            // the tests read the masses of the CLUSTERS when there are some ( `Aggregation.h`: each member's share )
+            const std::vector<double> &A = agg.shares( a, nu, ae );
             double worst = 0, worst_rel = 0;
             SI nb_empty = 0;
             for ( SI i = 0; i < n; ++i ) {
                 nb_empty += ! ( a[ i ] > 0 );
-                worst = std::max( worst, std::fabs( nu[ i ] - a[ i ] ) );
-                worst_rel = std::max( worst_rel, std::fabs( nu[ i ] - a[ i ] ) / nu[ i ] );
+                worst = std::max( worst, std::fabs( nu[ i ] - A[ i ] ) );
+                worst_rel = std::max( worst_rel, std::fabs( nu[ i ] - A[ i ] ) / nu[ i ] );
             }
             // THE SWITCH, decided BEFORE the right-hand side and the merit so that `b`, `nr` and `n2r` all speak
             // the same residual; latched ( `worst_rel` is not monotone, and we do not go back )
@@ -266,26 +280,38 @@ struct Newton {
             rhs( a, b );
             project_on_range( b );
             if ( it == 0 ) {                             // the mass floor of the damping
-                double am = a[ 0 ], nm = nu[ 0 ];
-                for ( SI i = 0; i < n; ++i ) { am = std::min( am, a[ i ] ); nm = std::min( nm, nu[ i ] ); }
+                double am = agg.floor_min( a ), nm = nu[ 0 ];
+                for ( SI i = 0; i < n; ++i ) nm = std::min( nm, nu[ i ] );
                 eps = 0.5 * std::min( nm, am );
                 st.eps = eps;
                 st.residual0 = worst;
             }
-            const double nr = merit( a );
+            double nr = merit( A );
             st.residual = worst;
 
             if ( worst <= o.tol_abs || ( o.tol_rel > 0 && worst_rel <= o.tol_rel ) ) {
                 if ( o.trace )
-                    std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  CONVERGED\n", it, nr, worst );
+                    std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  CONVERGED%s\n", it, nr, worst, agg.any() ? " ( aggregated )" : "" );
                 st.status = NewtonStats::CONVERGED;
+                resplit();
                 return true;
             }
             ++st.nb_iter;
             const int g0 = bal.nb_diag;
 
             double t0 = now();
-            L.assemble( n, fa );
+            if ( agg.has_dups() ) {                      // ( the duplicates' rows linked to their representatives )
+                agg.link_duplicates( fa, fa_lin );
+                L.assemble( n, fa_lin );
+            } else
+                L.assemble( n, fa );
+            // the pairs whose plane the doubles can no longer place are merged ( `Aggregation.h` ): the merit then reads
+            // their clusters from this iteration on
+            if ( agg.detect( L, w, nu ) ) {
+                nr = merit( agg.shares( a, nu, ae ) );
+                if ( o.trace )
+                    std::printf( "      aggregation: %d clusters, %d seeds ( |r|_2 %.3e )\n", int( agg.nb_clusters() ), int( agg.nb_aggregated() ), nr );
+            }
             st.t_asm += now() - t0;
             t0 = now();
             const bool solved = lin.solves( L, b, d );
@@ -314,7 +340,7 @@ struct Newton {
                     ++nb_evals;
                     t_done = t;
                     bad_cells.clear();
-                    for ( SI i = 0; i < n; ++i ) if ( a2[ i ] < eps ) bad_cells.push_back( i );
+                    for ( SI i = 0; i < n; ++i ) if ( a2[ i ] < eps && ! agg.is_dup( i ) ) bad_cells.push_back( i );
                     if ( bad_cells.empty() ) break;
                     ++st.nb_limit_rounds;
                     t0 = now();
@@ -350,9 +376,8 @@ struct Newton {
                     measures_and_facets( w2, a2, fa2 );
                     ++nb_evals;
                 }
-                double m2 = a2[ 0 ];                     // the `eps` floor is an ABSOLUTE mass
-                for ( SI i = 0; i < n; ++i ) m2 = std::min( m2, a2[ i ] );
-                const double n2r = merit( a2 );
+                const double m2 = agg.floor_min( a2 );   // the `eps` floor is an ABSOLUTE mass
+                const double n2r = merit( agg.shares( a2, nu, ae2 ) );
                 if ( m2 >= eps && std::isfinite( n2r ) && n2r <= ( 1 - t / 2 ) * nr && n2r < nr ) { taken = true; break; }
                 const bool hopeless = hope.refused( t, n2r, nr, m2 >= eps && std::isfinite( n2r ) );
                 t /= 2;
@@ -395,11 +420,54 @@ struct Newton {
             if ( o.after_step ) o.after_step( it + 1, t, nb_evals );
         }
         // the last point: what it is worth
+        const std::vector<double> &A = agg.shares( a, nu, ae );
         double worst = 0;
-        for ( SI i = 0; i < n; ++i ) worst = std::max( worst, std::fabs( nu[ i ] - a[ i ] ) );
+        for ( SI i = 0; i < n; ++i ) worst = std::max( worst, std::fabs( nu[ i ] - A[ i ] ) );
         st.residual = worst;
         st.status = NewtonStats::MAX_ITERATIONS;
         return false;
+    }
+
+    /// THE RE-SPLITTING, once the aggregated problem has converged ( `Aggregation.h` ): local Newton steps on the members of
+    /// the clusters ( the rest of the diagram fixed ), one diagram each, kept while their residual decreases and the
+    /// aggregated test still passes. Stops as soon as the full problem passes the test, or at the floor of the doubles.
+    void resplit() {
+        if ( ! agg.any() )
+            return;
+        const SI n = bal.n();
+        Laplacian L;
+        std::vector<double> dw, a2, w2, ae;
+        std::vector<Facet> fa2;
+        for ( int round = 0; round < 4; ++round ) {
+            double wf, wfr;
+            agg.full_residual( a, nu, wf, wfr );
+            if ( agg.converged( wf, wfr ) )
+                return;
+            L.assemble( n, fa );
+            const double before = agg.local_step( L, a, nu, dw );
+            const double d0 = dw[ 0 ];                   // the gauge `w_0 = 0`, kept by a shift of everyone
+            w2.resize( n );
+            for ( SI i = 0; i < n; ++i ) w2[ i ] = w[ i ] + dw[ i ] - d0;
+            measures_and_facets( w2, a2, fa2 );
+            ++st.nb_polish;
+            const double after = agg.members_residual( a2, nu );
+            const std::vector<double> &A2 = agg.shares( a2, nu, ae );
+            double worst = 0, worst_rel = 0;
+            for ( SI i = 0; i < n; ++i ) {
+                worst = std::max( worst, std::fabs( nu[ i ] - A2[ i ] ) );
+                worst_rel = std::max( worst_rel, std::fabs( nu[ i ] - A2[ i ] ) / nu[ i ] );
+            }
+            if ( o.trace )
+                std::printf( "      re-splitting: members' residual %.3e -> %.3e, aggregated %.3e\n", before, after, worst );
+            if ( ! ( after < before ) || ! ( agg.floor_min( a2 ) > 0 ) || ! agg.converged( worst, worst_rel ) ) {
+                bal.set_weights( w );                    // the diagram takes the accepted weights back
+                return;
+            }
+            w.swap( w2 );
+            a.swap( a2 );
+            fa.swap( fa2 );
+            st.residual = worst;
+        }
     }
 };
 

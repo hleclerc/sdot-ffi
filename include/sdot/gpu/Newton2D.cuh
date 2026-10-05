@@ -72,6 +72,7 @@
 #include "DensityHost2D.cuh"
 #include "../sdotplan/Report.h"
 #include "../sdotplan/Continuation.h"
+#include "../sdotplan/Aggregation.h"
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -87,6 +88,7 @@ enum Opt : int {
     O_LIN_MAXIT, O_TRACE, O_MG_FLOAT, O_MG_SMOOTHED,
     O_CONTINUATION, O_CONV_THRESHOLD, O_CONV_S0, O_CONV_RATIO, O_CONV_MIN, O_CONV_POSSIBLE, O_MIN_SCALE,
     O_IMG_X0, O_IMG_Y0, O_IMG_HX, O_IMG_HY, O_IMG_NX, O_IMG_NY,
+    O_AGG_MARGIN, O_AGG_GAP, O_AGG_NB_DUPS,
     NB_OPTS
 };
 enum ContinuationKind : int { CONT_NEVER = 0, CONT_AUTO = 1, CONT_ALWAYS = 2 };
@@ -124,16 +126,33 @@ struct DiagFn {
     const double *a, *nu;
     double        eps, p;
     int           res;
+    const double *ar  = nullptr;                         ///< the masses the residual reads ( the clusters' shares, `sdotplan/Aggregation.h` ); null: `a`
+    const double *nue = nullptr;                         ///< the targets, an exact duplicate's at 0: left out of the floor ( its cell is empty )
     __device__ void operator()( SI i, DiagRed &r ) const {
-        const double ai = a[ i ], ni = nu[ i ], dd = ai - ni;
+        const double ai = a[ i ], ni = nu[ i ], ri = ar ? ar[ i ] : ai, dd = ri - ni;
         r.sum_a += ai;
         r.sum_d2 += dd * dd;
-        r.sum_g += g_of( ai / ni, res, p );
-        r.min_a = fmin( r.min_a, ai );
+        r.sum_g += g_of( ri / ni, res, p );
         r.max_abs = fmax( r.max_abs, fabs( dd ) );
         r.max_rel = fmax( r.max_rel, fabs( dd ) / ni );
+        if ( nue && ! ( nue[ i ] > 0 ) )
+            return;
+        r.min_a = fmin( r.min_a, ai );
         r.nb_empty += ! ( ai > 0 );
         r.nb_below += ai < eps;
+    }
+};
+
+/// THE FULL PROBLEM'S RESIDUAL ( `Aggregation::full_residual` ): `max |a - nu_e|` and its relative form, the exact duplicates
+/// ( `nu_e = 0` ) left out
+struct FullResFn {
+    const double *a, *nue;
+    __device__ void operator()( SI i, DiagRed &r ) const {
+        if ( ! ( nue[ i ] > 0 ) )
+            return;
+        const double dd = fabs( a[ i ] - nue[ i ] );
+        r.max_abs = fmax( r.max_abs, dd );
+        r.max_rel = fmax( r.max_rel, dd / nue[ i ] );
     }
 };
 
@@ -176,6 +195,8 @@ struct RhsSums {
     double        p;
     int           res;
     __device__ void operator()( SI i, Sum2 &acc ) const {
+        if ( ! ( nu[ i ] > 0 ) )                         // an exact duplicate ( `nu_e = 0` ): its weight follows its representative
+            return;
         const double x = a[ i ] / nu[ i ], u = nu[ i ] / gp_of( x, res, p );
         acc.s0 += u;
         acc.s1 += u * g_of( x, res, p );
@@ -186,6 +207,10 @@ __global__ void __launch_bounds__( BLOCK ) rhs_kernel( SI n, const double *a, co
     const SI i = SI( blockIdx.x ) * BLOCK + threadIdx.x;
     if ( i >= n )
         return;
+    if ( ! ( nu[ i ] > 0 ) ) {                           // an exact duplicate ( `nu_e = 0` )
+        b[ i ] = 0;
+        return;
+    }
     if ( res == RES_LIN ) {
         b[ i ] = nu[ i ] - a[ i ];
         return;
@@ -287,6 +312,170 @@ struct MinOf {
     const double *x;
     __device__ void operator()( SI i, Min1 &acc ) const { acc.m = fmin( acc.m, x[ i ] ); }
 };
+
+// ---- THE AGGREGATION of near-coincident seeds ( `sdotplan/Aggregation.h`; the host decides, these kernels apply ) --------------
+
+/// each member of a cluster gets its share of the cluster's mass, `ae[ m ] = nu[ m ] a_r / nu_r` ( `ae` holds `a` elsewhere )
+__global__ void __launch_bounds__( BLOCK ) cluster_shares( SI nc, const SI *beg, const SI *mem, const double *a, const double *nu, double *ae ) {
+    const SI c = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( c >= nc )
+        return;
+    double sa = 0, sn = 0;
+    for ( SI k = beg[ c ]; k < beg[ c + 1 ]; ++k ) { sa += a[ mem[ k ] ]; sn += nu[ mem[ k ] ]; }
+    const double r = sn > 0 ? sa / sn : 0.0;
+    for ( SI k = beg[ c ]; k < beg[ c + 1 ]; ++k ) ae[ mem[ k ] ] = nu[ mem[ k ] ] * r;
+}
+
+/// the targets with the exact duplicates' carried by their representatives: `nu_e[ rep ] += nu[ dup ]`, `nu_e[ dup ] = 0`
+__global__ void __launch_bounds__( BLOCK ) duplicate_targets( SI k, const SI *dup, const SI *rep, const double *nu, double *nue ) {
+    const SI q = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( q >= k )
+        return;
+    atomicAdd( nue + rep[ q ], nu[ dup[ q ] ] );
+    nue[ dup[ q ] ] = 0;
+}
+
+/// `w[ dup ] = w[ rep ] - gap`: the cell of an exact duplicate stays empty
+__global__ void __launch_bounds__( BLOCK ) tie_duplicates( SI k, const SI *dup, const SI *rep, const double *gap, double *w ) {
+    const SI q = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( q < k ) w[ dup[ q ] ] = w[ rep[ q ] ] - gap[ q ];
+}
+
+/// the ranks of the user seeds `users` ( sorted, `m` ): `ranks[ q ]` for `users[ q ]`
+template<class TI>
+__global__ void __launch_bounds__( BLOCK ) ranks_of_users( SI n, Strided<TI,1> ids, SI m, const SI *users, SI *ranks ) {
+    const SI k = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( k >= n )
+        return;
+    const SI u = SI( ids( k ) );
+    SI lo = 0, hi = m;
+    while ( lo < hi ) { const SI mid = ( lo + hi ) / 2; if ( users[ mid ] < u ) lo = mid + 1; else hi = mid; }
+    if ( lo < m && users[ lo ] == u ) ranks[ lo ] = k;
+}
+
+/// `out[ q ] = src[ at[ q ] ]` ( a few values read back by the host )
+__global__ void __launch_bounds__( BLOCK ) gather_at( SI m, const SI *at, const double *src, double *out ) {
+    const SI q = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( q < m ) out[ q ] = src[ at[ q ] ];
+}
+
+template<class TI>
+__global__ void __launch_bounds__( BLOCK ) users_at( SI m, const SI *at, Strided<TI,1> ids, SI *out ) {
+    const SI q = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( q < m ) out[ q ] = SI( ids( at[ q ] ) );
+}
+
+struct MaxOfV {
+    const double *x;
+    __device__ void operator()( SI i, Max1 &acc ) const { acc.m = fmax( acc.m, x[ i ] ); }
+};
+
+/// one coefficient of the laplacian above the bound of the detection, read back by the host
+struct HeavyFacet { SI i, j; double c, wi, wj, nui, nuj; };
+
+/// THE DETECTION'S SCAN ( `Aggregation::detect` ): the entries `i < j` of the laplacian with `c_ij > c_star`, at most `cap`
+template<class TR>
+__global__ void __launch_bounds__( BLOCK ) heavy_facets( SI n, const SI *row, const TR *col, const double *val, const double *dia, double c_star,
+                                                        const double *w, const double *nu, unsigned long long *count, HeavyFacet *out, SI cap ) {
+    const SI i = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( i >= n || ! ( dia[ i ] > c_star ) )
+        return;
+    for ( SI e = row[ i ]; e < row[ i + 1 ]; ++e ) {
+        const SI j = SI( col[ e ] );
+        if ( j <= i || ! ( val[ e ] > c_star ) )
+            continue;
+        const SI q = SI( atomicAdd( count, 1ull ) );
+        if ( q < cap ) out[ q ] = HeavyFacet{ i, j, val[ e ], w[ i ], w[ j ], nu[ i ], nu[ j ] };
+    }
+}
+
+/// THE RE-SPLITTING'S ROWS: for each member `mem[ q ]`, its diagonal and its entries ( at most `deg` ), for the host's blocks
+template<class TR>
+__global__ void __launch_bounds__( BLOCK ) member_rows( SI m, const SI *mem, const SI *row, const TR *col, const double *val, const double *dia,
+                                                       int deg, double *out_dia, SI *out_len, SI *out_col, double *out_val ) {
+    const SI q = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( q >= m )
+        return;
+    const SI i = mem[ q ];
+    out_dia[ q ] = dia[ i ];
+    out_len[ q ] = row[ i + 1 ] - row[ i ];
+    for ( SI e = row[ i ], u = 0; e < row[ i + 1 ] && u < deg; ++e, ++u ) {
+        out_col[ q * deg + u ] = SI( col[ e ] );
+        out_val[ q * deg + u ] = val[ e ];
+    }
+}
+
+/// THE LINEAR SYSTEM'S ROWS OF THE DUPLICATES ( `Aggregation::link_duplicates` ): a facet `( dup, rep, c )` appended to the COO
+/// after its `nb` entries ( the host checked the room ), counted in by `bump_facets`, taken out again after the assembly
+template<class TR>
+__global__ void __launch_bounds__( BLOCK ) append_links( SI k, const SI *dup, const SI *rep, double c, unsigned long long nb, TR *fi, TR *fj, double *fc ) {
+    const SI q = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( q >= k )
+        return;
+    fi[ nb + q ] = TR( dup[ q ] );
+    fj[ nb + q ] = TR( rep[ q ] );
+    fc[ nb + q ] = c;
+}
+__global__ void bump_facets( Counters *counters, long long delta ) { counters->nb_facets += delta; }
+
+/// THE DIRECTION WITH CLUSTERS ( see `solve` ): the coefficients between two members of cluster `c` capped at `cap` in their
+/// rows ( the diagonal following ); one thread per cluster
+template<class TR>
+__global__ void __launch_bounds__( BLOCK ) cap_internal( SI nc, const SI *beg, const SI *mem, const SI *row, const TR *col, double *val, double *dia, double cap ) {
+    const SI c = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( c >= nc )
+        return;
+    for ( SI k = beg[ c ]; k < beg[ c + 1 ]; ++k ) {
+        const SI i = mem[ k ];
+        bool capped = false;
+        for ( SI e = row[ i ]; e < row[ i + 1 ]; ++e ) {
+            if ( ! ( val[ e ] > cap ) ) continue;
+            const SI j = SI( col[ e ] );
+            SI lo = beg[ c ], hi = beg[ c + 1 ];
+            while ( lo < hi ) { const SI mid = ( lo + hi ) / 2; if ( mem[ mid ] < j ) lo = mid + 1; else hi = mid; }
+            if ( lo < beg[ c + 1 ] && mem[ lo ] == j ) { val[ e ] = cap; capped = true; }
+        }
+        if ( capped ) {                                  // the diagonal summed again ( a float cut can make a coefficient infinite )
+            double d = 0;
+            for ( SI e = row[ i ]; e < row[ i + 1 ]; ++e ) d += val[ e ];
+            dia[ i ] = d > 0 ? d : 1.0;
+        }
+    }
+}
+
+/// ... and the members' directions tied to their cluster's, `d_i = sum nu_j d_j / sum nu_j` ( `nu`: the targets, a duplicate's 0 )
+__global__ void __launch_bounds__( BLOCK ) tie_direction( SI nc, const SI *beg, const SI *mem, const double *nu, double *d ) {
+    const SI c = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( c >= nc )
+        return;
+    double s = 0, sn = 0;
+    for ( SI k = beg[ c ]; k < beg[ c + 1 ]; ++k ) { s += nu[ mem[ k ] ] * d[ mem[ k ] ]; sn += nu[ mem[ k ] ]; }
+    const double dm = sn > 0 ? s / sn : 0.0;
+    for ( SI k = beg[ c ]; k < beg[ c + 1 ]; ++k ) d[ mem[ k ] ] = dm;
+}
+
+/// `w2 = w - shift`, then `w2[ at[ q ] ] += dw[ q ]` ( the re-splitting's step; the shift keeps the gauge )
+__global__ void __launch_bounds__( BLOCK ) shifted_copy( SI n, const double *w, double shift, double *w2 ) {
+    const SI i = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( i < n ) w2[ i ] = w[ i ] - shift;
+}
+__global__ void __launch_bounds__( BLOCK ) add_at( SI m, const SI *at, const double *dw, double *w ) {
+    const SI q = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( q < m ) w[ at[ q ] ] += dw[ q ];
+}
+
+/// the clusters' output, user order: every seed its own index ...
+template<class TI,class TO>
+__global__ void __launch_bounds__( BLOCK ) write_own_index( SI n, Strided<TI,1> ids, StridedOut<TO,1> out ) {
+    const SI k = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( k < n ) out( SI( ids( k ) ) ) = TO( ids( k ) );
+}
+/// ... then the members of a cluster the smallest index of it
+template<class TO>
+__global__ void __launch_bounds__( BLOCK ) write_representatives( SI m, const SI *users, const SI *reps, StridedOut<TO,1> out ) {
+    const SI q = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( q < m ) out( users[ q ] ) = TO( reps[ q ] );
+}
 
 template<class SV>
 __global__ void set_shape_var( SV sv, SI v ) { sv.set( v ); }
@@ -406,8 +595,9 @@ struct AlphaBackward {
     const int    *nb_edges;
     SI            n;
     double        rho, eps, t_trial;
+    const double *nue = nullptr;                         ///< an exact duplicate ( `nu_e = 0` ): empty by construction, no say
     __device__ void operator()( SI k, MinCount &acc ) const {
-        if ( ! ( a[ k ] < eps ) )
+        if ( ! ( a[ k ] < eps ) || ( nue && ! ( nue[ k ] > 0 ) ) )
             return;
         acc.c += 1;
         double target = 0.5 * t_trial;
@@ -528,8 +718,9 @@ struct AlphaBackwardDens {
     SI            n;
     D             dens;
     double        eps, t_trial;
+    const double *nue = nullptr;                         ///< an exact duplicate ( `nu_e = 0` ): empty by construction, no say
     __device__ void operator()( SI k, MinCount &acc ) const {
-        if ( ! ( a[ k ] < eps ) )
+        if ( ! ( a[ k ] < eps ) || ( nue && ! ( nue[ k ] > 0 ) ) )
             return;
         acc.c += 1;
         double target = 0.5 * t_trial;
@@ -565,6 +756,13 @@ struct StageTimer {
     void release() { if ( a ) cudaEventDestroy( a ); if ( b ) cudaEventDestroy( b ); a = b = nullptr; }
 };
 
+/// an integer input read as `SI` ( the exact duplicates )
+template<class T>
+__global__ void __launch_bounds__( BLOCK ) read_ints( SI n, Strided<T,1> src, SI *dst ) {
+    const SI k = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( k < n ) dst[ k ] = SI( src( k ) );
+}
+
 // ---- the solver -----------------------------------------------------------------------------------------------------------
 
 /// what a diagram writes, twice ( the accepted one and the trial )
@@ -580,13 +778,19 @@ struct Slot {
 };
 
 /// THE SOLVE ( see the header ). `pd`: the diagram ( its tree, its positions; its weights are not read ); `nu_in`, `w0_in`:
-/// user order; `opts_in`: `NB_OPTS` reals. Outputs as `sdotplan::solve`, plus the diagram's `sorted_weights_out`,
+/// user order; `dups_in`: the exact duplicates, `( dup, rep )` user pairs flattened ( the first `O_AGG_NB_DUPS` pairs );
+/// `opts_in`: `NB_OPTS` reals. Outputs as `sdotplan::solve`, plus the diagram's `sorted_weights_out`,
 /// `node_wa_out`, `node_wb_out` and `work` ( the capacity `nb_facets` ). `dens_in`: the density ( a 0-d tensor: a constant;
 /// `image_in( ... )`, `gauss_in( ... )`: `DensityHost2D.cuh` ). `max_vertices`, `overflow_warps`: the cells' fourth pass
 /// ( `Cell2D.cuh::Overflow` ).
+///
+/// THE AGGREGATION ( `sdotplan/Aggregation.h` ): the host keeps the clusters ( in ranks ), the card applies them -- the shares
+/// in the reports' residual, the exact duplicates' targets and tied weights, the detection's scan of the laplacian, the
+/// re-splitting's step. Nothing of it runs on a cloud without such seeds but two reductions per iteration ( the largest
+/// weight and diagonal ).
 template<class V,class VD = V>
-void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const auto &w0_in, const auto &opts_in,
-            auto &&weights, auto &&hist, auto &&stats, auto &&masses, auto &&bary, auto &&cost,
+void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const auto &w0_in, const auto &dups_in, const auto &opts_in,
+            auto &&weights, auto &&hist, auto &&stats, auto &&masses, auto &&bary, auto &&cost, auto &&clusters_out,
             auto &&sorted_weights_out, auto &&node_wa_out, auto &&node_wb_out, auto &&work,
             const auto &errors_, auto &allocator, const auto &dens_in, int max_vertices, int overflow_warps ) {
     using PD = std::decay_t<decltype( pd )>;
@@ -633,6 +837,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     const int lin_kind = int( o[ O_LIN ] );
     const bool trace = o[ O_TRACE ] != 0;
     const int continuation = int( o[ O_CONTINUATION ] );
+    const SI agg_nb_dups = SI( o[ O_AGG_NB_DUPS ] );
 
     // ---- the fourth pass's slots, ONE budget for every card of the solve ( they run one after the other ), sized for the
     // largest cell form ( the double kernel's, MIXED )
@@ -787,16 +992,96 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     // the target in ranks ( `nu`: gathered again from `nu_in` at each stage rather than kept twice )
     launch_kernel( queue, &gather_ranks<TF,TI>, blocks_for( n ), BLOCK, 0, n, strided( nu_in ), ids, nu );
 
-    /// the report of slot `s` against the current target, residual and floor ( reductions, one read back )
+    // ---- THE AGGREGATION ( `sdotplan/Aggregation.h` ), its host side in RANKS
+    sp::Aggregation agg;
+    agg.init( n );
+    agg.margin = o[ O_AGG_MARGIN ];
+    agg.gap = o[ O_AGG_GAP ];
+    agg.tol_abs = tol_abs;
+    agg.tol_rel = tol_rel;
+    double tau_min = 0;
+    int nb_polish = 0;
+    SI *dup_dev = nullptr, *drep_dev = nullptr;          // the exact duplicates and their representatives ( ranks )
+    double *gap_dev = nullptr;                           // ... `w_rep - w_dup`
+    double *nue = nullptr;                               // the targets, the duplicates' carried by their representatives
+    double *const ae = b;                                // the clusters' shares: `b`'s room, dead whenever a diagram is reported
+    SI *cl_beg_dev = nullptr, *cl_mem_dev = nullptr, cl_cap = 0;
+    auto upload_clusters = [&]() -> bool {
+        const SI nc = agg.nb_clusters(), nm = agg.nb_aggregated();
+        if ( std::max( nc + 1, nm ) > cl_cap ) {
+            cl_cap = 2 * std::max( nc + 1, nm ) + 64;
+            cl_beg_dev = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * cl_cap ) );
+            cl_mem_dev = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * cl_cap ) );
+            if ( ! cl_beg_dev || ! cl_mem_dev )
+                return false;
+        }
+        cuda_check( cudaMemcpyAsync( cl_beg_dev, agg.cl_begin.data(), sizeof( SI ) * ( nc + 1 ), cudaMemcpyHostToDevice, queue.stream ), "copy of the clusters" );
+        cuda_check( cudaMemcpyAsync( cl_mem_dev, agg.cl_members.data(), sizeof( SI ) * nm, cudaMemcpyHostToDevice, queue.stream ), "copy of the clusters" );
+        cuda_check( cudaStreamSynchronize( queue.stream ), "sync ( clusters )" );
+        return true;
+    };
+    if ( agg_nb_dups > 0 ) {
+        // the pairs ( user order ) to ranks: the users sorted, each rank looks itself up
+        SI *tmp = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * 2 * agg_nb_dups ) );
+        if ( ! tmp ) return;
+        launch_kernel( queue, &read_ints<std::remove_const_t<typename std::decay_t<decltype( dups_in )>::TF>>, blocks_for( 2 * agg_nb_dups ), BLOCK, 0,
+                       2 * agg_nb_dups, strided( dups_in ), tmp );
+        std::vector<SI> pairs( 2 * agg_nb_dups );
+        read_back( queue, pairs.data(), ( const SI * ) tmp, 2 * agg_nb_dups );
+        std::vector<SI> users( pairs );
+        std::sort( users.begin(), users.end() );
+        users.erase( std::unique( users.begin(), users.end() ), users.end() );
+        const SI m = SI( users.size() );
+        SI *users_dev = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * m ) ), *ranks_dev = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * m ) );
+        dup_dev = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * agg_nb_dups ) );
+        drep_dev = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * agg_nb_dups ) );
+        nue = vec( n );
+        gap_dev = vec( agg_nb_dups );
+        if ( ! users_dev || ! ranks_dev || ! dup_dev || ! drep_dev || ! nue || ! gap_dev ) return;
+        cuda_check( cudaMemcpyAsync( users_dev, users.data(), sizeof( SI ) * m, cudaMemcpyHostToDevice, queue.stream ), "copy of the duplicates" );
+        launch_kernel( queue, &ranks_of_users<TI>, blocks_for( n ), BLOCK, 0, n, ids, m, ( const SI * ) users_dev, ranks_dev );
+        std::vector<SI> ranks( m );
+        read_back( queue, ranks.data(), ( const SI * ) ranks_dev, m );
+        auto rank_of = [&]( SI u ) { return ranks[ SI( std::lower_bound( users.begin(), users.end(), u ) - users.begin() ) ]; };
+        std::vector<SI> dr( agg_nb_dups ), rr( agg_nb_dups );
+        for ( SI q = 0; q < agg_nb_dups; ++q ) { dr[ q ] = rank_of( pairs[ 2 * q ] ); rr[ q ] = rank_of( pairs[ 2 * q + 1 ] ); }
+        cuda_check( cudaMemcpyAsync( dup_dev, dr.data(), sizeof( SI ) * agg_nb_dups, cudaMemcpyHostToDevice, queue.stream ), "copy of the duplicates" );
+        cuda_check( cudaMemcpyAsync( drep_dev, rr.data(), sizeof( SI ) * agg_nb_dups, cudaMemcpyHostToDevice, queue.stream ), "copy of the duplicates" );
+        cuda_check( cudaStreamSynchronize( queue.stream ), "sync ( duplicates )" );
+        agg.set_duplicates( dr, rr );
+        cuda_check( cudaMemcpyAsync( gap_dev, agg.dup_gap.data(), sizeof( double ) * agg_nb_dups, cudaMemcpyHostToDevice, queue.stream ), "copy of the gaps" );
+        if ( ! upload_clusters() ) return;
+    }
+    /// the targets with the duplicates' carried by their representatives, for the current `nu`
+    auto duplicate_targets_now = [&]() {
+        if ( ! nue ) return;
+        cuda_check( cudaMemcpyAsync( nue, nu, sizeof( double ) * n, cudaMemcpyDeviceToDevice, queue.stream ), "copy of the targets" );
+        launch_kernel( queue, &duplicate_targets, blocks_for( agg_nb_dups ), BLOCK, 0, agg_nb_dups, ( const SI * ) dup_dev, ( const SI * ) drep_dev,
+                       ( const double * ) nu, nue );
+    };
+    duplicate_targets_now();
+
+    /// the report of slot `s` against the current target, residual and floor ( reductions, one read back ); with clusters, the
+    /// residual reads their shares ( `ae` )
     auto report = [&]( Slot<TR> &s ) {
-        reduce( queue, n, DiagFn{ s.a, nu, eps, power, res_cur }, red_diag.partials, red_diag.out );
-        reduce( queue, n, CentredG2{ s.a, nu, red_diag.out, 1.0 / double( n ), power, res_cur }, red1.partials, red1.out );
+        const double *ar = nullptr;
+        if ( agg.any() ) {
+            cuda_check( cudaMemcpyAsync( ae, s.a, sizeof( double ) * n, cudaMemcpyDeviceToDevice, queue.stream ), "copy of the measures" );
+            launch_kernel( queue, &cluster_shares, blocks_for( agg.nb_clusters() ), BLOCK, 0, agg.nb_clusters(), ( const SI * ) cl_beg_dev,
+                           ( const SI * ) cl_mem_dev, ( const double * ) s.a, ( const double * ) nu, ae );
+            ar = ae;
+        }
+        reduce( queue, n, DiagFn{ s.a, nu, eps, power, res_cur, ar, nue }, red_diag.partials, red_diag.out );
+        reduce( queue, n, CentredG2{ ar ? ar : s.a, nu, red_diag.out, 1.0 / double( n ), power, res_cur }, red1.partials, red1.out );
         launch_kernel( queue, &gather_report, 1, 1, 0, rep_dev, ( const DiagRed * ) red_diag.out, ( const Sum1 * ) red1.out, ( const Counters * ) s.counters );
         read_back( queue, &s.rep, ( const Report * ) rep_dev, 1 );
     };
 
-    /// THE DIAGRAM of `wt` into slot `s`
+    /// THE DIAGRAM of `wt` into slot `s` ( the exact duplicates' weights tied to their representatives' first )
     auto diagram = [&]( const double *wt, Slot<TR> &s ) {
+        if ( agg_nb_dups > 0 )
+            launch_kernel( queue, &tie_duplicates, blocks_for( agg_nb_dups ), BLOCK, 0, agg_nb_dups, ( const SI * ) dup_dev, ( const SI * ) drep_dev,
+                           ( const double * ) gap_dev, const_cast<double *>( wt ) );
         tm_maj.start( queue );
         maj.refresh( queue, pd, wt, const_cast<Node<true,TR> *>( card.pb.nodes ) );
         auto run_on = [&]( auto &c ) {
@@ -914,6 +1199,216 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     launch_kernel( queue, &pick_value, 1, 1, 0, ( const double * ) w, r0, gauge );
     launch_kernel( queue, &subtract_scalar, blocks_for( n ), BLOCK, 0, w, ( const double * ) gauge, 1.0, n );
 
+    /// the scale of a facet's coefficient ( `rho l / 2 delta` with `l ~ delta` ): the density, or the mean density of the box
+    const double c_scale = CONST ? rho : 1.0 / std::max( ( box_hi[ 0 ] - box_lo[ 0 ] ) * ( box_hi[ 1 ] - box_lo[ 1 ] ), 1e-300 );
+
+    // ---- THE AGGREGATION'S DETECTION ( `Aggregation::detect` ) on the laplacian just assembled and the accepted weights
+    const SI heavy_cap = 4096;
+    HeavyFacet *heavy = nullptr;
+    unsigned long long *heavy_count = nullptr;
+    auto detect = [&]() -> bool {
+        if ( ! ( agg.margin > 0 ) )
+            return false;
+        reduce( queue, n, MaxAbs{ w }, redm.partials, redm.out );
+        Max1 mw, md;
+        read_back( queue, &mw, ( const Max1 * ) redm.out, 1 );
+        reduce( queue, n, MaxOfV{ ldia }, redm.partials, redm.out );
+        read_back( queue, &md, ( const Max1 * ) redm.out, 1 );
+        // ON THE CARD, a second bound: a coefficient past 1e9 times the scale of a facet is merged whatever the weights -- the
+        // multigrid's float levels do not hold it, and a cut decided by the float kernel can make it infinite ( a pair 1e-12
+        // apart: 2.5e10, a linear solver failure at the first iteration, before any weight has grown ). ( 1e6 merged an
+        // ordinary pair of a uniform cloud of 4000 seeds under the mixed kernel )
+        const double c_cond = 1e9 * c_scale;
+        const double c_star = std::min( tau_min / ( agg.margin * sp::ulp_of( mw.m ) ), c_cond );
+        if ( ! ( md.m > c_star ) )
+            return false;
+        if ( ! heavy ) {
+            heavy = static_cast<HeavyFacet *>( take( allocator, SI( sizeof( HeavyFacet ) ) * heavy_cap ) );
+            heavy_count = static_cast<unsigned long long *>( take( allocator, SI( sizeof( unsigned long long ) ) ) );
+            if ( ! heavy || ! heavy_count ) { agg.margin = 0; return false; }
+        }
+        zero_fill( queue, heavy_count, SI( sizeof( unsigned long long ) ) );
+        launch_kernel( queue, &heavy_facets<TR>, blocks_for( n ), BLOCK, 0, n, ( const SI * ) lrow, ( const TR * ) lcol, ( const double * ) lval,
+                       ( const double * ) ldia, c_star, ( const double * ) w, ( const double * ) nu, heavy_count, heavy, heavy_cap );
+        unsigned long long cnt = 0;
+        read_back( queue, &cnt, ( const unsigned long long * ) heavy_count, 1 );
+        std::vector<HeavyFacet> hf( size_t( std::min<unsigned long long>( cnt, heavy_cap ) ) );
+        if ( ! hf.empty() )
+            read_back( queue, hf.data(), ( const HeavyFacet * ) heavy, SI( hf.size() ) );
+        bool changed = false;
+        for ( const HeavyFacet &h : hf ) {
+            const double m = h.c * sp::ulp_of( std::max( std::fabs( h.wi ), std::fabs( h.wj ) ) );
+            if ( ( m * agg.margin > agg.tau( std::min( h.nui, h.nuj ) ) || h.c > c_cond ) && agg.unite( h.i, h.j ) ) { changed = true; ++agg.nb_merged_pairs; }
+        }
+        if ( changed ) {
+            agg.rebuild();
+            if ( ! upload_clusters() ) { stop_all = failed = true; return false; }   // ( the pool is exhausted )
+        }
+        return changed;
+    };
+
+    // ---- THE CLUSTERS' ROWS OF THE LAPLACIAN, read back for the host's `k x k` blocks ( the re-splitting, and the direction's
+    // local correction below )
+    const int row_cap = 64;                              // entries per member row read back ( a 2D cell has a handful )
+    SI *rs_mem = nullptr, *rs_len = nullptr, *rs_col = nullptr, *rs_at = nullptr;
+    double *rs_dia = nullptr, *rs_val = nullptr, *rs_a = nullptr, *rs_nu = nullptr, *rs_dw = nullptr, *rs_dn = nullptr;
+    SI rs_cap = 0;
+    struct Rows { std::vector<SI> all, beg, len, col; std::vector<double> dia, val; };
+    /// the movable members, cluster after cluster, and their rows of the laplacian `( lrow, lcol, lval, ldia )` as it is now
+    auto read_rows = [&]( Rows &R ) -> bool {
+        std::vector<SI> mem;
+        R.all.clear(); R.beg.assign( 1, 0 );
+        for ( SI c = 0; c < agg.nb_clusters(); ++c ) {
+            agg.movable_members( c, mem );
+            R.all.insert( R.all.end(), mem.begin(), mem.end() );
+            R.beg.push_back( SI( R.all.size() ) );
+        }
+        const SI m = SI( R.all.size() );
+        if ( m == 0 )
+            return false;
+        if ( m > rs_cap ) {
+            rs_cap = m;
+            rs_mem = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * m ) );
+            rs_len = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * m ) );
+            rs_col = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * m * row_cap ) );
+            rs_at = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * m * row_cap ) );
+            rs_dia = vec( m ); rs_val = vec( m * row_cap ); rs_a = vec( m ); rs_nu = vec( m ); rs_dw = vec( m ); rs_dn = vec( m * row_cap );
+            if ( ! rs_mem || ! rs_len || ! rs_col || ! rs_at || ! rs_dia || ! rs_val || ! rs_a || ! rs_nu || ! rs_dw || ! rs_dn ) {
+                rs_cap = 0;
+                return false;
+            }
+        }
+        cuda_check( cudaMemcpyAsync( rs_mem, R.all.data(), sizeof( SI ) * m, cudaMemcpyHostToDevice, queue.stream ), "copy of the members" );
+        launch_kernel( queue, &member_rows<TR>, blocks_for( m ), BLOCK, 0, m, ( const SI * ) rs_mem, ( const SI * ) lrow, ( const TR * ) lcol,
+                       ( const double * ) lval, ( const double * ) ldia, row_cap, rs_dia, rs_len, rs_col, rs_val );
+        R.dia.resize( m ); R.len.resize( m ); R.col.resize( size_t( m ) * row_cap ); R.val.resize( size_t( m ) * row_cap );
+        read_back( queue, R.dia.data(), ( const double * ) rs_dia, m );
+        read_back( queue, R.len.data(), ( const SI * ) rs_len, m );
+        read_back( queue, R.col.data(), ( const SI * ) rs_col, m * row_cap );
+        read_back( queue, R.val.data(), ( const double * ) rs_val, m * row_cap );
+        return true;
+    };
+    /// `L_CC x_C = r_C` per cluster ( `r`, per member, overwritten by `x`; 0 where a block cannot be solved )
+    auto block_solves = [&]( const Rows &R, std::vector<double> &r ) {
+        std::vector<double> M, x;
+        for ( size_t c = 0; c + 1 < R.beg.size(); ++c ) {
+            const SI b0 = R.beg[ c ], k = R.beg[ c + 1 ] - b0;
+            bool fits = k >= 2 && k <= 64;
+            M.assign( size_t( k * k ), 0.0 );
+            x.assign( r.begin() + b0, r.begin() + b0 + k );
+            for ( SI u = 0; u < k && fits; ++u ) {
+                const SI q = b0 + u;
+                fits = R.len[ q ] <= row_cap;
+                M[ u * k + u ] = R.dia[ q ];
+                for ( SI e = 0; e < std::min<SI>( R.len[ q ], row_cap ); ++e ) {
+                    const SI j = R.col[ size_t( q ) * row_cap + e ];
+                    const auto it = std::lower_bound( R.all.begin() + b0, R.all.begin() + b0 + k, j );
+                    if ( it != R.all.begin() + b0 + k && *it == j )
+                        M[ u * k + SI( it - ( R.all.begin() + b0 ) ) ] -= R.val[ size_t( q ) * row_cap + e ];
+                }
+            }
+            for ( double v : M ) fits = fits && std::isfinite( v );
+            if ( ! fits || ! sp::Aggregation::cholesky_solve( k, M, x ) )
+                x.assign( k, 0.0 );
+            std::copy( x.begin(), x.end(), r.begin() + b0 );
+        }
+    };
+
+    // ---- THE DIRECTION WITH CLUSTERS: the laplacian's coefficient between two members of a cluster is `rho l / 2 delta` --
+    // 2.5e10 for a pair 1e-12 apart, which the card's multigrid ( float levels ) does not survive. So the system is solved
+    // with those coefficients capped at 1e6 times the scale of a facet ( `cap_internal`: the multigrid's floats still hold
+    // there, `lines_equal`'s pair is at 4e6 ), the members' directions tied to their cluster's ( `tie_direction`: the
+    // direction of the merged seed, to ~1e-6 ), then the split inside each cluster corrected by its exact local system, the
+    // rest fixed: `L_CC dd_C = b_C - ( L d )_C` with the TRUE rows, its mean over the cluster ( weighted by the targets )
+    // taken out -- one two-level step
+    Rows rows_dir;
+    bool rows_ok = false;
+    auto correct_direction = [&]() {
+        if ( ! rows_ok )
+            return;
+        const SI m = SI( rows_dir.all.size() );
+        std::vector<SI> at;                              // the columns of the members' rows, then the members
+        for ( SI q = 0; q < m; ++q )
+            for ( SI e = 0; e < std::min<SI>( rows_dir.len[ q ], row_cap ); ++e ) at.push_back( rows_dir.col[ size_t( q ) * row_cap + e ] );
+        const SI na = SI( at.size() );
+        if ( na > m * row_cap ) return;
+        cuda_check( cudaMemcpyAsync( rs_at, at.data(), sizeof( SI ) * na, cudaMemcpyHostToDevice, queue.stream ), "copy of the columns" );
+        launch_kernel( queue, &gather_at, blocks_for( na ), BLOCK, 0, na, ( const SI * ) rs_at, ( const double * ) d, rs_dn );
+        launch_kernel( queue, &gather_at, blocks_for( m ), BLOCK, 0, m, ( const SI * ) rs_mem, ( const double * ) d, rs_a );
+        std::vector<double> dn( na ), dm( m ), bm( m );
+        read_back( queue, dn.data(), ( const double * ) rs_dn, na );
+        read_back( queue, dm.data(), ( const double * ) rs_a, m );
+        read_back( queue, bm.data(), ( const double * ) rs_nu, m );   // ( `b` at the members, gathered before the solve )
+        std::vector<double> r( m );
+        for ( SI q = 0, k = 0; q < m; ++q ) {
+            double ld = rows_dir.dia[ q ] * dm[ q ];
+            for ( SI e = 0; e < std::min<SI>( rows_dir.len[ q ], row_cap ); ++e, ++k ) ld -= rows_dir.val[ size_t( q ) * row_cap + e ] * dn[ k ];
+            r[ q ] = bm[ q ] - ld;
+        }
+        block_solves( rows_dir, r );
+        // only the split inside each cluster: the cluster as a whole moves as the tied solve said ( its share of the targets )
+        launch_kernel( queue, &gather_at, blocks_for( m ), BLOCK, 0, m, ( const SI * ) rs_mem, nue ? ( const double * ) nue : ( const double * ) nu, rs_a );
+        std::vector<double> tm( m );
+        read_back( queue, tm.data(), ( const double * ) rs_a, m );
+        for ( size_t c = 0; c + 1 < rows_dir.beg.size(); ++c ) {
+            double s = 0, sn = 0;
+            for ( SI q = rows_dir.beg[ c ]; q < rows_dir.beg[ c + 1 ]; ++q ) { s += tm[ q ] * r[ q ]; sn += tm[ q ]; }
+            for ( SI q = rows_dir.beg[ c ]; q < rows_dir.beg[ c + 1 ]; ++q ) r[ q ] -= sn > 0 ? s / sn : 0.0;
+        }
+        cuda_check( cudaMemcpyAsync( rs_dw, r.data(), sizeof( double ) * m, cudaMemcpyHostToDevice, queue.stream ), "copy of the correction" );
+        launch_kernel( queue, &add_at, blocks_for( m ), BLOCK, 0, m, ( const SI * ) rs_mem, ( const double * ) rs_dw, d );
+    };
+
+    // ---- THE RE-SPLITTING ( `Newton.h::resplit` ): local Newton steps on the members of the clusters, one diagram each
+    auto resplit = [&]() {
+        const double *tg = nue ? nue : nu;
+        Rows R;
+        for ( int round = 0; round < 4 && ! stop_all; ++round ) {
+            reduce( queue, n, FullResFn{ cur->a, tg }, red_diag.partials, red_diag.out );
+            DiagRed fr;
+            read_back( queue, &fr, ( const DiagRed * ) red_diag.out, 1 );
+            if ( agg.converged( fr.max_abs, fr.max_rel ) )
+                return;
+            // the laplacian of the accepted diagram, and the members' rows
+            if ( coo_of != cur ) {
+                diagram( w, *cur );
+                if ( stop_all ) return;
+            }
+            card.pb.fi = cur->fi; card.pb.fj = cur->fj; card.pb.fc = cur->fc;
+            card.counters = cur->counters; card.pb.counters = cur->counters;
+            assemble_laplacian_in( queue, card, lws, lrow, lcol, lval, ldia );
+            if ( ! read_rows( R ) )
+                return;
+            const SI m = SI( R.all.size() );
+            launch_kernel( queue, &gather_at, blocks_for( m ), BLOCK, 0, m, ( const SI * ) rs_mem, ( const double * ) cur->a, rs_a );
+            launch_kernel( queue, &gather_at, blocks_for( m ), BLOCK, 0, m, ( const SI * ) rs_mem, tg, rs_nu );
+            std::vector<double> am( m ), nm( m ), dw( m );
+            read_back( queue, am.data(), ( const double * ) rs_a, m );
+            read_back( queue, nm.data(), ( const double * ) rs_nu, m );
+            double before = 0;
+            for ( SI q = 0; q < m; ++q ) { dw[ q ] = nm[ q ] - am[ q ]; before = std::max( before, std::fabs( dw[ q ] ) ); }
+            block_solves( R, dw );
+            double d0 = 0;                               // the gauge: a shift of everyone if seed 0 moved
+            for ( SI q = 0; q < m; ++q ) if ( R.all[ q ] == r0 ) d0 = dw[ q ];
+            cuda_check( cudaMemcpyAsync( rs_dw, dw.data(), sizeof( double ) * m, cudaMemcpyHostToDevice, queue.stream ), "copy of the step" );
+            launch_kernel( queue, &shifted_copy, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, d0, w2 );
+            launch_kernel( queue, &add_at, blocks_for( m ), BLOCK, 0, m, ( const SI * ) rs_mem, ( const double * ) rs_dw, w2 );
+            diagram( w2, *tri );
+            ++nb_polish;
+            if ( stop_all ) return;
+            launch_kernel( queue, &gather_at, blocks_for( m ), BLOCK, 0, m, ( const SI * ) rs_mem, ( const double * ) tri->a, rs_a );
+            read_back( queue, am.data(), ( const double * ) rs_a, m );
+            double after = 0;
+            for ( SI q = 0; q < m; ++q ) after = std::max( after, std::fabs( am[ q ] - nm[ q ] ) );
+            if ( trace )
+                std::printf( "      re-splitting: members' residual %.3e -> %.3e, aggregated %.3e\n", before, after, tri->rep.d.max_abs );
+            if ( ! ( after < before ) || ! ( tri->rep.d.min_a > 0 ) || ! agg.converged( tri->rep.d.max_abs, tri->rep.d.max_rel ) )
+                return;
+            std::swap( w, w2 );
+            std::swap( cur, tri );
+        }
+    };
+
     // ---- THE STAGES, each a Newton ( `Newton.h::solves` )
     int status = sp::S_RUNNING, nb_iter = 0, nb_backtracks = 0, it_switch = -1, nb_limit_rounds = 0;
     SI nb_cell_lim = 0;
@@ -933,6 +1428,8 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
             launch_kernel( queue, &scale_values, blocks_for( n ), BLOCK, 0, n, nu, domain_mass / snu.s );
             nu_min *= domain_mass / snu.s;
         }
+        duplicate_targets_now();
+        tau_min = agg.tau( nu_min );
         if ( trace && scales.size() > 1 )
             std::printf( "  stage %d / %d : s = %.4e, domain mass %.6f, smallest mass %.3e\n", int( stage + 1 ), int( scales.size() ), s_current,
                          domain_mass, cur->rep.d.min_a );
@@ -955,11 +1452,13 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
                 if ( stage == 0 ) { residual0 = worst; eps0 = eps; }
             }
             report( *cur );                              // its merit in the residual in use, its cells under the floor
-            const double nr = merit_of( cur->rep, res_cur );
+            double nr = merit_of( cur->rep, res_cur );
             residual_max = worst;
             if ( worst <= tol_abs || ( tol_rel > 0 && worst_rel <= tol_rel ) ) {
-                if ( trace ) std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  CONVERGED\n", it, nr, worst );
+                if ( trace ) std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  CONVERGED%s\n", it, nr, worst, agg.any() ? " ( aggregated )" : "" );
                 st_status = sp::S_CONVERGED;
+                if ( agg.any() )
+                    resplit();
                 break;
             }
             ++nb_iter;
@@ -971,15 +1470,43 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
                 if ( stop_all ) { st_status = failed ? sp::S_FAILURE : sp::S_CAPACITY; break; }
             }
             tm_asm.start( queue );
+            card.pb.fi = cur->fi; card.pb.fj = cur->fj; card.pb.fc = cur->fc;
+            card.counters = cur->counters; card.pb.counters = cur->counters;
+            // the duplicates' rows linked to their representatives ( `Aggregation::link_duplicates`; the coefficient: the
+            // scale of a facet, `rho`, or the mean density of the box )
+            const bool links = agg_nb_dups > 0 && cur->rep.nb_facets + ( unsigned long long ) agg_nb_dups <= ( unsigned long long ) fcap;
+            if ( links ) {
+                const double c_link = c_scale;
+                launch_kernel( queue, &append_links<TR>, blocks_for( agg_nb_dups ), BLOCK, 0, agg_nb_dups, ( const SI * ) dup_dev, ( const SI * ) drep_dev,
+                               c_link, cur->rep.nb_facets, cur->fi, cur->fj, cur->fc );
+                launch_kernel( queue, &bump_facets, 1, 1, 0, cur->counters, ( long long ) agg_nb_dups );
+            }
+            assemble_laplacian_in( queue, card, lws, lrow, lcol, lval, ldia );
+            if ( links )
+                launch_kernel( queue, &bump_facets, 1, 1, 0, cur->counters, - ( long long ) agg_nb_dups );
+            // the pairs whose plane the doubles can no longer place are merged ( `Aggregation.h` ): the merit reads their
+            // clusters from here on ( before `b`, whose room the shares take )
+            if ( detect() ) {
+                report( *cur );
+                nr = merit_of( cur->rep, res_cur );
+                if ( trace ) std::printf( "      aggregation: %d clusters, %d seeds ( |r|_2 %.3e )\n", int( agg.nb_clusters() ), int( agg.nb_aggregated() ), nr );
+            }
+            // with clusters: their true rows read back, then their internal coefficients capped ( see `correct_direction` )
+            rows_ok = agg.any() && read_rows( rows_dir );
+            if ( agg.any() )
+                launch_kernel( queue, &cap_internal<TR>, blocks_for( agg.nb_clusters() ), BLOCK, 0, agg.nb_clusters(), ( const SI * ) cl_beg_dev,
+                               ( const SI * ) cl_mem_dev, ( const SI * ) lrow, ( const TR * ) lcol, lval, ldia,
+                               1e6 * c_scale );
+            const double *tg = nue ? nue : nu;           // the targets ( an exact duplicate's carried by its representative )
             if ( res_cur != RES_LIN )
-                reduce( queue, n, RhsSums{ cur->a, nu, power, res_cur }, red2.partials, red2.out );
-            launch_kernel( queue, &rhs_kernel, blocks_for( n ), BLOCK, 0, n, ( const double * ) cur->a, ( const double * ) nu, power, res_cur,
+                reduce( queue, n, RhsSums{ cur->a, tg, power, res_cur }, red2.partials, red2.out );
+            launch_kernel( queue, &rhs_kernel, blocks_for( n ), BLOCK, 0, n, ( const double * ) cur->a, tg, power, res_cur,
                            ( const Sum2 * ) red2.out, b );
             reduce( queue, n, SumOf{ b }, red1.partials, red1.out );
             launch_kernel( queue, &subtract_scalar, blocks_for( n ), BLOCK, 0, b, reinterpret_cast<const double *>( red1.out ), 1.0 / double( n ), n );
-            card.pb.fi = cur->fi; card.pb.fj = cur->fj; card.pb.fc = cur->fc;
-            card.counters = cur->counters; card.pb.counters = cur->counters;
-            assemble_laplacian_in( queue, card, lws, lrow, lcol, lval, ldia );
+            if ( rows_ok )                               // ( `b` at the members, for the correction after the solve )
+                launch_kernel( queue, &gather_at, blocks_for( SI( rows_dir.all.size() ) ), BLOCK, 0, SI( rows_dir.all.size() ), ( const SI * ) rs_mem,
+                               ( const double * ) b, rs_nu );
             tm_asm.stop( queue );
 
             // the direction
@@ -993,6 +1520,11 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
             if ( ! solved ) {
                 st_status = sp::S_LINEAR_FAILURE;
                 break;
+            }
+            if ( agg.any() ) {
+                launch_kernel( queue, &tie_direction, blocks_for( agg.nb_clusters() ), BLOCK, 0, agg.nb_clusters(), ( const SI * ) cl_beg_dev,
+                               ( const SI * ) cl_mem_dev, tg, d );
+                correct_direction();
             }
             launch_kernel( queue, &pick_value, 1, 1, 0, ( const double * ) d, r0, gauge );
             launch_kernel( queue, &subtract_scalar, blocks_for( n ), BLOCK, 0, d, ( const double * ) gauge, 1.0, n );
@@ -1032,10 +1564,10 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
                     const double th1 = wall_now();
                     tm_lim.start( queue );
                     if constexpr ( CONST )
-                        reduce( queue, n, AlphaBackward<TF,TR>{ pos, box_min, box_max, w, d, tri->a, tri->edges, tri->nb_edges, n, rho, eps, t },
+                        reduce( queue, n, AlphaBackward<TF,TR>{ pos, box_min, box_max, w, d, tri->a, tri->edges, tri->nb_edges, n, rho, eps, t, nue },
                                 red_mc.partials, red_mc.out );
                     else
-                        reduce( queue, n, AlphaBackwardDens<TF,TR,D>{ pos, box_min, box_max, w, d, tri->a, tri->edges, tri->nb_edges, n, card.pb.dens, eps, t },
+                        reduce( queue, n, AlphaBackwardDens<TF,TR,D>{ pos, box_min, box_max, w, d, tri->a, tri->edges, tri->nb_edges, n, card.pb.dens, eps, t, nue },
                                 red_mc.partials, red_mc.out );
                     MinCount mc;
                     read_back( queue, &mc, ( const MinCount * ) red_mc.out, 1 );
@@ -1091,6 +1623,18 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
                     if ( trace ) std::printf( "      switch: kernel float -> double ( the float step stagnates )\n" );
                     diagram( w, *cur );
                     if ( stop_all ) { st_status = failed ? sp::S_FAILURE : sp::S_CAPACITY; break; }
+                    // the target, rescaled to the domain's mass as the DOUBLE kernel measures it: the float kernel's sum is off
+                    // by ~1e-11, which every cell then carried as a residual the double steps could not remove ( a uniform
+                    // 3e-11 relative floor under a tight tolerance )
+                    const double dm = cur->rep.d.sum_a;
+                    if ( dm > 0 && domain_mass > 0 && dm != domain_mass ) {
+                        launch_kernel( queue, &scale_values, blocks_for( n ), BLOCK, 0, n, nu, dm / domain_mass );
+                        nu_min *= dm / domain_mass;
+                        domain_mass = dm;
+                        duplicate_targets_now();
+                        tau_min = agg.tau( nu_min );
+                        report( *cur );
+                    }
                     continue;
                 }
             }
@@ -1116,6 +1660,40 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
         nb_steps_before = nb_steps > 0 ? int( rows[ SI( nb_steps - 1 ) * sp::NB_HIST + sp::H_STEP ] ) + 1 : 0;
         if ( st_status == sp::S_LINEAR_FAILURE || stop_all )
             break;
+    }
+
+    // ---- THE FULL PROBLEM'S RESIDUAL, and the status when only the aggregated problem passed the test
+    double full = residual_max;
+    if ( agg.any() && ! stop_all ) {
+        reduce( queue, n, FullResFn{ cur->a, nue ? nue : nu }, red_diag.partials, red_diag.out );
+        DiagRed fr;
+        read_back( queue, &fr, ( const DiagRed * ) red_diag.out, 1 );
+        full = fr.max_abs;
+        residual_max = cur->rep.d.max_abs;
+        if ( status == sp::S_CONVERGED && ! agg.converged( fr.max_abs, fr.max_rel ) )
+            status = sp::S_CONVERGED_AGGREGATED;
+    }
+    // ---- the clusters ( user order ): every seed its own index, the members of a cluster the smallest index of it
+    {
+        using TCl = std::remove_const_t<typename std::decay_t<decltype( clusters_out )>::TF>;
+        launch_kernel( queue, &write_own_index<TI,TCl>, blocks_for( n ), BLOCK, 0, n, ids, strided_out<TCl,1>( clusters_out ) );
+        const SI m = agg.nb_aggregated();
+        SI *mu = m ? static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) * 2 * m ) ) : nullptr;
+        if ( mu ) {
+            launch_kernel( queue, &users_at<TI>, blocks_for( m ), BLOCK, 0, m, ( const SI * ) cl_mem_dev, ids, mu );
+            std::vector<SI> users( m ), reps( m );
+            read_back( queue, users.data(), ( const SI * ) mu, m );
+            for ( SI c = 0; c < agg.nb_clusters(); ++c ) {
+                SI r = users[ agg.cl_begin[ c ] ];
+                for ( SI k = agg.cl_begin[ c ]; k < agg.cl_begin[ c + 1 ]; ++k ) r = std::min( r, users[ k ] );
+                for ( SI k = agg.cl_begin[ c ]; k < agg.cl_begin[ c + 1 ]; ++k ) reps[ k ] = r;
+            }
+            cuda_check( cudaMemcpyAsync( mu, users.data(), sizeof( SI ) * m, cudaMemcpyHostToDevice, queue.stream ), "copy of the clusters" );
+            cuda_check( cudaMemcpyAsync( mu + m, reps.data(), sizeof( SI ) * m, cudaMemcpyHostToDevice, queue.stream ), "copy of the clusters" );
+            launch_kernel( queue, &write_representatives<TCl>, blocks_for( m ), BLOCK, 0, m, ( const SI * ) mu, ( const SI * ) mu + m,
+                           strided_out<TCl,1>( clusters_out ) );
+            cuda_check( cudaStreamSynchronize( queue.stream ), "sync ( clusters )" );
+        }
     }
 
     // ---- what comes out: the weights and the measures ( user order ), the diagram's weights and majorants
@@ -1191,6 +1769,11 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     st[ sp::MIN_START_MASS ] = min_start_mass;
     st[ sp::IT_SWITCH ] = it_switch;
     st[ sp::IT_DOUBLE ] = it_double;
+    st[ sp::NB_CLUSTERS ] = double( agg.nb_clusters() );
+    st[ sp::NB_AGGREGATED ] = double( agg.nb_aggregated() );
+    st[ sp::NB_DUPLICATES ] = double( agg.dups.size() );
+    st[ sp::RESIDUAL_FULL ] = full;
+    st[ sp::NB_POLISH ] = double( nb_polish );
     ( void ) t_lim_host;
     double *tmp = vec( std::max<SI>( SI( rows.size() ), sp::NB_STATS ) );
     if constexpr ( requires { allocator.taken; } )
