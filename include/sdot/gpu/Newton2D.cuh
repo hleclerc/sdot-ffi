@@ -1058,6 +1058,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
             // ---- THE DAMPING
             bool taken = false;
             const double t_lim0 = t;
+            sp::HopelessDamping hope;                     // ( `sdotplan/Report.h` )
             for ( int trial = 0; trial < max_backtracks && ! stop_all; ++trial ) {
                 if ( ! ( trial == 0 && already ) ) {
                     launch_kernel( queue, &trial_weights, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, ( const double * ) d, t, r0, w2 );
@@ -1067,9 +1068,10 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
                 }
                 const double m2 = tri->rep.d.min_a, n2r = merit_of( tri->rep, res_cur );
                 if ( m2 >= eps && std::isfinite( n2r ) && n2r <= ( 1 - t / 2 ) * nr && n2r < nr ) { taken = true; break; }
+                const bool hopeless = hope.refused( t, n2r, nr, m2 >= eps && std::isfinite( n2r ) );
                 t /= 2;
                 ++nb_backtracks;
-                if ( t < t_min )
+                if ( t < t_min || hopeless )
                     break;
             }
             if ( trace ) {

@@ -65,6 +65,7 @@
 
 #include "Sweep.h"
 #include "Linear.h"
+#include "Report.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -337,6 +338,7 @@ struct Newton {
             // ---- THE DAMPING
             bool taken = false;
             const double t_lim0 = t;
+            HopelessDamping hope;                         // ( `Report.h` )
             w2.resize( n );
             for ( int trial = 0; trial < o.max_backtracks; ++trial ) {
                 if ( ! ( trial == 0 && already ) ) {        // otherwise, already done at `t`
@@ -349,9 +351,10 @@ struct Newton {
                 for ( SI i = 0; i < n; ++i ) m2 = std::min( m2, a2[ i ] );
                 const double n2r = merit( a2 );
                 if ( m2 >= eps && std::isfinite( n2r ) && n2r <= ( 1 - t / 2 ) * nr && n2r < nr ) { taken = true; break; }
+                const bool hopeless = hope.refused( t, n2r, nr, m2 >= eps && std::isfinite( n2r ) );
                 t /= 2;
                 ++st.nb_backtracks;
-                if ( t < o.t_min )
+                if ( t < o.t_min || hopeless )
                     break;
             }
             if ( o.trace ) {

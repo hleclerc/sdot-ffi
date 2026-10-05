@@ -24,5 +24,31 @@ enum Hist : int { H_STEP = 0, H_T, H_RESIDUAL_L2, H_MIN_MASS, H_MAX_RESIDUAL, H_
 /// of the call was too small, loom runs the call again with more ( eagerly ) or raises ( under a trace )
 enum SolveStatus : int { S_RUNNING = 0, S_CONVERGED = 1, S_MAX_ITERATIONS = 2, S_STAGNATION = 3, S_LINEAR_FAILURE = 4, S_CAPACITY = 5, S_FAILURE = 6 };
 
+/// THE DAMPING THAT CAN NO LONGER PASS, the same for both solvers. A trial at `t` is taken when the merit drops by `t / 2`
+/// of itself, i.e. when the secant slope `( nr - n2r ) / t` reaches `nr / 2` -- which, as `t` shrinks, tends to the
+/// derivative along `d` ( `-nr` for an exact Newton direction ). Two refused trials in a row whose secant slopes agree
+/// ( the merit is linear in `t` there ) and whose extrapolation to `t = 0` is under `nr / 4` say that no shorter trial
+/// will pass: the residual left is not in the range of the step. That is the floor of the weights' double ( `lines_equal`:
+/// two seeds 1e-8 apart, one ulp of their weight moves 5e-6 of their mass; the merit then falls by 2.6 % of itself
+/// along `d`, and halving down to `t_min` cost 30 diagrams of a 53-diagram solve ), and we stop there at once, in
+/// STAGNATION as before. A trial below the mass floor or not finite says nothing on the slope and resets it.
+struct HopelessDamping {
+    double t_prev = 0, s_prev = 0;
+    bool   has_prev = false;
+
+    /// after a REFUSED trial at `t` of merit `n2r` ( `ok`: above the floor and finite ): `true` to stop halving
+    bool refused( double t, double n2r, double nr, bool ok ) {
+        if ( ! ok || ! ( nr > 0 ) ) { has_prev = false; return false; }
+        const double s = ( nr - n2r ) / t;
+        const bool hopeless = has_prev && t_prev == 2 * t && s < nr / 4 && s_prev < nr / 4 &&
+                              s - s_prev <= 0.25 * ( s_prev > 0 ? s_prev : - s_prev ) && s_prev - s <= 0.25 * ( s_prev > 0 ? s_prev : - s_prev ) &&
+                              2 * s - s_prev < nr / 4;
+        t_prev = t;
+        s_prev = s;
+        has_prev = true;
+        return hopeless;
+    }
+};
+
 } // namespace sdotplan
 } // namespace sdot
