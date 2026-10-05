@@ -966,6 +966,123 @@ if test( "the_card_density_solves_run_under_jit" ):
         print( f"  { name }: { de } diagrams, { ke } stages, jit == eager" )
 
 
+# THE CARD'S MEMORY ( `CardMemory.py` ): what the solve takes from XLA's pool, its model, and the refusal. XLA's pool waits
+# ~10 s before it refuses an allocation; a solve that does not fit must raise a clear error AT ONCE ( the model, checked
+# before the call ), and at worst after ONE wait ( loom's `Scratch`: a refusal is final for the call ). The pool is made
+# small in a subprocess ( `XLA_PYTHON_CLIENT_MEM_FRACTION`: one process, one pool ).
+
+def _card_scratch_model( n, it ):
+    from sdot.CardMemory import card_solve_bytes
+    from sdot.SdotPlanNd import SdotPlanNd
+    parts = card_solve_bytes( n, **SdotPlanNd._card_memory_kw( n, it ) )
+    return sum( v for k, v in parts.items() if k not in ( "tree", "outputs" ) )
+
+
+if test( "the_card_memory_model_follows_the_solve" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    rng = numpy.random.default_rng( 301 )
+    n = 200_000
+    pos = rng.uniform( 0.001, 0.999, size = ( n, 2 ) )
+    for name, it in ( ( "mixed", Iterative( tol = 1e-10 / n, max_iter = 30 ) ),
+                      ( "fp32", Iterative( tol = 1e-10 / n, max_iter = 30, precision = "fp32" ) ),
+                      ( "fp64, double levels", Iterative( tol = 1e-10 / n, max_iter = 30, precision = "fp64", tuning = Tuning( mg_precision = "double" ) ) ),
+                      ( "fp64, cg", Iterative( tol = 1e-10 / n, max_iter = 30, precision = "fp64", tuning = Tuning( linear_solver = "cg", linear_tol = 1e-8 ) ) ) ):
+        plan = OtProblem( SumOfDiracs( pos ), _box_target() ).solve( it )
+        assert plan.converged, ( name, plan.stats )
+        took, model = plan.stats[ "scratch_bytes" ], _card_scratch_model( n, it )
+        print( f"  { name }: took { took / n :.1f} bytes per seed, model { model / n :.1f}" )
+        assert abs( model - took ) < 0.08 * took, ( name, took, model )
+
+
+if test( "the_card_finish_store_by_chunks_gives_the_same_plan" ):
+    # `SDOT_CARD_DEFER_CAP`: the float kernel's finish store smaller than the cloud, so the first pass runs by chunks and the
+    # second leaves its cells by position ( `Card::run` ): the same cells, so the same plan to the bit
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    import os, pickle, subprocess, sys, tempfile
+    rng = numpy.random.default_rng( 302 )
+    n = 6000
+    pos = rng.uniform( 0.001, 0.999, size = ( n, 2 ) )
+    nu = rng.uniform( 0.5, 1.5, n )
+    script = """
+import pickle, sys, numpy
+from sdot import Image, Iterative, OtProblem, SumOfDiracs
+pos, nu = pickle.load( open( sys.argv[ 1 ], "rb" ) )
+box = Image( values = numpy.ones( ( 1, 1 ) ), origin = [ 0.0, 0.0 ], frame = numpy.eye( 2 ) )
+out = {}
+for precision in ( "fp32", "auto" ):
+    plan = OtProblem( SumOfDiracs( pos, nu ), box ).solve( Iterative( tol = 1e-10 / len( nu ), max_iter = 60, precision = precision ) )
+    out[ precision ] = ( numpy.asarray( plan.weights ).reshape( -1 ), plan.stats[ "nb_diag" ], plan.stats[ "scratch_bytes" ] )
+pickle.dump( out, open( sys.argv[ 2 ], "wb" ) )
+"""
+    runs = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        fi = os.path.join( tmp, "in.pkl" )
+        pickle.dump( ( pos, nu ), open( fi, "wb" ) )
+        for cap in ( "", "1000" ):
+            fo = os.path.join( tmp, f"out{ cap }.pkl" )
+            r = subprocess.run( [ sys.executable, "-c", script, fi, fo ], env = dict( os.environ, SDOT_CARD_DEFER_CAP = cap ),
+                                capture_output = True, text = True )
+            assert r.returncode == 0, r.stdout[ -3000: ] + r.stderr[ -3000: ]
+            runs[ cap ] = pickle.load( open( fo, "rb" ) )
+    for precision in ( "fp32", "auto" ):
+        ( w0, d0, b0 ), ( w1, d1, b1 ) = runs[ "" ][ precision ], runs[ "1000" ][ precision ]
+        assert numpy.array_equal( w0, w1 ) and d0 == d1, ( precision, numpy.abs( w0 - w1 ).max(), d0, d1 )
+        assert b1 < b0, ( precision, b0, b1 )       # ( 148 bytes per cell of the store: 5000 cells less )
+        print( f"  { precision }: the same plan, { ( b0 - b1 ) / 1e3 :.0f} kB less" )
+
+
+_OOM_SOLVE = """
+import os, sys, time, numpy
+from sdot import Image, Iterative, OtProblem, SumOfDiracs
+box = Image( values = numpy.ones( ( 1, 1 ) ), origin = [ 0.0, 0.0 ], frame = numpy.eye( 2 ) )
+def solve( n, jit = False ):
+    pos = numpy.random.default_rng( 0 ).uniform( 0.001, 0.999, size = ( n, 2 ) )
+    it = Iterative( tol = 1e-6 / n, max_iter = 30 )
+    if jit:
+        import jax
+        return jax.jit( lambda m: OtProblem( SumOfDiracs( pos, m ), box ).solve( it ).weights.raw )( numpy.ones( n ) ).block_until_ready()
+    return OtProblem( SumOfDiracs( pos ), box ).solve( it ).weights
+solve( 2000 )                                    # ( the kernels compiled, the pool opened )
+for jit in sys.argv[ 2: ]:
+    t = time.perf_counter()
+    try:
+        solve( int( sys.argv[ 1 ] ), jit == "jit" )
+        print( "RESULT none", time.perf_counter() - t )
+    except Exception as e:
+        print( "RESULT", type( e ).__name__, time.perf_counter() - t, str( e ).replace( chr( 10 ), " " ) )
+"""
+
+
+def _oom_runs( n, modes, **env ):
+    import os, subprocess, sys
+    r = subprocess.run( [ sys.executable, "-c", _OOM_SOLVE, str( n ), *modes ], capture_output = True, text = True,
+                        env = dict( os.environ, XLA_PYTHON_CLIENT_MEM_FRACTION = "0.05", **env ), timeout = 900 )
+    lines = [ ( l.split( " ", 3 ) + [ "" ] )[ 1:4 ] for l in r.stdout.splitlines() if l.startswith( "RESULT " ) ]
+    assert len( lines ) == len( modes ), r.stdout[ -3000: ] + r.stderr[ -3000: ]
+    return [ ( kind, float( t ), msg ) for kind, t, msg in lines ]
+
+
+if test( "the_card_refuses_a_solve_that_does_not_fit_at_once" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    n = 1_000_000                                # ~1 GB for the solve, the pool ~0.5 GB
+    # the model, before anything is launched: eager and while tracing
+    for mode, ( kind, t, msg ) in zip( ( "eager", "jit" ), _oom_runs( n, [ "eager", "jit" ] ) ):
+        print( f"  { mode }: { kind } after { t :.2f} s: { msg[ :200 ] }..." )
+        assert kind == "MemoryError" and t < 5, ( mode, kind, t, msg )
+        assert f"solve of { n } seeds needs about" in msg and "XLA_PYTHON_CLIENT_MEM_FRACTION" in msg and "LOOM_DEVICE=cpu" in msg, msg
+    # without the check, the call itself: ONE wait of XLA's pool ( ~10 s ), then the refusal, with what was refused and why
+    ( kind, t, msg ), = _oom_runs( n, [ "eager" ], SDOT_CARD_MEMORY_CHECK = "0" )
+    print( f"  without the check: { kind } after { t :.2f} s: { msg[ :300 ] }..." )
+    assert kind != "none" and t < 40, ( kind, t, msg )
+    assert "RESOURCE_EXHAUSTED" in msg and "the scratch pool refused" in msg and f"Newton solve of { n } seeds" in msg, msg
+
+
 # -- what we LOOK AT -------------------------------------------------------------------------
 #
 #   ./run experiment test_SdotPlanNd

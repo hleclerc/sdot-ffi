@@ -325,6 +325,7 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
     put( MIN_START_MASS, min_start_mass );
     put( IT_SWITCH, double( total.it_switch ) );
     put( IT_DOUBLE, 0 );                                 // ( one kernel: the card's mixed precision only )
+    put( SCRATCH_BYTES, 0 );                             // ( the card's pool only )
 }
 
 } // namespace sdotplan

@@ -1148,8 +1148,13 @@ struct CardLinear {
 
     ~CardLinear() { g_iter.release(); }
 
-    /// `n` unknowns, `nnz_cap` the capacity of the fine CSR
-    bool prepare( auto &allocator, SI n_, SI nnz_cap_, const LinOptions &o_ ) {
+    /// `n` unknowns, `nnz_cap` the capacity of the fine CSR; `scan_`: the counters and scan tiles of `n` rows to work in
+    /// ( the laplacian's assembly's, `LapWork`: used one after the other ), or `nullptr`: taken. `work`, `work_bytes`: memory
+    /// that is the solver's DURING A SOLVE only ( Newton's COO of the facets, read by the assembly before the solve and written
+    /// again by the next diagram ): the vectors that live within a solve ( the flexible CG's, the fine level's input, output and
+    /// diagonal in `TV` ) are carved from it as far as it goes, the others are taken.
+    bool prepare( auto &allocator, SI n_, SI nnz_cap_, const LinOptions &o_, const LapWork<SI> *scan_ = nullptr,
+                  unsigned char *work = nullptr, SI work_bytes = 0 ) {
         o = o_;
         o.stop = std::min( std::max( o.stop, 16 ), 2048 );
         o.recycle = std::min( std::max( o.recycle, 0 ), 4 );
@@ -1162,15 +1167,29 @@ struct CardLinear {
         nnz_cap = nnz_cap_;
         auto vec = [&]( SI m ) { return static_cast<double *>( take( allocator, SI( sizeof( double ) ) * std::max<SI>( m, 1 ) ) ); };
         auto tvec = [&]( SI m ) { return static_cast<TV *>( take( allocator, SI( sizeof( TV ) ) * std::max<SI>( m, 1 ) ) ); };
-        r = vec( n ); z = vec( n ); p = vec( n ); q = vec( n );
+        auto carve = [&]( SI bytes ) -> void * {        // from `work` while it lasts, 16-byte aligned
+            bytes = ( std::max<SI>( bytes, 1 ) + 15 ) / 16 * 16;
+            if ( work && bytes <= work_bytes ) {
+                void *res = work;
+                work += bytes;
+                work_bytes -= bytes;
+                return res;
+            }
+            return take( allocator, bytes );
+        };
+        auto wvec = [&]( SI m ) { return static_cast<double *>( carve( SI( sizeof( double ) ) * m ) ); };
+        auto wtvec = [&]( SI m ) { return static_cast<TV *>( carve( SI( sizeof( TV ) ) * m ) ); };
+        r = wvec( n ); z = wvec( n ); p = wvec( n ); q = wvec( n );
         sc = static_cast<CgScalars *>( take( allocator, SI( sizeof( CgScalars ) ) ) );
         fail = static_cast<int *>( take( allocator, SI( sizeof( int ) ) ) );
         bool ok = r && z && p && q && sc && fail && w1.take_from( allocator ) && w2.take_from( allocator );
         if ( o.method == 1 ) {
             bottom = vec( SI( BOTTOM_DENSE ) * BOTTOM_DENSE );
-            ok = ok && bottom && scan.take_from( allocator, n );
+            if ( scan_ )
+                scan = *scan_;
+            ok = ok && bottom && ( scan_ || scan.take_from( allocator, n ) );
             if constexpr ( ! SAME ) {
-                val0 = tvec( nnz_cap ); dia0 = tvec( n ); rf = tvec( n ); zf = tvec( n );
+                dia0 = wtvec( n ); rf = wtvec( n ); zf = wtvec( n ); val0 = tvec( nnz_cap );
                 ok = ok && val0 && dia0 && rf && zf;
             }
             if ( o.recycle > 0 ) {

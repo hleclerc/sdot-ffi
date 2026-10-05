@@ -84,7 +84,7 @@ from .PowerDiagram import PowerDiagram
 # what `stats` carries, in the order of `sdotplan/Solve.h::Stat`
 _STATS = [ "status", "residual", "residual0", "nb_iter", "nb_diag", "nb_backtracks", "t_majorant", "t_diag", "t_asm", "t_lin", "t_lim", "eps",
            "domain_mass", "nb_overflowed", "nb_cell_lim", "nb_limit_rounds", "lin_nb_hierarchies", "lin_nb_iter", "lin_worst", "start", "t_total",
-           "nb_continuation_steps", "min_start_mass", "it_switch", "it_double" ]
+           "nb_continuation_steps", "min_start_mass", "it_switch", "it_double", "scratch_bytes" ]
 # one row of `history`, in the order of `sdotplan/Solve.h::Hist`
 _HISTORY = [ "step", "t", "residual_l2", "min_measure", "max_abs_residual", "nb_diag", "nb_evals", "s" ]
 _STATUS = { 0: "running", 1: "converged", 2: "max iterations", 3: "stagnation", 4: "linear solver failure", 5: "card capacity",
@@ -296,6 +296,11 @@ class SdotPlanNd:
         # plain storage. The zeros of a cold start are made on the host ( a constant ); given traced weights, the TREE is
         # built on the positions alone ( it only depends on them ) and the weights enter its majorants ( a kernel ). On the
         # card, see below.
+        # ON THE CARD, what the solve will take from the card, checked before anything is launched ( `CardMemory.py` )
+        self._card_mg_recycle = None
+        if on_card and d == 2:
+            self._card_mg_recycle = self._check_card_memory( int( src_dist.nb_diracs.value ), settings )
+
         accelerator = tun.accelerator
         pos_raw = getattr( src_dist.positions, "raw", src_dist.positions )
         import numpy as np
@@ -427,6 +432,52 @@ class SdotPlanNd:
         self._read_stats( stats, settings )
         self._read_history( history, settings, pd )
 
+    @staticmethod
+    def _card_memory_kw( n, settings ):
+        """what `CardMemory.card_solve_bytes` needs to know of the card's solve of `n` seeds with these `settings` ( the same
+        choices as `_build_card`: the kernels, the linear solver and its levels, the fourth pass's slots )"""
+        from .AaBsp import AaBsp
+        from .PowerDiagram_Bsp import PowerDiagram_Bsp, card_overflow_warps_for, card_variant_for
+        tun = settings.tuning
+        nodes = AaBsp.max_nb_nodes_for( n )
+        widest = card_variant_for( 32 if settings.precision == "fp32" else 64, n, nodes )
+        warps = card_overflow_warps_for( widest, n, PowerDiagram_Bsp.card_max_vertices, PowerDiagram_Bsp.card_overflow_warps,
+                                         PowerDiagram_Bsp.card_overflow_bytes )
+        tk, tr = widest.split( "<" )[ 1 ].split( "," )[ :2 ]
+        per_vertex = 5 * ( 4 if tk.strip() == "float" else 8 ) + 2 * ( 4 if tr.strip() == "int" else 8 )
+        cap = max( 4, min( int( PowerDiagram_Bsp.card_max_vertices ), n + 4 ) )
+        warps = ( warps + 3 ) // 4 * 4                    # ( whole blocks of four warps, `Overflow::sized` )
+        lin_name = tun.linear_solver
+        linear = "host" if getattr( tun, "linear_host", False ) or lin_name in ( "cholesky", "amg" ) else "cg" if lin_name == "cg" else "mg"
+        return dict( nb_nodes = nodes, precision = settings.precision, linear = linear,
+                     mg_float = ( getattr( tun, "mg_precision", None ) or _CARD_MG_PRECISION ) == "float",
+                     recycle = 2 if tun.mg_recycle is None else int( tun.mg_recycle ),
+                     shift = ( int( tun.mg_pack ).bit_length() - 1 ) if tun.mg_pack else 2,
+                     smoothed = 1 if getattr( tun, "mg_smoothed", None ) is None else int( tun.mg_smoothed ),
+                     stop = min( max( int( tun.mg_stop or 64 ), 16 ), 2048 ),
+                     overflow_bytes = warps * cap * per_vertex, max_iter = int( settings.max_iter ),
+                     keep_weights = bool( settings.keep_weights ) )
+
+    @staticmethod
+    def _check_card_memory( n, settings ):
+        """THE CARD'S MEMORY, before the tree and the solve ( `CardMemory.check_card_memory` ): a `MemoryError` that says what
+        to do when the solve of `n` seeds does not fit in what XLA's pool has left. A VARIANT is chosen here when it helps: the
+        multigrid's recycled solutions ( 16 bytes per seed each ) are given up, one then the other, before refusing -- unless
+        `mg_recycle` was set. Returns the recycled solutions to ask the card for ( `None`: the default )."""
+        from .CardMemory import check_card_memory
+        kw = SdotPlanNd._card_memory_kw( n, settings )
+        if kw[ "linear" ] != "mg" or settings.tuning.mg_recycle is not None:
+            check_card_memory( n, **kw )
+            return None
+        first = None
+        for recycle in ( 2, 1, 0 ):
+            try:
+                check_card_memory( n, **{ **kw, "recycle": recycle } )
+                return None if recycle == 2 else recycle
+            except MemoryError as e:
+                first = first or e
+        raise first
+
     def _build_card( self, pd, settings, step, verbose ):
         """THE CARD'S SOLVE ( `include/sdot/gpu/Newton2D.cuh` ): the same Newton, the same options and outputs as the CPU's, in
         ONE ffi call whose handler drives the loop on the call's stream -- so it runs under `jax.jit` too. Taken in 2D, with
@@ -492,7 +543,8 @@ class SdotPlanNd:
         put( "residual", _RESIDUAL[ tun.residual ] ); put( "power", tun.residual_power ); put( "switch", tun.residual_switch )
         put( "lin", lin_kind ); put( "host_method", _LIN[ lin_name ] ); put( "lin_tol", tun.linear_tol or 0.0 )
         put( "amg_variant", _AMG_VARIANT[ tun.amg_variant ] ); put( "mg_shift", pack.bit_length() - 1 if pack else 0 )
-        put( "mg_recycle", -1 if tun.mg_recycle is None else tun.mg_recycle ); put( "mg_rebuild", tun.mg_rebuild or 0 )
+        recycle = tun.mg_recycle if tun.mg_recycle is not None else getattr( self, "_card_mg_recycle", None )
+        put( "mg_recycle", -1 if recycle is None else recycle ); put( "mg_rebuild", tun.mg_rebuild or 0 )
         put( "mg_stop", tun.mg_stop or 0 ); put( "mg_nu", tun.mg_nu or 0 )
         put( "mg_kcycle", -1 if getattr( tun, "mg_kcycle", None ) is None else tun.mg_kcycle )
         put( "lin_maxit", 0 ); put( "trace", int( bool( verbose ) ) )
@@ -608,7 +660,7 @@ class SdotPlanNd:
         self.stats[ "it_double" ] = int( self.stats[ "it_double" ] )
         self.stats[ "start" ] = _START.get( int( self.stats[ "start" ] ), "?" )
         for name in ( "nb_iter", "nb_diag", "nb_backtracks", "nb_overflowed", "nb_cell_lim", "nb_limit_rounds",
-                      "lin_nb_hierarchies", "lin_nb_iter", "nb_continuation_steps" ):
+                      "lin_nb_hierarchies", "lin_nb_iter", "nb_continuation_steps", "scratch_bytes" ):
             self.stats[ name ] = int( self.stats[ name ] )
         # aggregation: REQUESTED here, not yet done by the C++ ( step 7 of
         # `notes/2026-10-02-sdotplan.md` ) -- and that is reported rather than kept quiet, because a

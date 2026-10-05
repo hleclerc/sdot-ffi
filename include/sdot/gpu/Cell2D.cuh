@@ -68,6 +68,7 @@
 #include "Density2D.cuh"
 #include <loom/support/Ct.h>
 #include <cuda_runtime.h>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1141,10 +1142,10 @@ __device__ __forceinline__ void start_of( const Pb &pb, typename Pb::TR k, Frame
     b[ 3 ] = TK( double( pb.box_max( 1 ) ) - py );
 }
 
-/// `deferred`: the cell is left in it for `finish_pass` instead of being finished here ( `nullptr`: finished here ).
-/// `false`: the cell overflowed `R` vertices, nothing was written
+/// `deferred`: the cell is left in it, at `slot`, for `finish_pass` instead of being finished here ( `nullptr`: finished
+/// here ). `false`: the cell overflowed `R` vertices, nothing was written
 template<int R,class Pb>
-__device__ __forceinline__ bool cell_in_registers( const Pb &pb, typename Pb::TR k, const Deferred<typename Pb::TR> *deferred = nullptr ) {
+__device__ __forceinline__ bool cell_in_registers( const Pb &pb, typename Pb::TR k, const Deferred<typename Pb::TR> *deferred, SI slot ) {
     using TK = typename Pb::TK;
     using TR = typename Pb::TR;
     Frame<TK> f;
@@ -1173,11 +1174,11 @@ __device__ __forceinline__ bool cell_in_registers( const Pb &pb, typename Pb::TR
         if constexpr ( std::is_same_v<TK,float> ) {
             if ( cell.nb > RD )                          // more than the finish holds: a later pass
                 cell.nb = -1;
-            deferred->nb[ k ] = cell.nb;
+            deferred->nb[ slot ] = cell.nb;
             cell.for_each_vertex( [&]( int i, float x, float y, TR c ) {
-                deferred->x[ SI( i ) * deferred->n + k ] = x;
-                deferred->y[ SI( i ) * deferred->n + k ] = y;
-                deferred->c[ SI( i ) * deferred->n + k ] = c;
+                deferred->x[ SI( i ) * deferred->n + slot ] = x;
+                deferred->y[ SI( i ) * deferred->n + slot ] = y;
+                deferred->c[ SI( i ) * deferred->n + slot ] = c;
             } );
         }
     }
@@ -1197,8 +1198,31 @@ template<class Pb>
 __global__ void __launch_bounds__( BLOCK, MINB1 ) first_pass( Pb pb, typename Pb::TR *ovf_list, Deferred<typename Pb::TR> deferred ) {
     using TR = typename Pb::TR;
     const SI k = SI( blockIdx.x ) * blockDim.x + threadIdx.x;
-    if ( k < SI( pb.n ) && ! cell_in_registers<R1>( pb, TR( k ), deferring<Pb>() ? &deferred : nullptr ) )
+    if ( k < SI( pb.n ) && ! cell_in_registers<R1>( pb, TR( k ), deferring<Pb>() ? &deferred : nullptr, k ) )
         ovf_list[ atomicAdd( &pb.counters->ovf[ 0 ], 1ull ) ] = TR( k );
+}
+
+/// THE FIRST PASS BY CHUNKS, when the finish store holds fewer cells than the diagram ( `DEFER_CAP` ): the ranks
+/// `k0 + s`, `s < cnt <= deferred.n`, the cell of `k0 + s` left at slot `s` ( float kernel )
+template<class Pb>
+__global__ void __launch_bounds__( BLOCK, MINB1 ) first_pass_chunk( Pb pb, typename Pb::TR *ovf_list, Deferred<typename Pb::TR> deferred, SI k0, SI cnt ) {
+    using TR = typename Pb::TR;
+    const SI s = SI( blockIdx.x ) * blockDim.x + threadIdx.x;
+    if ( s < cnt && ! cell_in_registers<R1>( pb, TR( k0 + s ), &deferred, s ) )
+        ovf_list[ atomicAdd( &pb.counters->ovf[ 0 ], 1ull ) ] = TR( k0 + s );
+}
+
+/// the finish of a chunk of `first_pass_chunk`
+template<class Pb>
+__global__ void __launch_bounds__( BLOCK ) finish_chunk( Pb pb, Deferred<typename Pb::TR> deferred, SI k0, SI cnt ) {
+    using TR = typename Pb::TR;
+    const SI s = SI( blockIdx.x ) * blockDim.x + threadIdx.x;
+    if ( s >= cnt )
+        return;
+    const int nb = deferred.nb[ s ];
+    if ( nb < 0 )                                        // a later pass has it
+        return;
+    finish_cell( pb, TR( k0 + s ), DeferredCell<TR>{ deferred, s, nb } );
 }
 
 /// THE FINISH of the cells the first two passes left in `deferred` ( float kernel )
@@ -1222,8 +1246,31 @@ template<class Pb>
 __global__ void __launch_bounds__( BLOCK ) second_pass( Pb pb, const typename Pb::TR *list, typename Pb::TR *ovf_list, Deferred<typename Pb::TR> deferred ) {
     const unsigned long long m = pb.counters->ovf[ 0 ];
     for ( unsigned long long i = SI( blockIdx.x ) * blockDim.x + threadIdx.x; i < m; i += SI( gridDim.x ) * blockDim.x )
-        if ( ! cell_in_registers<R2>( pb, list[ i ], deferring<Pb>() ? &deferred : nullptr ) )
+        if ( ! cell_in_registers<R2>( pb, list[ i ], deferring<Pb>() ? &deferred : nullptr, SI( list[ i ] ) ) )
             ovf_list[ atomicAdd( &pb.counters->ovf[ 1 ], 1ull ) ] = list[ i ];
+}
+
+/// THE SECOND PASS BY POSITION, when the finish store holds fewer cells than the diagram: the cell at `i` of the list
+/// left at slot `i`; past the store's capacity, a cell goes to the third pass as it is ( float kernel )
+template<class Pb>
+__global__ void __launch_bounds__( BLOCK ) second_pass_slots( Pb pb, const typename Pb::TR *list, typename Pb::TR *ovf_list, Deferred<typename Pb::TR> deferred ) {
+    const unsigned long long m = pb.counters->ovf[ 0 ];
+    for ( unsigned long long i = SI( blockIdx.x ) * blockDim.x + threadIdx.x; i < m; i += SI( gridDim.x ) * blockDim.x )
+        if ( SI( i ) >= deferred.n || ! cell_in_registers<R2>( pb, list[ i ], &deferred, SI( i ) ) )
+            ovf_list[ atomicAdd( &pb.counters->ovf[ 1 ], 1ull ) ] = list[ i ];
+}
+
+/// the finish of `second_pass_slots`
+template<class Pb>
+__global__ void __launch_bounds__( BLOCK ) finish_slots( Pb pb, const typename Pb::TR *list, Deferred<typename Pb::TR> deferred ) {
+    using TR = typename Pb::TR;
+    const SI i = SI( blockIdx.x ) * blockDim.x + threadIdx.x;
+    if ( i >= deferred.n || i >= SI( pb.counters->ovf[ 0 ] ) )
+        return;
+    const int nb = deferred.nb[ i ];
+    if ( nb < 0 )                                        // the third pass has it
+        return;
+    finish_cell( pb, list[ i ], DeferredCell<TR>{ deferred, i, nb } );
 }
 
 /// THE WARP PASSES: what the registers of one thread could not hold, ONE CELL PER WARP ( `WarpCell` ). The cells that
@@ -1340,8 +1387,13 @@ __global__ void report_count( SV sv, const unsigned long long *count, unsigned l
 
 /// `nb_bytes` of the call's pool, 16-byte aligned ( `nullptr` if the pool said no: the handler reports it )
 inline void *take( auto &allocator, SI nb_bytes ) {
+    static const bool log = std::getenv( "SDOT_CARD_TAKES" ) && *std::getenv( "SDOT_CARD_TAKES" ) != '0';
+    const auto t0 = std::chrono::steady_clock::now();
     auto v = allocator.template view<std::int32_t>( ( nb_bytes + 16 + 3 ) / 4 );
     auto p = reinterpret_cast<std::uintptr_t>( v.data().raw );
+    if ( log )
+        std::printf( "TAKE %lld %s %.3f\n", ( long long ) nb_bytes, p ? "ok" : "REFUSED",
+                     std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() ), std::fflush( stdout );
     if ( ! p )
         return nullptr;
     // `SDOT_CARD_POISON=1`: every byte taken set to 0xff ( a NaN in every double ) -- a read before a write then shows at
@@ -1385,6 +1437,31 @@ struct Overflow {
     }
 };
 
+/// THE FINISH STORE'S CAPACITY ( `Deferred`, float kernel ): ~148 bytes per cell, so it holds at most this many cells
+/// ( 155 MB ) and the first pass runs by chunks of it past that ( `Card::run` ) -- the store was the largest per-seed
+/// buffer of a card ( 1.5 GB at 1e7 seeds ). Below it, nothing changes. `SDOT_CARD_DEFER_CAP` sets another ( a test of
+/// the chunks on small clouds; `CardMemory.DEFER_CAP` reads it too ).
+constexpr SI DEFER_CAP = SI( 1 ) << 20;
+inline SI defer_cap_default() {
+    static const SI cap = [] {
+        const char *e = std::getenv( "SDOT_CARD_DEFER_CAP" );
+        return e && std::atoll( e ) > 0 ? SI( std::atoll( e ) ) : DEFER_CAP;
+    }();
+    return cap;
+}
+
+/// WHAT A CARD MAY BORROW from another card of the same call instead of taking it from the pool: the cards of a call run
+/// one after the other on its stream, and these buffers are only read or overwritten while a card runs ( the lists, the
+/// finish store ) or are the same for both ( the node records, written by the majorants; the packed seeds of the same
+/// kernel float ). `nullptr`: taken.
+template<class TR>
+struct CardShare {
+    const void         *nodes = nullptr;                 ///< `Node< W, TR >` records ( not rebuilt from the tree )
+    const void         *pos = nullptr, *w = nullptr;     ///< the packed seeds ( not packed again )
+    TR                 *lists = nullptr;                 ///< the passes' two lists of `n` ranks
+    const Deferred<TR> *deferred = nullptr;              ///< the float kernel's finish store
+};
+
 /// THE DIAGRAM ON THE CARD, for one call: the kernel's tree and seeds, the lists and counters of the passes, the
 /// global-memory slots of the fourth pass. `prepare` takes it all from the call's allocator and fills the tree and
 /// the seeds; `run` launches the passes -- everything `pb` points to ( the outputs ) is the caller's. Nothing is read
@@ -1404,11 +1481,12 @@ struct Card {
     Deferred<TR>   deferred{};
     Overflow       overflow{};                           ///< the fourth pass's slots
     SI             nb_nodes = 0;
+    SI             defer_cap = defer_cap_default();      ///< the cells the finish store holds ( set before `prepare` )
 
     /// `overflow`: the slots of the fourth pass, already taken ( shared with another card of the call: they must hold
-    /// this card's cells, `bytes_for< TK, TR >` ), or only sized ( `slots == nullptr` ): taken here. `false`: the pool
-    /// said no.
-    bool prepare( const CudaQueue &queue, const auto &pd, auto &allocator, Overflow overflow_ ) {
+    /// this card's cells, `bytes_for< TK, TR >` ), or only sized ( `slots == nullptr` ): taken here. `share`: what is
+    /// borrowed from another card of the call instead of taken ( `CardShare` ). `false`: the pool said no.
+    bool prepare( const CudaQueue &queue, const auto &pd, auto &allocator, Overflow overflow_, const CardShare<TR> &share = {} ) {
         static_assert( std::decay_t<decltype( pd )>::ct_dim == 2, "the dedicated GPU cell is 2D" );
         const SI n = SI( pd.nb_seeds() );
         nb_nodes = SI( pd.tree.node_begin.shape( 0 ) );
@@ -1424,23 +1502,32 @@ struct Card {
         if ( ! overflow.slots && ! overflow.template take_from<TK,TR>( allocator ) )
             return false;
 
-        auto *nodes = static_cast<Node<W,TR> *>( take( allocator, SI( sizeof( Node<W,TR> ) ) * nb_nodes ) );
-        auto *pos   = static_cast<Pos *>( take( allocator, SI( sizeof( Pos ) ) * n ) );
+        // ( each take checked at once: past a refusal the pool is not asked again, but nothing is gained by asking )
+        auto *nodes = share.nodes ? static_cast<Node<W,TR> *>( const_cast<void *>( share.nodes ) )
+                                  : static_cast<Node<W,TR> *>( take( allocator, SI( sizeof( Node<W,TR> ) ) * nb_nodes ) );
+        auto *pos   = share.pos ? static_cast<Pos *>( const_cast<void *>( share.pos ) ) : static_cast<Pos *>( take( allocator, SI( sizeof( Pos ) ) * n ) );
         Wt   *w     = nullptr;
         if constexpr ( W )
-            w = static_cast<Wt *>( take( allocator, SI( sizeof( Wt ) ) * n ) );
-        lists    = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * 2 * n ) );
+            w = share.w ? static_cast<Wt *>( const_cast<void *>( share.w ) ) : static_cast<Wt *>( take( allocator, SI( sizeof( Wt ) ) * n ) );
+        lists    = share.lists ? share.lists : static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * 2 * n ) );
         counters = static_cast<Counters *>( take( allocator, SI( sizeof( Counters ) ) ) );
         if ( ! nodes || ! pos || ( W && ! w ) || ! lists || ! counters )
             return false;
-        deferred = Deferred<TR>{ nullptr, nullptr, nullptr, nullptr, n };
+        // the float kernel's finish store: `defer_cap` cells at most ( the first pass then runs by chunks, `run` )
+        deferred = Deferred<TR>{ nullptr, nullptr, nullptr, nullptr, std::max<SI>( 1, std::min( n, defer_cap ) ) };
         if constexpr ( std::is_same_v<TK,float> ) {
-            deferred.x  = static_cast<float *>( take( allocator, SI( sizeof( float ) ) * RD * n ) );
-            deferred.y  = static_cast<float *>( take( allocator, SI( sizeof( float ) ) * RD * n ) );
-            deferred.c  = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * RD * n ) );
-            deferred.nb = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * n ) );
-            if ( ! deferred.x || ! deferred.y || ! deferred.c || ! deferred.nb )
-                return false;
+            if ( share.deferred && share.deferred->x ) {
+                if ( share.deferred->n < deferred.n )
+                    throw std::runtime_error( "sdot::gpu2d: shared finish store too small for this card" );
+                deferred = *share.deferred;
+            } else {
+                const SI m = deferred.n;
+                if ( ! ( deferred.x  = static_cast<float *>( take( allocator, SI( sizeof( float ) ) * RD * m ) ) ) ||
+                     ! ( deferred.y  = static_cast<float *>( take( allocator, SI( sizeof( float ) ) * RD * m ) ) ) ||
+                     ! ( deferred.c  = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * RD * m ) ) ) ||
+                     ! ( deferred.nb = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * m ) ) ) )
+                    return false;
+            }
         }
 
         pb.nodes   = nodes;
@@ -1457,12 +1544,24 @@ struct Card {
         pb.rho     = 1;
         pb.user_order = true;
         pb.counters = counters;
-        refresh( queue, pd );
+        // what is borrowed is the lender's to fill ( and may already hold more recent values than the diagram's tensors )
+        refresh( queue, pd, ! share.nodes, ! share.pos );
         return true;
     }
 
+    /// what another card of the call may borrow from this one ( `CardShare` ): the nodes, the lists, the finish store,
+    /// and with `seeds` the packed seeds ( a card of the same kernel float )
+    CardShare<TR> lend( bool seeds ) const {
+        CardShare<TR> s;
+        s.nodes = pb.nodes;
+        s.lists = lists;
+        s.deferred = &deferred;
+        if ( seeds ) { s.pos = pb.pos; s.w = pb.w; }
+        return s;
+    }
+
     /// the kernel's tree and seeds from the diagram's tensors ( again after the weights changed )
-    void refresh( const CudaQueue &queue, const auto &pd ) {
+    void refresh( const CudaQueue &queue, const auto &pd, bool nodes = true, bool seeds = true ) {
         using TB = std::remove_const_t<typename std::decay_t<decltype( pd.tree.node_box )>::TF>;
         using TJ = std::remove_const_t<typename std::decay_t<decltype( pd.tree.node_begin )>::TF>;
         static_assert( std::is_same_v<TB,TF>, "the tree's boxes and the positions share the driver's float" );
@@ -1473,11 +1572,13 @@ struct Card {
             wb = strided( pd.tree.node_wb );
             pb.w64 = strided( pd.sorted_weights );
         }
-        launch_kernel( queue, &make_nodes<W,TR,TB,TJ>, blocks_for( nb_nodes ), BLOCK, 0,
-                       nb_nodes, strided( pd.tree.node_box ), wa, wb, strided( pd.tree.node_begin ), strided( pd.tree.node_end ),
-                       const_cast<Node<W,TR> *>( pb.nodes ) );
-        launch_kernel( queue, &pack_seeds<TK,W,TF>, blocks_for( SI( pb.n ) ), BLOCK, 0, SI( pb.n ), pb.pos64, pb.w64,
-                       const_cast<Pos *>( pb.pos ), const_cast<Wt *>( pb.w ) );
+        if ( nodes )
+            launch_kernel( queue, &make_nodes<W,TR,TB,TJ>, blocks_for( nb_nodes ), BLOCK, 0,
+                           nb_nodes, strided( pd.tree.node_box ), wa, wb, strided( pd.tree.node_begin ), strided( pd.tree.node_end ),
+                           const_cast<Node<W,TR> *>( pb.nodes ) );
+        if ( seeds )
+            launch_kernel( queue, &pack_seeds<TK,W,TF>, blocks_for( SI( pb.n ) ), BLOCK, 0, SI( pb.n ), pb.pos64, pb.w64,
+                           const_cast<Pos *>( pb.pos ), const_cast<Wt *>( pb.w ) );
     }
 
     /// THE PASSES. `errors`: the kernel form of loom's error buffer ( what a failure is recorded in ).
@@ -1490,9 +1591,21 @@ struct Card {
 
         // first pass, second pass ( no read back between them )
         TR *list1 = lists, *list2 = lists + n;
-        launch_kernel( queue, &first_pass<Pb>, blocks_for( n ), BLOCK, 0, pb, list1, deferred );
-        static const int grid2 = resident_grid( &second_pass<Pb>, BLOCK );
-        launch_kernel( queue, &second_pass<Pb>, grid2, BLOCK, 0, pb, list1, list2, deferred );
+        const bool chunks = deferring<Pb>() && deferred.n < n;   // the finish store holds fewer cells than the diagram
+        if ( ! chunks ) {
+            launch_kernel( queue, &first_pass<Pb>, blocks_for( n ), BLOCK, 0, pb, list1, deferred );
+            static const int grid2 = resident_grid( &second_pass<Pb>, BLOCK );
+            launch_kernel( queue, &second_pass<Pb>, grid2, BLOCK, 0, pb, list1, list2, deferred );
+        } else if constexpr ( deferring<Pb>() ) {
+            for ( SI k0 = 0; k0 < n; k0 += deferred.n ) {
+                const SI cnt = std::min( deferred.n, n - k0 );
+                launch_kernel( queue, &first_pass_chunk<Pb>, blocks_for( cnt ), BLOCK, 0, pb, list1, deferred, k0, cnt );
+                launch_kernel( queue, &finish_chunk<Pb>, blocks_for( cnt ), BLOCK, 0, pb, deferred, k0, cnt );
+            }
+            static const int grid2 = resident_grid( &second_pass_slots<Pb>, BLOCK );
+            launch_kernel( queue, &second_pass_slots<Pb>, grid2, BLOCK, 0, pb, list1, list2, deferred );
+            launch_kernel( queue, &finish_slots<Pb>, blocks_for( deferred.n ), BLOCK, 0, pb, list1, deferred );
+        }
 
         // third pass, one warp per cell in shared memory ( its overflow goes to `list1`, free again )
         constexpr int CAP = shared_cap<TK>();
@@ -1505,7 +1618,8 @@ struct Card {
         launch_kernel( queue, k3, grid3, BLOCK, bytes3, pb, list2, 1, list1, ( unsigned char * ) nullptr, CAP, errors );
 
         if constexpr ( deferring<Pb>() )
-            launch_kernel( queue, &finish_pass<Pb>, blocks_for( n ), BLOCK, 0, pb, deferred );
+            if ( ! chunks )
+                launch_kernel( queue, &finish_pass<Pb>, blocks_for( n ), BLOCK, 0, pb, deferred );
 
         // fourth pass, one warp per cell in global memory, a persistent grid of exactly the slots: launched whatever the
         // count ( it reads it ), it costs a launch when there is nothing to do

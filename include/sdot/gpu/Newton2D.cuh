@@ -607,6 +607,11 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
 
     const double t_begin = wall_now();
     const SI n = SI( pd.nb_seeds() );
+    if constexpr ( requires { allocator.why; } )         // what a refusal of the pool says ( loom's `Scratch` )
+        allocator.why = "It was the card's Newton solve of " + std::to_string( n ) + " seeds ( `SdotPlanNd`, `gpu/Newton2D.cuh` ), "
+                        "whose need `sdot.CardMemory.card_solve_bytes` estimates ( and checks before the call, unless "
+                        "SDOT_CARD_MEMORY_CHECK=0 ). Solve fewer seeds, give XLA more of the card ( XLA_PYTHON_CLIENT_MEM_FRACTION, "
+                        "0.75 by default ), free the arrays the program keeps, or solve on the CPU ( LOOM_DEVICE=cpu )";
     const auto errors = sdot::kernel_form( queue, MutList(), errors_ );
     const auto ids = strided( pd.tree.seed_indices );
     const auto pos = strided( pd.sorted_positions );
@@ -662,12 +667,12 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     const SI fcap = std::max<SI>( SI( work.nb_facets.max ), 1 );
     card.pb.fcap = fcap;
     // MIXED: the double kernel's card, sharing the node records ( the majorants write them for both: they are float records
-    // whatever the kernel ); only the seeds' weights are packed per kernel
+    // whatever the kernel ) and the passes' lists; only the seeds are packed per kernel
     CardD cardd;
     bool use_double = ! MIXED;
     int it_double = MIXED ? -1 : 0;
     if constexpr ( MIXED ) {
-        if ( ! cardd.prepare( queue, pd, allocator, overflow ) )
+        if ( ! cardd.prepare( queue, pd, allocator, overflow, card.lend( false ) ) )
             return;
         if constexpr ( CONST )
             set_density( cardd.pb, dens_in );
@@ -686,25 +691,31 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
                 cardd.pb.dens = dh.dev;
         }
     };
+    // ONE COO for the two slots: only the accepted diagram's is read ( the laplacian, at the start of an iteration ), and
+    // the accepted diagram is the last one made but on a refused start or after a linear solve ( `coo_of`: then it is made
+    // again ). ONE BLOCK, because between the assembly and the next diagram it is the linear solver's ( `CardLinear::prepare` )
     Slot<TR> slots[ 2 ];
+    const SI coo_bytes = ( SI( sizeof( double ) ) + 2 * SI( sizeof( TR ) ) ) * fcap;
+    auto *coo = static_cast<unsigned char *>( take( allocator, coo_bytes ) );
+    if ( ! coo )
+        return;
+    double *coo_c = reinterpret_cast<double *>( coo );
+    TR *coo_i = reinterpret_cast<TR *>( coo + SI( sizeof( double ) ) * fcap ), *coo_j = coo_i + fcap;
     for ( Slot<TR> &s : slots ) {
-        s.a = vec( n );
-        s.fi = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * fcap ) );
-        s.fj = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * fcap ) );
-        s.fc = vec( fcap );
-        s.counters = static_cast<Counters *>( take( allocator, SI( sizeof( Counters ) ) ) );
-        s.edges = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * EDGE_CAP * n ) );
-        s.nb_edges = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * n ) );
-        if ( ! s.a || ! s.fi || ! s.fj || ! s.fc || ! s.counters || ! s.edges || ! s.nb_edges )
+        s.fi = coo_i; s.fj = coo_j; s.fc = coo_c;
+        if ( ! ( s.a = vec( n ) ) || ! ( s.counters = static_cast<Counters *>( take( allocator, SI( sizeof( Counters ) ) ) ) ) ||
+             ! ( s.edges = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * EDGE_CAP * n ) ) ) ||
+             ! ( s.nb_edges = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * n ) ) ) )
             return;
     }
     Slot<TR> *cur = &slots[ 0 ], *tri = &slots[ 1 ];
+    const Slot<TR> *coo_of = nullptr;                    // the slot whose facets the COO holds
     Majorants<TR,TN> maj;
     if ( ! maj.prepare( allocator, pd ) )
         return;
 
     // ---- the vectors ( ranks ), the reductions, the laplacian, the linear solver
-    double *nu = vec( n ), *nu0 = vec( n ), *w = vec( n ), *w2 = vec( n ), *d = vec( n ), *b = vec( n ), *gauge = vec( 1 );
+    double *nu = vec( n ), *w = vec( n ), *w2 = vec( n ), *d = vec( n ), *b = vec( n ), *gauge = vec( 1 );
     SI *r0_dev = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) ) );
     Report *rep_dev = static_cast<Report *>( take( allocator, SI( sizeof( Report ) ) ) );
     RedSlot<DiagRed> red_diag;
@@ -714,7 +725,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     RedSlot<Min1> red_min;
     RedSlot<MinCount> red_mc;
     RedSlot<Extent2> red_ext;
-    if ( ! nu || ! nu0 || ! w || ! w2 || ! d || ! b || ! gauge || ! r0_dev || ! rep_dev || ! red_diag.take_from( allocator ) || ! red1.take_from( allocator )
+    if ( ! nu || ! w || ! w2 || ! d || ! b || ! gauge || ! r0_dev || ! rep_dev || ! red_diag.take_from( allocator ) || ! red1.take_from( allocator )
          || ! red2.take_from( allocator ) || ! redm.take_from( allocator ) || ! red_min.take_from( allocator ) || ! red_mc.take_from( allocator )
          || ! red_ext.take_from( allocator ) )
         return;
@@ -753,7 +764,8 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
             hl.mg_stop = int( o[ O_MG_STOP ] );
             hl.mg_nu = int( o[ O_MG_NU ] );
             host.prepare( int( o[ O_HOST_METHOD ] ), n, hl );
-        } else if ( lin_float ? ! linf.prepare( allocator, n, nnz_cap, lo ) : ! lin.prepare( allocator, n, nnz_cap, lo ) )
+        } else if ( lin_float ? ! linf.prepare( allocator, n, nnz_cap, lo, &lws, coo, coo_bytes )
+                              : ! lin.prepare( allocator, n, nnz_cap, lo, &lws, coo, coo_bytes ) )
             return;
     }
 
@@ -772,8 +784,8 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     launch_kernel( queue, &find_rank0<TI>, blocks_for( n ), BLOCK, 0, n, ids, r0_dev );
     SI r0 = 0;
     read_back( queue, &r0, ( const SI * ) r0_dev, 1 );
-    launch_kernel( queue, &gather_ranks<TF,TI>, blocks_for( n ), BLOCK, 0, n, strided( nu_in ), ids, nu0 );
-    cuda_check( cudaMemcpyAsync( nu, nu0, sizeof( double ) * n, cudaMemcpyDeviceToDevice, queue.stream ), "copy of the target" );
+    // the target in ranks ( `nu`: gathered again from `nu_in` at each stage rather than kept twice )
+    launch_kernel( queue, &gather_ranks<TF,TI>, blocks_for( n ), BLOCK, 0, n, strided( nu_in ), ids, nu );
 
     /// the report of slot `s` against the current target, residual and floor ( reductions, one read back )
     auto report = [&]( Slot<TR> &s ) {
@@ -805,6 +817,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
             else              run_on( card );
         } else
             run_on( card );
+        coo_of = &s;
         report( s );
         tm_maj.collect();
         tm_diag.collect();
@@ -849,12 +862,12 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     } else
         launch_kernel( queue, &fill_value, blocks_for( n ), BLOCK, 0, w, 0.0, n );
     int start = given ? sp::START_GIVEN : sp::START_VORONOI;
-    reduce( queue, n, SumOf{ nu0 }, red1.partials, red1.out );
+    reduce( queue, n, SumOf{ nu }, red1.partials, red1.out );
     Sum1 snu;
     read_back( queue, &snu, ( const Sum1 * ) red1.out, 1 );
     double nu_min0 = 0;
     {
-        reduce( queue, n, MinOf{ nu0 }, red_min.partials, red_min.out );
+        reduce( queue, n, MinOf{ nu }, red_min.partials, red_min.out );
         Min1 m;
         read_back( queue, &m, ( const Min1 * ) red_min.out, 1 );
         nu_min0 = m.m;
@@ -914,7 +927,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
         }
         // the target at the scale of what the domain holds of THIS density
         domain_mass = cur->rep.d.sum_a;
-        cuda_check( cudaMemcpyAsync( nu, nu0, sizeof( double ) * n, cudaMemcpyDeviceToDevice, queue.stream ), "copy of the target" );
+        launch_kernel( queue, &gather_ranks<TF,TI>, blocks_for( n ), BLOCK, 0, n, strided( nu_in ), ids, nu );
         double nu_min = nu_min0;
         if ( domain_mass > 0 && snu.s > 0 && domain_mass != snu.s ) {
             launch_kernel( queue, &scale_values, blocks_for( n ), BLOCK, 0, n, nu, domain_mass / snu.s );
@@ -953,6 +966,10 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
             const int g0 = nb_diag;
 
             // the right-hand side, projected on the range; the laplacian of the accepted diagram
+            if ( coo_of != cur ) {                       // the COO holds a refused start's facets: the accepted diagram again
+                diagram( w, *cur );
+                if ( stop_all ) { st_status = failed ? sp::S_FAILURE : sp::S_CAPACITY; break; }
+            }
             tm_asm.start( queue );
             if ( res_cur != RES_LIN )
                 reduce( queue, n, RhsSums{ cur->a, nu, power, res_cur }, red2.partials, red2.out );
@@ -971,6 +988,8 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
                               : lin_float ? linf.solve( queue, allocator, L, b, d ) : lin.solve( queue, allocator, L, b, d );
             t_lin += wall_now() - tl0;
             tm_asm.collect();
+            if ( lin_kind != LIN_HOST )
+                coo_of = nullptr;                        // ( the card's solver worked in the COO )
             if ( ! solved ) {
                 st_status = sp::S_LINEAR_FAILURE;
                 break;
@@ -1102,9 +1121,11 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     // ---- THE MOMENTS on the TRUE density ( `s = 0`, whatever stage the solve stopped at ) at the fitted weights ( barycentres,
     // the cost ), a last walk
     if ( ! stop_all ) {
+        // the moments' card borrows the one of its kernel ( nodes, seeds, lists, finish store ), and writes its measures
+        // and costs in the trial's measures and the direction, free now
         MomT mom;
-        double *mres = vec( n ), *mcost = vec( n );
-        if ( mres && mcost && mom.prepare( queue, pd, allocator, overflow ) ) {
+        double *mres = tri->a, *mcost = d;
+        if ( mom.prepare( queue, pd, allocator, overflow, cmom.lend( true ) ) ) {
             if constexpr ( CONST )
                 set_density( mom.pb, dens_in );
             else {
@@ -1162,6 +1183,8 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     st[ sp::IT_DOUBLE ] = it_double;
     ( void ) t_lim_host;
     double *tmp = vec( std::max<SI>( SI( rows.size() ), sp::NB_STATS ) );
+    if constexpr ( requires { allocator.taken; } )
+        st[ sp::SCRATCH_BYTES ] = double( allocator.taken );
     if ( tmp ) {
         if ( nb_steps > 0 ) {
             cuda_check( cudaMemcpyAsync( tmp, rows.data(), sizeof( double ) * rows.size(), cudaMemcpyHostToDevice, queue.stream ), "copy of the history" );

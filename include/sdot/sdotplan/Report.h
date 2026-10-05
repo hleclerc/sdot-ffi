@@ -7,11 +7,12 @@ namespace sdot {
 namespace sdotplan {
 
 /// what the caller reads in `stats( . )` -- same list on the python side ( `SdotPlanNd._STATS` ). `IT_DOUBLE`: the card's mixed
-/// precision, the iteration where the double kernel took over ( -1: never; 0 on the CPU and for a single kernel )
+/// precision, the iteration where the double kernel took over ( -1: never; 0 on the CPU and for a single kernel ). `SCRATCH_BYTES`:
+/// what the card's solve took from XLA's pool ( 0 on the CPU )
 enum Stat : int {
     STATUS = 0, RESIDUAL, RESIDUAL0, NB_ITER, NB_DIAG, NB_BACKTRACKS, T_MAJORANT, T_DIAG, T_ASM, T_LIN, T_LIM, EPS,
     DOMAIN_MASS, NB_OVERFLOWED, NB_CELL_LIM, NB_LIMIT_ROUNDS, LIN_NB_HIERARCHIES, LIN_NB_ITER, LIN_WORST, START, T_TOTAL,
-    NB_CONTINUATION_STEPS, MIN_START_MASS, IT_SWITCH, IT_DOUBLE,
+    NB_CONTINUATION_STEPS, MIN_START_MASS, IT_SWITCH, IT_DOUBLE, SCRATCH_BYTES,
     NB_STATS
 };
 enum Start : int { START_GIVEN = 0, START_VORONOI = 1, START_SIMILARITY = 2 };

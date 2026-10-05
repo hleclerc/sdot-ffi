@@ -1239,3 +1239,79 @@ host round trips at this n ), the 22 blurred images a few ms each. The double ke
   gaussians are far from a cell gives masses at the 1e-17 noise on both sides, not the same noise.
 * The image's tables are 5 doubles per pixel in the call's pool ( 10 MB at 512^2, 2.7 GB at 16384^2 ); past the pool, the outputs
   are left unwritten as for any card call.
+
+# GPU step 9: the card's memory, a clear error instead of a hang ( 2026-10-05 )
+
+A uniform 2D solve of 1e7 seeds on lmo ( 2080 Ti, XLA's pool 8.51 GB = 75 % of 11 GB ) never ended.
+
+## Why it hung
+
+* The solve takes its buffers during the call from XLA's pool ( `take`, loom's `Scratch` over `ffi::ScratchAllocator` ). When
+  the pool cannot give, XLA's BFC allocator does NOT refuse at once: it waits ~10 s for frees ( `AllocatorRetry` ), then refuses.
+* Our prepares went on taking after a refusal ( `CardLinear::prepare` takes all its levels before checking ): at 1e7 the first
+  refusal came after 7.17 GB, inside the linear solver's prepare, and then every following take waited its 10 s -- 117 refusals
+  logged in 20 minutes, not finished. No retry loop of ours or of loom: XLA's wait times the number of takes.
+* `SDOT_CARD_TAKES=1` ( new, `Cell2D.cuh::take` ): every take printed with its size, ok / REFUSED and how long it took.
+
+## What changed
+
+* loom `Scratch` ( `fe283f9` ): a refusal is FINAL for the call ( later requests refused without asking the pool: one wait per
+  call at most ), the bytes taken are counted, and the handler's `RESOURCE_EXHAUSTED` message says what was refused, what the call
+  had taken, and the body's `why` ( the card solve says what it is, for how many seeds, and what to do ).
+* A model of the solve's memory ( `sdot/CardMemory.py::card_solve_bytes`, take by take, the multigrid's coarse matrices per
+  fine unknown as measured ), checked before the tree and the solve against `memory_stats()` ( `bytes_limit - bytes_in_use` ):
+  a `MemoryError` at once ( eager and while tracing ) with the need, the largest parts, what is left, how many seeds would fit
+  and what to do ( fewer seeds, `fp32`, `XLA_PYTHON_CLIENT_MEM_FRACTION`, free arrays, the CPU ). Before refusing, Python gives
+  up the multigrid's recycled solutions ( 16 B / seed each ) when that makes it fit. `SDOT_CARD_MEMORY_CHECK=0` skips it.
+  `stats[ "scratch_bytes" ]`: what the solve really took ( the model is within 1 % at 1e6 and 1e7 ).
+* Less memory per seed ( `Newton2D.cuh`, `Cell2D.cuh`, `Linear2D.cuh` ), nothing changed in the arithmetic:
+  * the moments' card borrows the card of its kernel ( nodes, seeds, lists, finish store ) and writes in the trial's measures
+    and the direction ( -58 B ); the double kernel's card borrows the float card's nodes and lists ( -18 B );
+  * one COO for both diagram slots, made again in the rare case it holds a refused start's facets ( -48 B ); between the
+    assembly and the next diagram it is the linear solver's: r, z, p, q and the fine float input / output / diagonal are
+    carved from it ( -44 B );
+  * the linear solver's scan work is the assembly's ( -16 B ); the target is gathered again per stage instead of kept twice ( -8 B );
+  * the float kernel's finish store holds at most `DEFER_CAP = 2^20` cells ( 155 MB ): past it the first pass runs by chunks and
+    the second leaves its cells by position ( -133 B at 1e7; unchanged below 2^20; `SDOT_CARD_DEFER_CAP` for tests ).
+
+| bytes per seed ( mixed, uniform ) | before | after |
+|---|---|---|
+| solve's scratch, 1e6 | 1094 | 897 |
+| solve's scratch, 1e7 | ~990 ( never completed ) | 663 |
+
+After, at 1e7 ( model, B / seed ): linear solver 203, diagram slots 152 ( edges 2 x 64 ), laplacian 104, cells 82, facets 48,
+vectors 40, majorants 27, overflow slots 10; plus the tree's and the outputs' XLA buffers ~100.
+
+## 1e7 on lmo ( mixed, limits, rtol 1e-6 )
+
+* eager: converged, 7 iterations, 13 diagrams, solve 8.4 s; 6.63 GB taken, peak of the pool 8.45 of 8.51 GB.
+* jitted: runs ( 8.4 s ), and again on a second call -- at the edge: anything else the program keeps on the card makes it refuse.
+* before the fix it hung; a solve that does not fit now raises: `MemoryError` in 0.02-0.07 s ( the model ), or, check skipped,
+  `RESOURCE_EXHAUSTED` after one wait of the pool ( 10.8 s ).
+
+## Timings ( `bench_newton --case=uniform --step=limits --jit=yes`, n22 RTX A6000, min of 3; jit wall, seconds )
+
+| case | kernel | before | after | it / diag |
+|---|---|---|---|---|
+| uniform 1e5 | float | 0.066 | 0.066 | 5 / 6 both |
+| uniform 1e5 | mixed | 0.072 | 0.073 | 5 / 6 both |
+| uniform 1e6 | float | 0.336 | 0.333 | 5 / 6 both |
+| uniform 1e6 | mixed | 0.382 | 0.383 | 5 / 6 both |
+
+( lmo, before only, same protocol: 0.075 / 0.081 / 0.436 / 0.495. ) The same iterations, diagrams and stage times: below
+2^20 seeds the kernels are the same; the memory check is one `memory_stats()` per solve.
+
+## Tests
+
+* lmo-jax `test_SdotPlanNd`, `test_CardCells`: all good. Local jax CPU `test_SdotPlanNd`: all good.
+* New: `the_card_memory_model_follows_the_solve` ( 2e5 seeds, mixed / fp32 / fp64 double levels / cg: model within 8 % of
+  `scratch_bytes` ), `the_card_finish_store_by_chunks_gives_the_same_plan` ( `SDOT_CARD_DEFER_CAP=1000`: the same plan to the bit ),
+  `the_card_refuses_a_solve_that_does_not_fit_at_once` ( `XLA_PYTHON_CLIENT_MEM_FRACTION=0.05`, 1e6 seeds: `MemoryError` in
+  < 0.1 s eager and jit; without the check `RESOURCE_EXHAUSTED` in 10.8 s with the message ).
+
+## Risks
+
+* The model's coarse matrices are measured on the uniform cloud; a cloud whose Galerkin products are denser takes more than the
+  model says -- then the call refuses after one wait of the pool, with its message.
+* Under `jax.jit` the program's own buffers are not seen at trace time: the check passes and the call may still refuse.
+* 1e7 fits the 2080 Ti with ~60 MB to spare: the edges of the two diagram slots ( 128 B / seed ) are the next thing to shrink.
