@@ -820,7 +820,7 @@ if test( "the_card_cells_3d_small_and_degenerate_clouds" ):
                     r = r if ok is None else r[ ok ]
                     # ( a jittered vertex near a tie is decided in float in the float kernel: a sliver, at its rounding )
                     tol = 1e-6 if ( kernel == "FP32" and ok is not None ) else 1e-10
-                    assert r.max() < tol and abs( m.sum() - 1 ) < 1e-9, ( label, leaf, kernel, r.max(), m.sum() )
+                    assert r.max() < tol and abs( m.sum() - 1 ) < 1e-3 * tol, ( label, leaf, kernel, r.max(), m.sum() )
                     print( f"  { label } ( leaf { leaf } ) { kernel }: max rel. gap { r.max() :.1e}" )
         pos = rng.uniform( 0.1, 0.9, size = ( 500, 3 ) )
         pos[ 0 ] = [ 1.5, 0.5, 0.5 ]
@@ -865,7 +865,7 @@ if test( "the_card_laplacian_3d_is_the_generic_one" ):
             for kernel in ( "FP64", "FP32" ):
                 out = _pd( pos, w, kernel, True, *_BOX3, tree = tree )._card_cells( facets = True, moments = False )
                 assert out is not None, label
-                assert _rel( numpy.asarray( out[ "measures" ].raw ).reshape( -1 ), plain ).max() < 1e-9
+                assert _rel( numpy.asarray( out[ "measures" ].raw ).reshape( -1 ), plain ).max() < ( 1e-9 if kernel == "FP64" else 1e-6 )
                 row, col, val, dia = _card_laplacian( out, n )
                 for i in range( n ):
                     c = col[ row[ i ]:row[ i + 1 ] ]

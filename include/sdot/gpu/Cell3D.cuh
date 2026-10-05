@@ -111,7 +111,8 @@ template<> struct SeedOf<double> { using T = SeedD; };
 template<class TK> using Seed = typename SeedOf<TK>::T;
 
 /// a half-space `d . v <= off`, `v` counted from the seed
-template<class TK> struct Plane { TK dx, dy, dz, off; };
+/// ( `tol`: how far beyond the plane a vertex must be to count as outside, `widen` )
+template<class TK> struct Plane { TK dx, dy, dz, off, tol; };
 
 /// THE POWER BISECTOR in the seed's frame, `d = q - p0`, `off = |d|^2 / 2 + ( w0 - wq ) / 2`. In float `d` is the
 /// difference of the two-float positions ( the high parts first: exact as soon as the seeds are close ), the weights'
@@ -119,6 +120,7 @@ template<class TK> struct Plane { TK dx, dy, dz, off; };
 template<bool W>
 __device__ __forceinline__ Plane<float> bisector( const SeedF &f, const SeedF &q ) {
     Plane<float> p;
+    p.tol = 0;
     p.dx  = ( q.xh - f.xh ) + ( q.xl - f.xl );
     p.dy  = ( q.yh - f.yh ) + ( q.yl - f.yl );
     p.dz  = ( q.zh - f.zh ) + ( q.zl - f.zl );
@@ -131,6 +133,7 @@ __device__ __forceinline__ Plane<float> bisector( const SeedF &f, const SeedF &q
 template<bool W>
 __device__ __forceinline__ Plane<double> bisector( const SeedD &f, const SeedD &q ) {
     Plane<double> p;
+    p.tol = 0;
     p.dx  = q.x - f.x;
     p.dy  = q.y - f.y;
     p.dz  = q.z - f.z;
@@ -140,16 +143,19 @@ __device__ __forceinline__ Plane<double> bisector( const SeedD &f, const SeedD &
     return p;
 }
 
-/// THE TIES, decided once: a vertex counts as outside only beyond `tol = 32 eps ( |d| ( |d| + L ) + |off| )`, what the
+/// THE TIES, decided once: a vertex counts as outside only beyond `tol = c eps ( |d| ( |d| + L ) + |off| )`, what the
 /// rounding of `d . v - off` can reach for a vertex of the cell ( `L` the farthest corner of the box: a float vertex is
 /// interpolated from what were once its corners ). A plane through vertices that are on it in exact arithmetic ( a grid:
 /// eight cells at each vertex ) then leaves them all inside, instead of cutting them off at the noise of the rounding --
-/// which, in 3D, may leave a face in several cycles that overlap. The cell moves by `tol / |d|` at most.
+/// which, in 3D, may leave a face in several cycles that overlap. The new vertices are still placed on the TRUE plane
+/// ( the interpolation reads `d . v - off` ): a second cut by the same plane ( two seeds at one place, weights within an
+/// ulp of the offset ) then finds them within `tol` and leaves them alone. The cell moves by `tol / |d|` at most.
 template<class TK>
 __device__ __forceinline__ void widen( Plane<TK> &p, TK L ) {
-    constexpr TK eps = sizeof( TK ) == 4 ? TK( 32 * 1.1920929e-7 ) : TK( 32 * 2.220446049250313e-16 );
+    // ( 8 float epsilons, 32 double ones: the float band is what a sliver may lose, measured on the planes cloud's facets )
+    constexpr TK eps = sizeof( TK ) == 4 ? TK( 8 * 1.1920929e-7 ) : TK( 32 * 2.220446049250313e-16 );
     const TK d = sqrt( p.dx * p.dx + p.dy * p.dy + p.dz * p.dz );
-    p.off += eps * ( d * ( d + L ) + fabs( p.off ) );
+    p.tol = eps * ( d * ( d + L ) + fabs( p.off ) );
 }
 
 // ---- the tree, as the kernel reads it ( see `Cell2D.cuh` ) --------------------------------------------------------------
@@ -502,8 +508,8 @@ struct RegCell {
             const bool valid = s * 32 + lane < nv;
             out[ s ] = in[ s ] = 0u;
             if ( s < su ) {
-                out[ s ] = __ballot_sync( FULL, valid && sv[ s ] > TK( 0 ) );
-                in[ s ]  = __ballot_sync( FULL, valid && ! ( sv[ s ] > TK( 0 ) ) );
+                out[ s ] = __ballot_sync( FULL, valid && sv[ s ] > p.tol );
+                in[ s ]  = __ballot_sync( FULL, valid && ! ( sv[ s ] > p.tol ) );
             }
         }
         const int nb_out = total( out );
@@ -539,7 +545,9 @@ struct RegCell {
             const TK   xo = gather( x, o, su ), yo = gather( y, o, su ), zo = gather( z, o, su );
             const TK   xu = gather( x, u, su ), yu = gather( y, u, su ), zu = gather( z, u, su );
             const unsigned nnu = gather( nn, u, su );
-            const TK   t = s_u / ( s_u - so );           // from the inside end
+            // from the inside end; an inside end within `tol` beyond the plane is the new vertex itself ( the ratio
+            // would extrapolate, without bound when both ends are in the band )
+            const TK   t = s_u > TK( 0 ) ? TK( 0 ) : s_u / ( s_u - so );
             const TK   nx = xu + ( xo - xu ) * t, ny = yu + ( yo - yu ) * t, nz = zu + ( zo - zu ) * t;
             int f0, f1;
             faces_of( ko, j, f0, f1 );
@@ -664,6 +672,7 @@ struct RegCell {
                 pj.dy = __shfl_sync( FULL, P.dy, j );
                 pj.dz = __shfl_sync( FULL, P.dz, j );
                 pj.off = __shfl_sync( FULL, P.off, j );
+                pj.tol = __shfl_sync( FULL, P.tol, j );
                 const int r = cut( pj, TR( q0 + j ) );
                 if ( r == CUT_EMPTY || r == CUT_OVERFLOW ) {
                     state = r;
@@ -750,7 +759,8 @@ struct MemCell {
         return __any_sync( FULL, res );
     }
 
-    __device__ __forceinline__ bool outside( int i ) const { return s[ i ] > TK( 0 ); }
+    TK      tol;                                         ///< the current cut's ( `widen` )
+    __device__ __forceinline__ bool outside( int i ) const { return s[ i ] > tol; }
 
     /// the index, among the new vertices, of the one born on the edge `slot` of the outside vertex `o`
     __device__ __forceinline__ int new_on( int o, int slot ) const {
@@ -824,11 +834,12 @@ struct MemCell {
 
     __device__ __forceinline__ int cut( const Plane<TK> &p, TR pid ) {
         const TK *x = X[ cur ], *y = Y[ cur ], *z = Z[ cur ];
+        tol = p.tol;
         int no = 0;
         for ( int i = lane; i < nv; i += 32 ) {
             const TK si = p.dx * x[ i ] + p.dy * y[ i ] + p.dz * z[ i ] - p.off;
             s[ i ] = si;
-            no += si > TK( 0 );
+            no += si > p.tol;
         }
         no = warp_sum( no );
         if ( no == 0 )
@@ -905,7 +916,7 @@ struct MemCell {
                 if ( outside( u ) )
                     continue;
                 const int q = nb_in + m++;
-                const TK t = s[ u ] / ( s[ u ] - s[ o ] );
+                const TK t = s[ u ] > TK( 0 ) ? TK( 0 ) : s[ u ] / ( s[ u ] - s[ o ] );
                 x2[ q ] = x[ u ] + ( x[ o ] - x[ u ] ) * t;
                 y2[ q ] = y[ u ] + ( y[ o ] - y[ u ] ) * t;
                 z2[ q ] = z[ u ] + ( z[ o ] - z[ u ] ) * t;
@@ -946,6 +957,7 @@ struct MemCell {
                 pj.dy = __shfl_sync( FULL, P.dy, j );
                 pj.dz = __shfl_sync( FULL, P.dz, j );
                 pj.off = __shfl_sync( FULL, P.off, j );
+                pj.tol = __shfl_sync( FULL, P.tol, j );
                 const int r = cut( pj, TR( q0 + j ) );
                 if ( r == CUT_EMPTY || r == CUT_OVERFLOW || r == CUT_BROKEN ) {
                     state = r;

@@ -22,10 +22,14 @@ for same-machine numbers.
   pass in global memory for anything larger ( fixed budget of slots, batches, a `KernelFailure` past `card_max_vertices` ).
 * THE NEW VERTICES PAIRED BY THE OLD CUT THEY SHARE ( exactly two per crossed face ); when that is ambiguous ( a face
   crossed four times: signs at the rounding ), the cell goes to the global pass, which pairs them by WALKING the faces.
-* THE TIES DECIDED ONCE ( `widen` ): a vertex is outside a plane only beyond `32 eps ( |d| ( |d| + L ) + |off| )`. Without
-  it an exact grid ( eight cells at every vertex ) came out with faces in overlapping cycles: cells 15-20 % too large,
-  the sum of the measures 1.0005 in double, 12 % errors in float. With it the grids are exact to 1e-12 ( double ) and
-  1e-15 ( float, re-solved ).
+* THE TIES DECIDED ONCE ( `widen` ): a vertex is outside a plane only beyond `c eps ( |d| ( |d| + L ) + |off| )` ( `c` = 8
+  in float, 32 in double ), and the new vertices are still placed on the TRUE plane ( an inside end within the band is the
+  new vertex itself ). Without the band an exact grid ( eight cells at every vertex ) came out with faces in overlapping
+  cycles: cells 15-20 % too large, the sum of the measures 1.0005 in double, 12 % errors in float. With the band but the
+  vertices placed on the widened plane, two seeds at one place whose weights differ by less than an ulp of the offset
+  ( `test_PowerDiagram::the_generic_cell_survives_almost_coincident_seeds` ) gave two identical planes, the second one
+  seeing the first one's vertices at the noise: a cell 5 % too large. Now the grids are exact to 1e-15 and that test
+  passes on the card.
 * THE END OF A CELL in the same kernel: the planes and the vertices to shared memory ( 4.25 KB per warp ), every vertex
   RE-SOLVED in double from its three planes ( both kernels: the widening would otherwise bias the double one by
   `tol / |d|` ), then a lane per face walks its polygon ( the fan from its lowest vertex, the tetrahedra from the vertex
@@ -38,9 +42,9 @@ for same-machine numbers.
 
 | case | n | ours float | ours double | old `voies` float, n22 | old `voies` double, n22 | old float, lmo 2080 Ti | old double, lmo |
 |---|---|---|---|---|---|---|---|
-| uniform 3D | 1e6 | **117.3** | **453.1** | 107.3 ( wrong cells ) | 834.7 | 229 | 1103 |
-| planes / Voronoi | 1e5 | **127.3** | **446.7** | 118.3 ( wrong cells ) | 811.9 | 231 | 1066 |
-| planes / equal volumes | 1e5 | **215.9** | **1184.1** | 206.0 ( wrong cells ) | 2264.7 | 405 | 2926 |
+| uniform 3D | 1e6 | **118.4** | **457.1** | 107.3 ( wrong cells ) | 834.7 | 229 | 1103 |
+| planes / Voronoi | 1e5 | **128.4** | **451.2** | 118.3 ( wrong cells ) | 811.9 | 231 | 1066 |
+| planes / equal volumes | 1e5 | **217.2** | **1189.9** | 206.0 ( wrong cells ) | 2264.7 | 405 | 2926 |
 
 The old binary ( `nsdot/gpu_des_familles`, `mesures --3d --variante voies -n 1000000 --cases sdot-ffi/bench/cases --threads 8
 --temoin-double`, built on n22 with the pip `nvcc` 13.3, `-arch=sm_86 -O3 -lineinfo`, `-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK`
@@ -57,6 +61,10 @@ of 128 per SM ( 42 % occupancy ); double 128 registers, 4 blocks ( 33 % ). The s
 2 blocks ) takes 0.8 ms of 117 on the uniform cloud, 1.5 ms of 13 on planes / Voronoi, 2.0 of 22 on planes / equal; the
 third pass is empty on these clouds ( a launch, 4 us ).
 
+WHAT NEWTON AND A GRADIENT ASK FOR ( uniform 3D 1e6, `--output=...`, kernel-only ns / seed; the measures alone 117.3 / 453.1 ):
+`facets` ( the cells, the COO of the upper facets and the laplacian's CSR, `_card_cells` ) 124.4 float / 464.1 double, `vjp`
+( the adjoint of the measures, the pullback alone ) 120.8 / 468.3, `moments` ( measures, barycentres, costs ) 125.8 / 481.0.
+
 How it got there ( planes / Voronoi, planes / equal, float ):
 
 | step | Voronoi | equal |
@@ -67,7 +75,9 @@ How it got there ( planes / Voronoi, planes / equal, float ):
 
 ## Accuracy
 
-* Against the GENERIC double path on the same tree ( `--witness=generic`, n = 1e5 planes ): float median 6.4e-15, p99.99
+* Against our double kernel after the last fixes: float median 0, p99.99 1.9e-10 / 7.8e-11 / 1.4e-10, max 2.2e-5 / 1.4e-3 /
+  5.6e-9 ( uniform, planes / Voronoi, planes / equal: the max is one sliver cell of the float topology ).
+* Against the GENERIC double path on the same tree ( `--witness=generic`, n = 1e5 planes, before the last fixes ): float median 6.4e-15, p99.99
   3.8e-10, max 6.7e-6 ( Voronoi ), 4.4e-15 / 5.8e-10 / 2.7e-6 ( equal volumes ); double median 6.4e-15, max 1.3e-13 /
   2.2e-13. The max of the float kernel is a sliver whose topology the float decides ( its share of the cell's volume ).
   At 1e6 the generic witness does not fit next to what the card's other users hold ( a 16 GB scratch ): the uniform row is
