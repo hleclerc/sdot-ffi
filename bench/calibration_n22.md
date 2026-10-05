@@ -98,10 +98,92 @@ How it got there ( planes / Voronoi, planes / equal, float ):
   per-level launches; not optimized.
 * The tree on the card in 3D: 13-40 ms at 1e6 ( the old host build: 498 ms ).
 
-## What remains ( stage 2 )
+## What remained after step 1
 
-* The 3D Newton solve on the card: `Newton2D.cuh`'s structure ( the cells with `FACETS`, the assembly, the linear solve,
-  the step ) on these cells; the multigrid in 3D with `nu = 1` smoothing ( old doc/06-ce-qui-reste.md l.451: 15.1 non-zeros
-  per row in 3D against 6.0 in 2D ); the `limits` step needs the volume polynomial along the direction ( `EDGES` in 2D ),
-  which 3D does not have ( the CPU's 3D has `trials` only ).
+* The 3D Newton solve on the card: done in step 2, below.
 * Faster cuts: the old doc's ideas ( survivors in place, fewer `rank` / `nth` calls ) and the walk order on clustered clouds.
+
+# 3D step 2: the Newton solve on the card ( 2026-10-05 )
+
+`gpu/Newton2D.cuh::solve` now takes a 3D diagram: ONE solver for both dimensions, the dimension read from the diagram. What
+depends on it: the cards ( `SolveCard`: `Cell2D.cuh`'s or `Cell3D.cuh`'s `Card`, which got the 2D interface -- `prepare` with
+shared last-pass slots, `lend` for the double kernel's and the moments' cards ), the majorants' records
+( `Majorant3D.cuh::MajorantsN`, the walk's float nodes written by the refresh itself ), the weights packed into the kernel's
+seeds ( `Cell3D.cuh::pack_seed_weights` ), the box. The laplacian ( `Laplacian2D.cuh`, its rows sorted in registers up to 32
+entries in 3D ), the card multigrid ( `Linear2D.cuh` ), the damping, the aggregation, the memory check are the same code.
+`SdotPlanNd._build_card` takes 3D against a constant density; `step = 'limits'` stays 2D ( refused in 3D, as on the CPU ),
+a 3D density is refused with a clear `NotImplementedError`.
+
+## The numbers ( `bench_newton --dim=3`, errand queue, `rtol = 1e-6`, cold start, min of 3; seconds, the JITTED call )
+
+| case | n | it / diag | mixed ( default ) | float | double | t_diag / t_lin ( mixed ) | CPU lmo, 8 threads ( `calibration_lmo_today.md` ) | CPU / card |
+|---|---|---|---|---|---|---|---|---|
+| uniform 3D | 1e5 | 5 / 6 | **0.135** | 0.135 | 0.424 | 0.075 / 0.037 | 2.29 | **17x** |
+| planes / Voronoi | 1e5 | 9 / 17 | **0.473** | 0.474 | 2.079 | 0.357 / 0.072 | 6.67 | **14x** |
+| planes / equal volumes | 1e5 | 9 / 17 | **0.469** | 0.470 | 2.054 | 0.358 / 0.073 | ( the same cloud ) | - |
+| uniform 3D | 1e6 | 5 / 6 | **1.308** | 1.244 ( before the float moments ) | - | 0.853 / 0.253 | - | - |
+| uniform 3D | 1e7 | 9 / 16 | 55.3 ( eager ) | - | - | 39.2 / 5.4 | - | - |
+
+At 1e7 the FLOAT KERNEL STAGNATES at iteration 6 ( its cuts decided in float, cells of 4.6e-3 in a unit box ): the mixed solve
+switches to the double kernel there and converges ( to 5e-12 relative ), but the double diagrams ( 6.3 s each, 630 ns / seed )
+and the double moments ( 6.9 s ) take half of it; 13 float diagrams of 1.54 s ( 154 ns / seed ). The jitted call at 1e7 failed
+to load XLA's own kernels ( `CUDA_ERROR_OUT_OF_MEMORY` outside the pool: not reproduced, the other card's user may hold memory on
+this one ) -- not investigated further.
+
+The iterations and diagrams are the CPU's ( 5 / 6 and 9 / 17, the same switch of the residual at it 1 / 4, the same 7
+backtracks on the planes ): the card's multigrid gives directions within its tolerance of the CPU's, the same decisions.
+Eager calls cost ~0.09 s more ( Python, the tree's call ). The old campaign has no 3D Newton on the GPU.
+
+Where the time goes ( uniform 1e6, mixed, kernel-only 1.29 s ): the cells 0.85 s ( 6 diagrams, 141 ms = 141 ns / seed: the
+cells of step 1, weighted ), the linear solves 0.25 s ( 124 multigrid iterations, CUDA graphs ), the moments' last walk 0.14
+s, the rest ( majorants 16 ms, assembly 21 ms, reductions ) under 0.06 s. On the planes the diagrams are 21 ms each ( 210 ns /
+seed: the weighted cells of the clustered cloud ), 75 % of the solve.
+
+THE MULTIGRID IN 3D ( float levels, smoothed first level, K-cycle, Chebyshev ): the packets and the degree swept together, as
+the old campaign said to ( `t_lin` / linear iterations, planes / Voronoi 1e5, float kernel ):
+
+| | `nu = 1` | `nu = 2` |
+|---|---|---|
+| packets of 4 | 0.079 s / 146 | 0.105 s / 120 |
+| packets of 8 | **0.073 s / 196** | 0.089 s / 155 |
+
+and on uniform 1e6: packets of 4 0.258 s ( 87 it ), of 8 **0.246 s** ( 124 it ). So in 3D: packets of 8, `nu = 1` -- the
+old campaign's CPU optimum, and the card's 2D choice stays packets of 4 ( `SdotPlanNd._CARD_MG_PACK`, `_CARD_MG_NU`, per
+dimension; `Tuning( mg_pack, mg_nu )` override them ). More iterations, cheaper cycles: the bandwidth decides.
+
+THE MOMENTS of a mixed solve in float: the double kernel's 3D walk costs four float ones ( 56 against 12 ms at 1e5 ), and
+the moments were taken by it even when the float kernel finished the solve. Now a 3D mixed solve takes them with the kernel
+it finished with ( `it_double = -1`: float ): uniform 1e5 0.182 -> 0.135 s, planes 0.575 -> 0.473 s. ( 2D is unchanged: its
+moments stay in double. )
+
+## Accuracy ( `test_SdotPlanNd`, 3D section: the card's plan against the CPU's, `tol = 1e-10 / n` )
+
+* uniform 3000 seeds, varied masses: the weights 1.7e-15 apart ( relative to max |w| ), the cost 5.3e-15, the barycentres
+  1.1e-14 of a cell; the measures of the card's weights through the PLAIN storage within 1e-8 / n of the targets; the float,
+  mixed, CG, host Cholesky, double-level and plain-aggregation variants within 3.3e-16 of each other;
+* seeds outside the cube ( the similarity start ): 2.6e-16;
+* planes 6000 seeds, equal volumes ( mixed ) and varied masses ( fp64 ): 3.8e-15 / 1.8e-15, the same iterations and diagrams
+  as the CPU ( 8 / 17, 8 / 13 );
+* `bench_newton --case=planes_equal`: the old campaign's equal-volume weights found again to 9.7e-13 ( mixed ) / 6.6e-14 ( double );
+* the aggregation ( `_degenerate_clouds( 3 )`: exact pairs, triples, pairs 1e-9 and 1e-12 apart ): the clusters of the CPU, each
+  cluster's mass within the tolerance ( fp64 and mixed );
+* eager == jit to the bit ( the masses traced, then the positions too: the tree in the program ).
+
+THE FLOAT KERNEL ALONE ( `precision = 'fp32'` ) floors at ~3e-8 relative on a 2e5 uniform cloud ( it stagnates at 1e-8 / n
+there ): the mixed default switches to the double kernel when that happens, as in 2D.
+
+## Memory ( `CardMemory.card_solve_bytes( dim = 3 )` )
+
+The 3D parts: no finish store nor edges, 32-byte seeds, `card_facet_capacity( n, 3 ) = 10 n + 1024` upper facets ( 7.8 per
+seed on a uniform cloud: room for denser clouds, an overflow being an error under `jit` ), the coarse matrices at 11 entries
+per fine unknown with packets of 8. Measured at 2e5 seeds ( `stats[ "scratch_bytes" ]` ): mixed 2295.4 bytes per seed taken /
+2293.5 modelled, fp64 double levels 2264.0 / 2261.5, fp32 2171.8 / 2169.9, CG 2015.6 / 2015.3 ( at 2e5 the last pass's fixed
+256 MB budget is 1280 of them; ~1300 bytes per seed at 1e6 ). A solve that does not fit raises the clear `MemoryError` at once, eager and while tracing.
+
+## What remains
+
+* The cells are 65-75 % of a 3D solve: the faster cuts above are now the lever.
+* The `limits` step in 3D: the volume of a cell along `w + t d` is a cubic while its topology holds ( each vertex is the
+  crossing of three planes whose offsets are affine in `t` ), but the cells would have to keep their faces ( ~90 cut
+  identifiers per cell ) for the polynomial passes; on the planes it could save some of the 7 backtracks of 17 diagrams.
+* Densities in 3D ( an image, gaussians ): the cells integrate a constant only.

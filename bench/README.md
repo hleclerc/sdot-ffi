@@ -72,8 +72,9 @@ micromamba --root-prefix ~/.mamba run -n prj-jax errand -k bench --env jax --no-
 
 On `lmo` (an rsync of the whole `~/Projects` tree to `/home/leclerc/Projects-rsync`, environments
 `lmo-numpy`, `lmo-torch`, `lmo-jax` of `errand-envs.py`). `lmo-numpy` is the CPU (by construction); `lmo-jax` is the GPU
-environment: there `bench_diagram` times the card's cells and `bench_newton` the card's solve ( 2D, a box; a constant
-density, an image or gaussians, the width continuation: `gpu/Newton2D.cuh` ), see "On the GPU" below.
+environment: there `bench_diagram` times the card's cells and `bench_newton` the card's solve ( a box; in 2D a constant
+density, an image or gaussians, the width continuation; in 3D a constant density and the step `trials`: `gpu/Newton2D.cuh` ),
+see "On the GPU" below.
 
 ```bash
 errand -k bench --env lmo-numpy "bench_diagram" --case=uniform --dim=2 --n=1000000 --threads=8 --pin=yes --kernel=double --reps=3
@@ -146,6 +147,7 @@ errand -k bench --env lmo-numpy bench_newton --case=lines_voronoi --step=limits 
 errand -k bench --env lmo-jax bench_newton --case=lines_voronoi --step=limits --compare=/tmp/w_cpu_lv.npy        # the plans
 errand -k bench --env lmo-jax bench_newton --case=uniform --dim=2 --mg-smoothed=0                    # the card's multigrid, plain aggregation
 errand -k bench --env lmo-jax bench_newton --case=uniform --dim=2 --jit=no --reps=1 --lin-dump=/home/leclerc/lindump/u1e5   # the linear systems to files
+errand -k bench --env n22-jax bench_newton --case=uniform,planes_voronoi,planes_equal --dim=3 --kernel=mixed,float,double  # 3D ( `calibration_n22.md` )
 ```
 
 THE CARD'S LINEAR SOLVER ALONE ( `calibration_lmo_today.md`, "GPU step 5" ): `--lin-dump=prefix` writes every system a Newton
