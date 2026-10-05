@@ -40,11 +40,16 @@ def _levels( n, shift, stop ):
 
 
 def card_solve_bytes( n, nb_nodes = None, precision = "mixed", linear = "mg", mg_float = True, recycle = 2, shift = 2, smoothed = 1,
-                      stop = 64, overflow_bytes = 0, max_iter = 100, keep_weights = False ):
+                      stop = 64, overflow_bytes = 0, max_iter = 100, keep_weights = False, jitted = False ):
     """the bytes the card's solve of `n` seeds takes, PER PART: a dict `{ name: bytes }`. `nb_nodes`: the tree's ( `None`: the
     one `AaBsp` builds for `n` ); `precision`: the kernels ( `fp32`, `fp64`, `mixed` -- `auto` is `mixed` on the card );
     `linear`: `mg`, `cg` or `host`; `overflow_bytes`: the fourth pass's slots ( `Cell2D.cuh::Overflow`, given by the caller
-    who chose them ). The parts `tree` and `outputs` are the XLA buffers of the calls, the others the solve's scratch."""
+    who chose them ). The parts `tree` and `outputs` are the XLA buffers of the calls, the others the solve's scratch.
+
+    `jitted`: the check runs while TRACING, so `memory_stats()` cannot see the program's own buffers, which XLA takes when the
+    program starts: its arguments and constants ( the positions and the masses, traced or not ), the masses normalized, the
+    weights it returns. The part `jitted program` counts them from the shapes, 40 bytes per seed: measured on the card at
+    1e7 seeds ( `memory_analysis()` of the jitted solve: 1355 MB of XLA buffers where `tree` + `outputs` say 1000 )."""
     from .AaBsp import AaBsp
     n = int( n )
     N = int( nb_nodes ) if nb_nodes is not None else AaBsp.max_nb_nodes_for( n )
@@ -82,6 +87,8 @@ def card_solve_bytes( n, nb_nodes = None, precision = "mixed", linear = "mg", mg
     # the XLA buffers: the tree's tensors ( `AaBsp` ) and the solve's outputs ( and its inputs: the target, the start )
     p[ "tree" ] = 24 * n + ( 32 + 16 + 24 ) * N
     p[ "outputs" ] = ( 8 + 8 + 16 + 8 + 8 + 8 ) * n + 24 * N + ( ( int( max_iter ) + 1 ) * 8 * n if keep_weights else 0 )
+    if jitted:
+        p[ "jitted program" ] = ( 16 + 8 + 8 + 8 ) * n          # positions, masses, normalized masses, the weights returned
     return p
 
 

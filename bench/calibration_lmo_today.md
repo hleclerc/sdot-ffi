@@ -1315,3 +1315,62 @@ vectors 40, majorants 27, overflow slots 10; plus the tree's and the outputs' XL
   model says -- then the call refuses after one wait of the pool, with its message.
 * Under `jax.jit` the program's own buffers are not seen at trace time: the check passes and the call may still refuse.
 * 1e7 fits the 2080 Ti with ~60 MB to spare: the edges of the two diagram slots ( 128 B / seed ) are the next thing to shrink.
+
+
+# Robustness ( 2026-10-05 ): ring cells, the `lines_equal` floor, the jitted memory check
+
+## 1. The generic cell path got ring cells wrong ( CPU and GPU alike )
+
+* Reproducer: a seed in the middle of a ring of 300 seeds ( `test_CardCells._ring`, seed 10 ): the generic BSP path gives a NaN
+  cell ( CPU, register kernel ) or a wrong area ( GPU, memory kernel: 5.4e-5 instead of 6.0e-4 ); the float kernel NaN cells and a
+  sum of the measures off by 1.5e-3 - 3.7e-3. The plain storage was right.
+* Cause: the bisectors of seeds on a circle all go through its centre, and the tree proposes the ring seeds BEFORE the centre
+  seed ( closest boxes first ). A ring cell is then for a while a fan of vertices within 1e-14 of the centre; the next ring
+  bisector passes through them, their signs are noise, and the outside comes in SEVERAL cyclic runs ( traced: s = + + -1.7e-18
+  +2.6e-18 +2.6e-18 ... ). `Local2::cut_impl` took them as one run ( the inside anchor was outside: `s3 == s2`, 0 / 0 ); the
+  register kernel's `ctz` picked mismatched ends. The plain storage cuts by the centre ( seed 0 ) first and never sees it.
+* Fix: the card's `Cell2D.cuh::main_run`, ported: the run that holds the farthest vertex is the cut, the others are on the plane
+  and stay. `Local2::cut_impl` checks the run it found ( walks it, stops at the first hole ); `Engine2Reg::step` tests
+  `starts & ( starts - 1 )` and sends such a cut to the memory excursion ( no call in the loop: a `noinline` helper there cost
+  3 % on `lines_equal` ). CPU diagram, local M-series 8 threads, ns / cell, before / after: uniform 1e6 104 / 103-104,
+  lines voronoi 116-117 / 116-119, lines equal 463-466 / 463-464.
+* Test: `test_PowerDiagram::the_accelerator_survives_concurrent_bisectors` ( BSP against the plain storage, both kernels, four
+  rings; fails before the fix: cell 227 at 100 % ), run on the CPU and on n22's card ( the generic GPU path ). The NaN mask of
+  `test_SdotPlanNd::the_card_solve_on_rings_in_batches_and_past_the_limit` is gone. ( `test_CardCells._check( plain = True )`
+  and the `broken` set of `the_card_laplacian_is_the_generic_one` could now go back to the generic path: not touched, that file
+  is being edited for the 3D cells. )
+
+## 2. `lines_equal` stagnates at 2.35e-6: the floor of the weights' double, now reached without 30 wasted diagrams
+
+* The old campaign never converged there either ( `solvers_des_familles` § 23.3-23.11: STAGNATION 2.35e-6 with every step and
+  linear solver; only the deduplicated cloud or the agglomeration converged, and the agglomeration's answer is not a weight vector ).
+* Measured on our final weights: the worst cells are the pair 75020 / 82077, 1.009e-8 apart ( w = -0.10976 ). ONE ulp of w_i
+  ( 1.4e-17 ) moves 5.4e-11 of mass between them, 5.4e-6 of their target: at the representable optimum the residual is
+  +2.351e-11 ( 0 ulp ) or -3.047e-11 ( -1 ulp ) -- 2.35e-6 relative IS the best a double weight vector can do ( the card's
+  3.05e-6 of step 5 was the neighbouring ulp ). Not the precision of the measures, not the linear solver.
+* What was wrong is the cost: at that point the damping halved t down to `t_min` ( 30-34 diagrams of a 53-diagram solve ),
+  the merit falling by 2.6 % of itself along `d` where it must fall by t / 2. New ( `sdotplan/Report.h::HopelessDamping`, CPU
+  `Newton.h` and card `Newton2D.cuh` ): two refused trials in a row whose secant slopes agree and extrapolate under `nr / 4`
+  ( the test needs `nr / 2` ) stop the halving -- STAGNATION, same weights, same residual.
+* CPU ( local M-series, 8 threads, min of 3, s; before / after ): lines equal limits 13 / 53 -> 13 / 22, 4.09 -> 2.60; trials
+  16 / 67 -> 16 / 50, 5.12 -> 4.33. Unchanged: uniform 6 / 7 ( 0.58 / 0.56 ), lines voronoi limits 12 / 19 ( 2.16 / 2.15 ),
+  trials 14 / 32 ( 2.97 / 2.96 ).
+* Card ( n22, `--step=limits --jit=yes`, min of 3, jit wall, s; before / after ): lines equal double 15 / 49 -> 15 / 18,
+  1.443 -> 0.667; mixed 26 / 218 -> 17 / 35, 2.197 -> 0.697 ( the float phase stagnated 192 backtracks long before its switch
+  to double ). Unchanged: lines voronoi 12 / 13 ( 0.497 / 0.492 double, 0.284 / 0.285 mixed ), uniform 5 / 6 ( 0.097 / 0.098,
+  0.071 / 0.072 ).
+* Not done: converging there needs the agglomeration of near-coincident seeds ( `Iterative( aggregate = ... )`, not wired ),
+  whose output is not a weight vector ( § 23.11-23.12 ).
+
+## 3. The jitted solve's memory check
+
+* Reproduced on n22 with the pool of an emulated small card ( `XLA_PYTHON_CLIENT_MEM_FRACTION=0.1542`: 7.85 GB ), uniform 1e7,
+  mixed, the bench's jit ( positions constant, masses argument ): the check passed ( model 7.66 GB ) and the call refused after
+  10.4 s ( RESOURCE_EXHAUSTED, 6.07 GB taken ). `memory_analysis()` of the program: 1355 MB of XLA buffers ( arguments 80,
+  constants 160, outputs 80, temp 1035 ) where the model's `tree` + `outputs` say 1000: the program's inputs and returned
+  weights, ~35 B / seed.
+* Fix: while tracing ( positions or masses traced ), `card_solve_bytes( jitted = True )` adds a part `jitted program`, 40 B /
+  seed from the shapes; the recycle fallback then gives up the multigrid's recycled solutions first. Same pool: the jitted
+  solve runs ( 6.3 s, peak 7.74 GB, no recycled solution ); 7.30 GB pool: `MemoryError` in 0.05 s. Eager unchanged.
+* Test: `test_SdotPlanNd::the_card_memory_check_counts_the_jitted_program` ( pure Python, the pool faked ).
+* Risk: buffers of the user's own program around the solve ( other arrays it computes ) are still invisible while tracing.

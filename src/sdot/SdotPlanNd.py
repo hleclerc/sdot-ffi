@@ -299,7 +299,9 @@ class SdotPlanNd:
         # ON THE CARD, what the solve will take from the card, checked before anything is launched ( `CardMemory.py` )
         self._card_mg_recycle = None
         if on_card and d == 2:
-            self._card_mg_recycle = self._check_card_memory( int( src_dist.nb_diracs.value ), settings )
+            traced = any( driver.is_traced( getattr( x, "raw", x ) ) for x in ( src_dist.positions, src_dist.weights )
+                          if getattr( x, "is_defined", True ) )
+            self._card_mg_recycle = self._check_card_memory( int( src_dist.nb_diracs.value ), settings, jitted = traced )
 
         accelerator = tun.accelerator
         pos_raw = getattr( src_dist.positions, "raw", src_dist.positions )
@@ -459,13 +461,15 @@ class SdotPlanNd:
                      keep_weights = bool( settings.keep_weights ) )
 
     @staticmethod
-    def _check_card_memory( n, settings ):
+    def _check_card_memory( n, settings, jitted = False ):
         """THE CARD'S MEMORY, before the tree and the solve ( `CardMemory.check_card_memory` ): a `MemoryError` that says what
         to do when the solve of `n` seeds does not fit in what XLA's pool has left. A VARIANT is chosen here when it helps: the
         multigrid's recycled solutions ( 16 bytes per seed each ) are given up, one then the other, before refusing -- unless
-        `mg_recycle` was set. Returns the recycled solutions to ask the card for ( `None`: the default )."""
+        `mg_recycle` was set. Returns the recycled solutions to ask the card for ( `None`: the default ). `jitted`: while
+        tracing, the program's own buffers are counted from the shapes ( `card_solve_bytes( jitted = True )` ), which the pool
+        cannot show yet -- so that a jitted solve gives up its recycled solutions, or refuses, BEFORE XLA's ten seconds."""
         from .CardMemory import check_card_memory
-        kw = SdotPlanNd._card_memory_kw( n, settings )
+        kw = { **SdotPlanNd._card_memory_kw( n, settings ), "jitted": bool( jitted ) }
         if kw[ "linear" ] != "mg" or settings.tuning.mg_recycle is not None:
             check_card_memory( n, **kw )
             return None

@@ -750,8 +750,8 @@ if test( "the_card_solve_on_rings_in_batches_and_past_the_limit" ):
             assert plan.converged, ( precision, plan.stats )
             w = numpy.asarray( plan.weights ).reshape( -1 )
             g = _generic_measures( pos, w )
-            ok = ~numpy.isnan( g )                                # ( the generic path's NaN cells on rings, see `test_CardCells` )
-            assert numpy.abs( g[ ok ] - 1 / n ).max() < 1e-7 / n, ( precision, numpy.abs( g[ ok ] - 1 / n ).max() * n )
+            # ( the generic path is a reference on rings too since its cut picks the run of the farthest vertex: `Local2::cut_impl` )
+            assert numpy.abs( g - 1 / n ).max() < 1e-7 / n, ( precision, numpy.abs( g - 1 / n ).max() * n )
             wj = jax.jit( lambda m: solve( m ).weights.raw )( numpy.ones( n ) )
             assert numpy.array_equal( numpy.asarray( wj ).reshape( -1 ), w ), precision
     finally:
@@ -994,6 +994,32 @@ if test( "the_card_memory_model_follows_the_solve" ):
         took, model = plan.stats[ "scratch_bytes" ], _card_scratch_model( n, it )
         print( f"  { name }: took { took / n :.1f} bytes per seed, model { model / n :.1f}" )
         assert abs( model - took ) < 0.08 * took, ( name, took, model )
+
+
+if test( "the_card_memory_check_counts_the_jitted_program" ):
+    # pure Python ( the pool is faked ): while tracing, the pool cannot show the jitted program's own buffers ( positions,
+    # masses, the weights returned: 40 bytes per seed ); the check counts them, and a pool that holds the eager solve just
+    # makes the jitted one give up its recycled solutions -- at 1e7 seeds on a 7.85 GB pool, before: RESOURCE_EXHAUSTED
+    # after XLA's 10 s, after: the solve runs with no recycled solution ( `calibration_lmo_today.md`, step 10 )
+    import sdot.CardMemory as cm
+    from sdot.SdotPlanNd import SdotPlanNd
+    n, it = 10_000_000, Iterative( tol = 1e-6 / 10_000_000, max_iter = 30 )
+    kw = SdotPlanNd._card_memory_kw( n, it )
+    eager = sum( cm.card_solve_bytes( n, **kw ).values() )
+    assert sum( cm.card_solve_bytes( n, **kw, jitted = True ).values() ) - eager == 40 * n
+    original = cm.card_pool
+    try:
+        cm.card_pool = lambda: ( eager + 10 * n, 0 )
+        assert SdotPlanNd._check_card_memory( n, it ) is None                      # the default: two recycled solutions
+        assert SdotPlanNd._check_card_memory( n, it, jitted = True ) == 0          # 40 B / seed more: none of them ( 16 B each )
+        cm.card_pool = lambda: ( eager - 33 * n, 0 )
+        try:
+            SdotPlanNd._check_card_memory( n, it, jitted = True )
+            raise AssertionError( "a jitted solve that does not fit went through" )
+        except MemoryError:
+            pass
+    finally:
+        cm.card_pool = original
 
 
 if test( "the_card_finish_store_by_chunks_gives_the_same_plan" ):
