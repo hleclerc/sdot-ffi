@@ -814,6 +814,30 @@ if test( "the_accelerator_survives_concurrent_bisectors" ):
             assert abs( m.sum() - 1 ) < ( 1e-12 if kernel == "FP64" else 1e-6 ), ( seed, k, kernel, m.sum() )
 
 
+if test( "the_generic_cell_survives_almost_coincident_seeds" ):
+    # two seeds closer than the precision, seen from a third one: their two bisectors with it coincide to
+    # rounding, so the second cut passes through the face the first one just made and sees the signs of
+    # its vertices as noise ( `LocalN::on_the_plane` ). The outside came in several runs per face, and the
+    # 3D cell came out with the wrong measure: the sum off by 1e-1 ( FP64, seeds 1e-9 apart ) or 5 ( FP32 ).
+    # The same with two seeds AT THE SAME PLACE whose weights differ by less than 1e-14 ( NaN at 1e-18 ).
+    # Both orders of cutting ( the plain sweep, the tree ), both kernels.
+    rng = numpy.random.default_rng( 0 )
+    pos0 = rng.uniform( 0, 1, size = ( 600, 3 ) )
+    target = Image( values = numpy.ones( ( 4, 4, 4 ) ) )
+    cases = [ ( f"delta={delta}", pos0[ 5 ] + delta * numpy.ones( 3 ) / numpy.sqrt( 3 ), 0.0 ) for delta in ( 1e-6, 1e-8, 1e-9, 1e-12, 1e-15 ) ]
+    cases += [ ( f"gap={gap}", pos0[ 5 ], gap ) for gap in ( 1e-12, 1e-16, 1e-18 ) ]
+    for name, p7, w7 in cases:
+        pos = pos0.copy()
+        pos[ 7 ] = p7
+        w = numpy.zeros( len( pos ) )
+        w[ 7 ] = w7
+        for kernel, tol in ( ( "FP64", 1e-12 ), ( "FP32", 1e-6 ) ):
+            for acc in ( "plain", None ):
+                m = _measures( PowerDiagram( pos, w, distribution = target, kernel_dtype = kernel, accelerator = acc ) )
+                assert not numpy.isnan( m ).any(), ( name, kernel, acc )
+                assert abs( m.sum() - 1 ) < tol, ( name, kernel, acc, m.sum() )
+
+
 if test( "an_unbounded_diagram_falls_back_to_the_full_sweep" ):
     # without a domain, a cell is not the hull of its vertices as long as it is not
     # bounded, so there is nothing to prune against: the walk must visit everything, and the

@@ -25,9 +25,9 @@
 //
 // THE ASSUMPTION: each vertex is on EXACTLY `D` planes ( general position ). This is what makes
 // the cut purely combinatorial: two new vertices of the created face are neighbors exactly
-// when they share `D - 2` OLD cuts. A plane that goes exactly through a vertex does not
-// remove it ( strict `s > 0` ), which is the only concession made to degenerate
-// configurations.
+// when they share `D - 2` OLD cuts. A plane that goes through a vertex -- exactly, or within a
+// band of a few ulps ( `on_the_plane` ) -- does not remove it, which is the only concession made
+// to degenerate configurations.
 //
 // THE CUT FILLS THE HOLES: vertices that are outside leave free slots, the new vertices
 // settle into them, and the survivors keep their index -- so their adjacency stays valid
@@ -370,18 +370,81 @@ struct LocalN {
 #endif
     }
 
-    HD int nb_outside( const PlaneT &p ) const { return signed_distances( p, nullptr ); }
+    /// the number of vertices `cut` would remove ( same classification, band included )
+    HD int nb_outside( const PlaneT &p ) const {
+        const int strict = signed_distances( p, s );
+        return strict ? on_the_plane( p, first_band() ) : 0;
+    }
+
+    // ---- "ON THE PLANE": a band, not a sign ---------------------------------------------------
+    //
+    // The cut is combinatorial, and it is only right if the outside set is one a plane can carve:
+    // on each face, the outside vertices make ONE run. In the kernel's float, a plane that comes
+    // within rounding of a face of the cell -- the bisectors of two seeds closer than the precision
+    // seen from a third one, or two seeds at the same place whose weights differ by 1e-16 -- sees
+    // the signs of that face's vertices as noise: several runs, new vertices that match three
+    // others or none, and a cell that ends up with the wrong measure ( or NaN ). So a vertex is
+    // outside only BEYOND a band of a few ulps of the terms of its dot product; inside the band it
+    // is on the plane, and stays ( what `s == 0` already did ). What the band ignores is a sliver
+    // of the size of the rounding.
+    //
+    // The band is not a proof: a vertex whose distance is near the band's edge can still flip. The
+    // matching of the new vertices sees it ( a new vertex must find exactly `D - 1` neighbors on
+    // the new face ), and the cut is then redone with a wider band -- nothing is committed before.
+
+    HD static TK first_band() { return TK( 16 ) * std::numeric_limits<TK>::epsilon(); }
+
+    /// `s[ i ] = 0` for the vertices that are outside but within `band` of the plane ( relative to
+    /// the magnitude of the terms of `dir . v_i - off` ). Returns the number still outside. Only
+    /// runs on a cut that has something to remove, never on the common `UNCHANGED` path.
+    HD int on_the_plane( const PlaneT &p, TK band ) const {
+        const TK ao = p.off < 0 ? - p.off : p.off;
+        int nb_out = 0;
+        for ( int i = 0; i < nv; ++i ) {
+            if ( ! ( s[ i ] > 0 ) )
+                continue;
+            TK mag = ao;
+            for ( int d = 0; d < D; ++d ) {
+                const TK t = p.dir[ d ] * v[ d ][ i ];
+                mag += t < 0 ? - t : t;
+            }
+            if ( s[ i ] <= band * mag )
+                s[ i ] = 0;
+            else
+                ++nb_out;
+        }
+        return nb_out;
+    }
 
     HD int cut_impl( const PlaneT &p ) {
-        const int nb_out = signed_distances( p, s );
-        if ( nb_out == 0 )
+        if ( signed_distances( p, s ) == 0 )
             return CutStatus::UNCHANGED;
-        if ( nb_out == nv ) {
-            nv = 0; nc = 0;
-            unbounded = false;
-            return CutStatus::EMPTY;
-        }
 
+        // the widest band, 1024 times the first one, is 4e-12 relative in double and 2e-3 in float:
+        // past it, the cut is dropped rather than made inconsistent
+        TK band = first_band();
+        for ( int attempt = 0; attempt < 3; ++attempt, band *= 32 ) {
+            const int nb_out = on_the_plane( p, band );
+            if ( nb_out == 0 )
+                return CutStatus::UNCHANGED;
+            if ( nb_out == nv ) {
+                nv = 0; nc = 0;
+                unbounded = false;
+                return CutStatus::EMPTY;
+            }
+            const int r = cut_classified( p );
+            if ( r != INCONSISTENT )
+                return r;
+        }
+        return CutStatus::UNCHANGED;
+    }
+
+    /// what `cut_classified` returns when the outside set is not one a plane can carve ( see
+    /// `on_the_plane` ); the cell is then untouched
+    static constexpr int INCONSISTENT = -1;
+
+    /// the cut proper, `s` classified ( `> 0`: outside ), at least one vertex on each side
+    HD int cut_classified( const PlaneT &p ) {
         if ( nc >= cap ) {
             compact();
             if ( nc >= cap )
@@ -441,6 +504,7 @@ struct LocalN {
             for ( int r = 0; r + 1 < D; ++r )
                 nn_[ r ][ i ] = -1;
             nn_[ D - 1 ][ i ] = rec_v[ i ];
+            m[ i ] = 0;                                  // how many face neighbors it found
         }
         for ( int i = 0; i < nm; ++i ) {
             int ki[ D - 1 ];
@@ -472,7 +536,17 @@ struct LocalN {
                 }
                 nn_[ ai ][ i ] = dest[ j ];
                 nn_[ bj ][ j ] = dest[ i ];
+                ++m[ i ];
+                ++m[ j ];
             }
+        }
+        // a plane-carved outside gives each new vertex exactly one neighbor per inherited cut
+        for ( int i = 0; i < nm; ++i ) {
+            bool ok = m[ i ] == D - 1;
+            for ( int r = 0; r + 1 < D; ++r )
+                ok &= nn_[ r ][ i ] >= 0;
+            if ( ! ok )
+                return INCONSISTENT;
         }
 
         // ---- COMMIT. Nothing has moved so far.
