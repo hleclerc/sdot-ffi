@@ -1548,6 +1548,20 @@ __global__ void __launch_bounds__( BLOCK ) pack_seeds( SI n, Strided<TF,2> pos, 
         out[ k ] = SeedD{ x, y, z, v };
 }
 
+/// NEW WEIGHTS INTO THE KERNEL'S SEEDS ( the card's Newton: `w` in ranks, a double per seed ), the positions left alone
+template<class TK>
+__global__ void __launch_bounds__( BLOCK ) pack_seed_weights( SI n, const double *w, Seed<TK> *out ) {
+    const SI k = SI( blockIdx.x ) * blockDim.x + threadIdx.x;
+    if ( k >= n )
+        return;
+    const double v = w[ k ];
+    if constexpr ( std::is_same_v<TK,float> ) {
+        out[ k ].wh = __double2float_rn( v );
+        out[ k ].wl = __double2float_rn( v - double( out[ k ].wh ) );
+    } else
+        out[ k ].w = v;
+}
+
 // ---- the host side ------------------------------------------------------------------------------------------------
 
 /// THE THIRD PASS'S BUDGET: `warps` slots of `capv` vertices in global memory, taken once per call ( Python's choice,
@@ -1557,6 +1571,7 @@ __global__ void __launch_bounds__( BLOCK ) pack_seeds( SI n, Strided<TF,2> pos, 
 /// waits for a slot to be free: a matter of speed on rare cells, never a reason to run again.
 struct Slots {
     unsigned char *ptr = nullptr;
+    SI             bytes = 0;                            ///< what `ptr` holds
     int            capv = 0, capc = 0, warps = 0;
 
     static Slots sized( SI n, int warps, int max_vertices ) {
@@ -1567,7 +1582,25 @@ struct Slots {
         return o;
     }
     template<class TK,class TR>
-    SI bytes() const { return MemCell<TK,TR>::bytes_for( capv, capc ) * warps; }
+    SI bytes_for() const { return MemCell<TK,TR>::bytes_for( capv, capc ) * warps; }
+
+    /// room for the slots of a `< TK, TR >` cell from the pool ( `false`: the pool said no )
+    template<class TK,class TR>
+    bool take_from( auto &allocator ) {
+        bytes = bytes_for<TK,TR>();
+        ptr = static_cast<unsigned char *>( take( allocator, bytes ) );
+        return ptr != nullptr;
+    }
+};
+
+/// WHAT A CARD OF THE CALL MAY BORROW FROM ANOTHER ( the card's Newton, `Newton2D.cuh`: the float kernel's card, the double
+/// one's, the moments' ): the node records ( written by the majorants, float for every kernel ), the passes' lists, and the
+/// packed seeds of the same kernel float. `nullptr`: taken.
+template<class TR>
+struct CardShare3 {
+    const void *nodes = nullptr;
+    const void *seeds = nullptr;
+    TR         *lists = nullptr;
 };
 
 /// THE DIAGRAM ON THE CARD, for one call: the kernel's tree and seeds, the lists and counters of the passes, the slots of
@@ -1588,6 +1621,13 @@ struct Card {
 
     /// `false`: the pool said no ( `allocator.failed` is reported )
     bool prepare( const CudaQueue &queue, const auto &pd, auto &allocator, int max_vertices, int overflow_warps ) {
+        return prepare( queue, pd, allocator, Slots::sized( SI( pd.nb_seeds() ), overflow_warps, max_vertices ) );
+    }
+
+    /// `slots_`: the third pass's slots, already taken ( shared with another card of the call: they must hold this card's
+    /// cells, `bytes_for< TK, TR >` ), or only sized ( `ptr == nullptr` ): taken here. `share`: what is borrowed from another
+    /// card of the call instead of taken ( `CardShare3` ). `false`: the pool said no.
+    bool prepare( const CudaQueue &queue, const auto &pd, auto &allocator, Slots slots_, const CardShare3<TR> &share = {} ) {
         static_assert( std::decay_t<decltype( pd )>::ct_dim == 3, "the 3D cells of the card" );
         const SI n = SI( pd.nb_seeds() );
         nb_nodes = SI( pd.tree.node_begin.shape( 0 ) );
@@ -1597,13 +1637,18 @@ struct Card {
         if ( depth > V::MAX_HEIGHT || ( std::is_same_v<typename V::TN,int> && nb_nodes > SI( 0x7fffffff ) )
                                    || ( std::is_same_v<TR,int> && n > SI( 0x7fffffff ) - 8 ) )
             throw std::runtime_error( "sdot::gpu3d: the variant chosen does not hold this tree ( see `PowerDiagram_Bsp._card_variant` )" );
-        slots = Slots::sized( n, overflow_warps, max_vertices );
-        slots.ptr = static_cast<unsigned char *>( take( allocator, slots.template bytes<TK,TR>() ) );
-        auto *nodes = static_cast<Node<W,TR> *>( take( allocator, SI( sizeof( Node<W,TR> ) ) * std::max<SI>( nb_nodes, 1 ) ) );
-        auto *seeds = static_cast<SeedT *>( take( allocator, SI( sizeof( SeedT ) ) * std::max<SI>( n, 1 ) ) );
-        lists    = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * 2 * std::max<SI>( n, 1 ) ) );
+        slots = slots_;
+        if ( slots.ptr && slots.bytes < slots.template bytes_for<TK,TR>() )
+            throw std::runtime_error( "sdot::gpu3d: shared slots too small for this card" );
+        if ( ! slots.ptr && ! slots.template take_from<TK,TR>( allocator ) )
+            return false;
+        auto *nodes = share.nodes ? static_cast<Node<W,TR> *>( const_cast<void *>( share.nodes ) )
+                                  : static_cast<Node<W,TR> *>( take( allocator, SI( sizeof( Node<W,TR> ) ) * std::max<SI>( nb_nodes, 1 ) ) );
+        auto *seeds = share.seeds ? static_cast<SeedT *>( const_cast<void *>( share.seeds ) )
+                                  : static_cast<SeedT *>( take( allocator, SI( sizeof( SeedT ) ) * std::max<SI>( n, 1 ) ) );
+        lists    = share.lists ? share.lists : static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * 2 * std::max<SI>( n, 1 ) ) );
         counters = static_cast<Counters *>( take( allocator, SI( sizeof( Counters ) ) ) );
-        if ( ! slots.ptr || ! nodes || ! seeds || ! lists || ! counters )
+        if ( ! nodes || ! seeds || ! lists || ! counters )
             return false;
         pb.nodes   = nodes;
         pb.seeds   = seeds;
@@ -1620,12 +1665,23 @@ struct Card {
         pb.counters = counters;
         static const bool only_global = std::getenv( "SDOT_CARD_GLOBAL_ONLY" ) && *std::getenv( "SDOT_CARD_GLOBAL_ONLY" ) != '0';
         pb.only_global = only_global;
-        refresh( queue, pd );
+        // what is borrowed is the lender's to fill ( and may already hold more recent values than the diagram's tensors )
+        refresh( queue, pd, ! share.nodes, ! share.seeds );
         return true;
     }
 
+    /// what another card of the call may borrow from this one ( `CardShare3` ): the nodes, the lists, and with `seeds` the
+    /// packed seeds ( a card of the same kernel float )
+    CardShare3<TR> lend( bool seeds ) const {
+        CardShare3<TR> s;
+        s.nodes = pb.nodes;
+        s.lists = lists;
+        if ( seeds ) s.seeds = pb.seeds;
+        return s;
+    }
+
     /// the kernel's tree and seeds from the diagram's tensors
-    void refresh( const CudaQueue &queue, const auto &pd ) {
+    void refresh( const CudaQueue &queue, const auto &pd, bool nodes = true, bool seeds = true ) {
         using TB = std::remove_const_t<typename std::decay_t<decltype( pd.tree.node_box )>::TF>;
         using TJ = std::remove_const_t<typename std::decay_t<decltype( pd.tree.node_begin )>::TF>;
         Strided<TF,2> wa{};
@@ -1634,10 +1690,12 @@ struct Card {
             wa = strided( pd.tree.node_wa );
             wb = strided( pd.tree.node_wb );
         }
-        launch_kernel( queue, &make_nodes<W,TR,TB,TJ>, blocks_for( nb_nodes ), BLOCK, 0, nb_nodes, strided( pd.tree.node_box ), wa, wb,
-                       strided( pd.tree.node_begin ), strided( pd.tree.node_end ), const_cast<Node<W,TR> *>( pb.nodes ) );
-        launch_kernel( queue, &pack_seeds<TK,W,TF>, blocks_for( SI( pb.n ) ), BLOCK, 0, SI( pb.n ), pb.pos64, pb.w64,
-                       const_cast<SeedT *>( pb.seeds ) );
+        if ( nodes )
+            launch_kernel( queue, &make_nodes<W,TR,TB,TJ>, blocks_for( nb_nodes ), BLOCK, 0, nb_nodes, strided( pd.tree.node_box ), wa, wb,
+                           strided( pd.tree.node_begin ), strided( pd.tree.node_end ), const_cast<Node<W,TR> *>( pb.nodes ) );
+        if ( seeds )
+            launch_kernel( queue, &pack_seeds<TK,W,TF>, blocks_for( SI( pb.n ) ), BLOCK, 0, SI( pb.n ), pb.pos64, pb.w64,
+                           const_cast<SeedT *>( pb.seeds ) );
     }
 
     /// THE PASSES. `errors`: the kernel form of loom's error buffer

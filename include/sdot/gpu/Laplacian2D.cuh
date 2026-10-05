@@ -159,11 +159,13 @@ __global__ void __launch_bounds__( BLOCK ) lap_fill( const TR *fi, const TR *fj,
 
 /// the rows of up to `SORT_R` entries are sorted in REGISTERS ( an odd-even transposition network, every index a
 /// compile-time constant ), the others in place ( insertion ): sorting in place in global memory, one read-modify-write
-/// per move, cost 2.8 ms at n = 1e6 -- more than the whole rest of the assembly
+/// per move, cost 2.8 ms at n = 1e6 -- more than the whole rest of the assembly. 16 in 2D ( six neighbours on average ),
+/// 32 in 3D ( fifteen: a third of the rows past 16 )
 constexpr int SORT_R = 16;
 
-template<class TP,class TC,class TV>
+template<class TP,class TC,class TV,int R = SORT_R>
 __global__ void __launch_bounds__( BLOCK ) lap_sort( const TP *row, TC *col, TV *val, TV *dia, SI n ) {
+    constexpr int SORT_R = R;
     const SI i = SI( blockIdx.x ) * blockDim.x + threadIdx.x;
     if ( i >= n )
         return;
@@ -235,7 +237,8 @@ void assemble_laplacian_in( const CudaQueue &queue, const CardT &card, const Lap
     exclusive_scan( queue, ws.sums, static_cast<const TP *>( ws.cnt ), row, n + 1 );
     cuda_check( cudaMemcpyAsync( ws.at, row, sizeof( TP ) * n, cudaMemcpyDeviceToDevice, queue.stream ), "copy of the row starts" );
     launch_kernel( queue, &lap_fill<typename CardT::TR,TP,TC,TV>, grid, BLOCK, 0, card.pb.fi, card.pb.fj, card.pb.fc, card.counters, card.pb.fcap, ws.at, col, val );
-    launch_kernel( queue, &lap_sort<TP,TC,TV>, blocks_for( n ), BLOCK, 0, row, col, val, dia, n );
+    constexpr int R = requires { card.pb.seeds; } ? 2 * SORT_R : SORT_R;      // ( a 3D card: `Cell3D.cuh` )
+    launch_kernel( queue, &lap_sort<TP,TC,TV,R>, blocks_for( n ), BLOCK, 0, row, col, val, dia, n );
 }
 
 /// the same, its workspace taken from the call's pool; `false` if the pool said no

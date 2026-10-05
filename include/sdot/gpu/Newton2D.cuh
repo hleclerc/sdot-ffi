@@ -1,8 +1,16 @@
 #pragma once
 
 // =====================================================================================
-// THE TRANSPORT SOLVED ON THE CARD ( 2D, a box; a constant density, an image or gaussians ): what `sdotplan/Solve.h` +
-// `Newton.h` do on the CPU, for the `SdotPlanNd` of a CUDA driver, in ONE ffi call -- so it runs under `jax.jit` like in eager.
+// THE TRANSPORT SOLVED ON THE CARD ( 2D or 3D, a box; in 2D a constant density, an image or gaussians, in 3D a constant ):
+// what `sdotplan/Solve.h` + `Newton.h` do on the CPU, for the `SdotPlanNd` of a CUDA driver, in ONE ffi call -- so it runs
+// under `jax.jit` like in eager.
+//
+// ONE SOLVER FOR BOTH DIMENSIONS ( `solve`, the dimension read from the diagram ): what depends on it is the cells
+// ( `Cell2D.cuh`'s or `Cell3D.cuh`'s `Card`, the same interface: `prepare`, `lend`, `run`; `SolveCard` picks one ), the
+// majorants' records ( `Majorants`, `gpu3d::MajorantsN` ), the weights packed for the kernel ( `pack_card_weights` ), the
+// box's corners. The laplacian ( `Laplacian2D.cuh` ), the linear solver ( `Linear2D.cuh`, any CSR ), the damping, the
+// aggregation are the same code. In 3D: the step is `trials` ( the cells keep no edges for the volume polynomials ), the
+// density a constant ( `SdotPlanNd._build_card` refuses the rest ).
 //
 // The handler is HOST code ( loom's `FfiCode.inline` ): it drives the Newton loop and launches everything on the call's
 // stream. The vectors live on the card, IN TREE RANKS ( the order of `sorted_positions`, of the facets, of the
@@ -56,7 +64,9 @@
 //
 // = What it does not do ( yet )
 //
-//   * 3D, other domains than a box, the neighbour memory; an image on a rotated or irregular grid.
+//   * other domains than a box, the neighbour memory; an image on a rotated or irregular grid; in 3D the step `limits`
+//     ( the volume along the direction is cubic per cell while its topology holds, but the cells would have to keep their
+//     faces ) and the densities.
 //
 // = Failures
 //
@@ -68,6 +78,8 @@
 // =====================================================================================
 
 #include "Majorant2D.cuh"
+#include "Majorant3D.cuh"
+#include "Cell3D.cuh"
 #include "Linear2D.cuh"
 #include "DensityHost2D.cuh"
 #include "../sdotplan/Report.h"
@@ -75,6 +87,7 @@
 #include "../sdotplan/Aggregation.h"
 #include <cmath>
 #include <cstdio>
+#include <type_traits>
 #include <vector>
 
 namespace sdot::gpu2d {
@@ -280,22 +293,32 @@ __global__ void __launch_bounds__( BLOCK ) scale_values( SI n, double *x, double
     if ( i < n ) x[ i ] *= f;
 }
 
+/// a translation, by value ( a kernel argument )
+struct Shift3 { double v[ 3 ]; };
+
 /// THE SIMILARITY START ( `Solve.h::similarity` ): the Voronoi of the cloud contracted and translated into the box, as weights
-template<class TF>
-__global__ void __launch_bounds__( BLOCK ) similarity_weights( SI n, Strided<TF,2> pos, double a, double b0, double b1, double *w ) {
+template<int DIM,class TF>
+__global__ void __launch_bounds__( BLOCK ) similarity_weights( SI n, Strided<TF,2> pos, double a, Shift3 b, double *w ) {
     const SI k = SI( blockIdx.x ) * BLOCK + threadIdx.x;
     if ( k >= n )
         return;
+    // ( the expressions written out per dimension: the same roundings, hence the same start, as the CPU's `Solve.h::similarity`
+    // -- which of the Voronoi and the similarity starts may hang on a cell of 1e-17 on an image with a hole )
     const double x = double( pos( k, 0 ) ), y = double( pos( k, 1 ) );
-    const double qx = a * x + b0, qy = a * y + b1;
-    w[ k ] = x * x + y * y - ( qx * qx + qy * qy ) / a;
+    const double qx = a * x + b.v[ 0 ], qy = a * y + b.v[ 1 ];
+    if constexpr ( DIM == 2 )
+        w[ k ] = x * x + y * y - ( qx * qx + qy * qy ) / a;
+    else {
+        const double z = double( pos( k, 2 ) ), qz = a * z + b.v[ 2 ];
+        w[ k ] = x * x + y * y + z * z - ( qx * qx + qy * qy + qz * qz ) / a;
+    }
 }
 
-template<class TF>
+template<int DIM,class TF>
 struct ExtentOf {
     Strided<TF,2> pos;
-    __device__ void operator()( SI k, Extent2 &acc ) const {
-        for ( int d = 0; d < 2; ++d ) {
+    __device__ void operator()( SI k, ExtentN<DIM> &acc ) const {
+        for ( int d = 0; d < DIM; ++d ) {
             const double v = double( pos( k, d ) );
             acc.lo[ d ] = fmin( acc.lo[ d ], v );
             acc.hi[ d ] = fmax( acc.hi[ d ], v );
@@ -777,6 +800,26 @@ struct Slot {
     Report    rep{};                                     ///< its last report ( host )
 };
 
+/// THE CARDS OF THE SOLVE by dimension: `Cell2D.cuh`'s ( `OUT` as asked, the density `D` ) or `Cell3D.cuh`'s ( a constant
+/// density; no `EDGES`: the 3D step is `trials` )
+template<int DIM,class V,unsigned OUT,class TF,class TI,class D> struct SolveCard;
+template<class V,unsigned OUT,class TF,class TI,class D> struct SolveCard<2,V,OUT,TF,TI,D> { using type = Card<V,true,OUT,TF,TI,D>; };
+template<class V,unsigned OUT,class TF,class TI,class D> struct SolveCard<3,V,OUT,TF,TI,D> { using type = gpu3d::Card<V,true,OUT & ~EDGES,TF,TI>; };
+
+/// the walk's node records of a card, writable ( the majorants write them )
+template<class C>
+auto *node_records( const C &c ) { return const_cast<std::remove_const_t<std::remove_pointer_t<decltype( c.pb.nodes )>> *>( c.pb.nodes ); }
+
+/// the weights `w` ( ranks, doubles ) into the kernel's seeds of card `c` ( 2D: the weights apart; 3D: in the seeds' records )
+template<class C>
+void pack_card_weights( const CudaQueue &queue, C &c, SI n, const double *w ) {
+    using TK = typename C::TK;
+    if constexpr ( requires { c.pb.seeds; } )
+        launch_kernel( queue, &gpu3d::pack_seed_weights<TK>, blocks_for( n ), BLOCK, 0, n, w, const_cast<gpu3d::Seed<TK> *>( c.pb.seeds ) );
+    else
+        launch_kernel( queue, &pack_weights<TK>, blocks_for( n ), BLOCK, 0, n, w, const_cast<typename C::Wt *>( c.pb.w ) );
+}
+
 /// THE SOLVE ( see the header ). `pd`: the diagram ( its tree, its positions; its weights are not read ); `nu_in`, `w0_in`:
 /// user order; `dups_in`: the exact duplicates, `( dup, rep )` user pairs flattened ( the first `O_AGG_NB_DUPS` pairs );
 /// `opts_in`: `NB_OPTS` reals. Outputs as `sdotplan::solve`, plus the diagram's `sorted_weights_out`,
@@ -801,9 +844,12 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     using DH = typename DensityHostOf<std::decay_t<decltype( dens_in )>>::type;
     using D  = typename DH::Dev;
     constexpr bool CONST = std::is_same_v<D,DensConst>;
-    using CardT = Card<V,true,MEASURES | FACETS | EDGES,TF,TI,D>;
-    using CardD = Card<VD,true,MEASURES | FACETS | EDGES,TF,TI,D>;
-    using MomT  = Card<VD,true,MEASURES | MOMENTS,TF,TI,D>;
+    constexpr int DIM = PD::ct_dim;                      // ( 3D: `Cell3D.cuh`'s cells, a constant density, the `trials` step )
+    static_assert( DIM == 2 || DIM == 3, "the card's solve is 2D or 3D" );
+    static_assert( DIM == 2 || CONST, "the card's 3D solve integrates a constant density" );
+    using CardT = typename SolveCard<DIM,V,MEASURES | FACETS | EDGES,TF,TI,D>::type;
+    using CardD = typename SolveCard<DIM,VD,MEASURES | FACETS | EDGES,TF,TI,D>::type;
+    using MomT  = typename SolveCard<DIM,VD,MEASURES | MOMENTS,TF,TI,D>::type;
     constexpr bool MIXED = ! std::is_same_v<V,VD>;       // the float kernel first, the double one once the float stagnates
     static_assert( std::is_same_v<typename V::TR,typename VD::TR> && std::is_same_v<typename V::TN,typename VD::TN>, "one tree, one rank type" );
     static_assert( std::is_same_v<TF,double>, "the card's solver works on float64 positions" );
@@ -841,11 +887,13 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
 
     // ---- the fourth pass's slots, ONE budget for every card of the solve ( they run one after the other ), sized for the
     // largest cell form ( the double kernel's, MIXED )
-    Overflow overflow = Overflow::sized( n, overflow_warps, max_vertices );
+    using Ovf = std::conditional_t<DIM == 2, Overflow, gpu3d::Slots>;
+    Ovf overflow = Ovf::sized( n, overflow_warps, max_vertices );
     overflow.bytes = std::max( overflow.template bytes_for<typename V::TK,TR>(), overflow.template bytes_for<typename VD::TK,TR>() );
-    overflow.slots = static_cast<unsigned char *>( take( allocator, overflow.bytes ) );
-    if ( ! overflow.slots )
+    unsigned char *ovf_ptr = static_cast<unsigned char *>( take( allocator, overflow.bytes ) );
+    if ( ! ovf_ptr )
         return;
+    if constexpr ( DIM == 2 ) overflow.slots = ovf_ptr; else overflow.ptr = ovf_ptr;
 
     // ---- the density ( `DensityHost2D.cuh` ): a constant, or the image / gaussians as given ( `s = 0` )
     DH dh;
@@ -908,14 +956,16 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     TR *coo_i = reinterpret_cast<TR *>( coo + SI( sizeof( double ) ) * fcap ), *coo_j = coo_i + fcap;
     for ( Slot<TR> &s : slots ) {
         s.fi = coo_i; s.fj = coo_j; s.fc = coo_c;
-        if ( ! ( s.a = vec( n ) ) || ! ( s.counters = static_cast<Counters *>( take( allocator, SI( sizeof( Counters ) ) ) ) ) ||
-             ! ( s.edges = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * EDGE_CAP * n ) ) ) ||
-             ! ( s.nb_edges = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * n ) ) ) )
+        if ( ! ( s.a = vec( n ) ) || ! ( s.counters = static_cast<Counters *>( take( allocator, SI( sizeof( Counters ) ) ) ) ) )
             return;
+        if constexpr ( DIM == 2 )                        // ( the cuts of each cell, for the step `limits`: 2D only )
+            if ( ! ( s.edges = static_cast<TR *>( take( allocator, SI( sizeof( TR ) ) * EDGE_CAP * n ) ) ) ||
+                 ! ( s.nb_edges = static_cast<int *>( take( allocator, SI( sizeof( int ) ) * n ) ) ) )
+                return;
     }
     Slot<TR> *cur = &slots[ 0 ], *tri = &slots[ 1 ];
     const Slot<TR> *coo_of = nullptr;                    // the slot whose facets the COO holds
-    Majorants<TR,TN> maj;
+    std::conditional_t<DIM == 2, Majorants<TR,TN>, gpu3d::MajorantsN<3,TR,TN>> maj;
     if ( ! maj.prepare( allocator, pd ) )
         return;
 
@@ -929,7 +979,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     RedSlot<Max1> redm;
     RedSlot<Min1> red_min;
     RedSlot<MinCount> red_mc;
-    RedSlot<Extent2> red_ext;
+    RedSlot<ExtentN<DIM>> red_ext;
     if ( ! nu || ! w || ! w2 || ! d || ! b || ! gauge || ! r0_dev || ! rep_dev || ! red_diag.take_from( allocator ) || ! red1.take_from( allocator )
          || ! red2.take_from( allocator ) || ! redm.take_from( allocator ) || ! red_min.take_from( allocator ) || ! red_mc.take_from( allocator )
          || ! red_ext.take_from( allocator ) )
@@ -1083,16 +1133,15 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
             launch_kernel( queue, &tie_duplicates, blocks_for( agg_nb_dups ), BLOCK, 0, agg_nb_dups, ( const SI * ) dup_dev, ( const SI * ) drep_dev,
                            ( const double * ) gap_dev, const_cast<double *>( wt ) );
         tm_maj.start( queue );
-        maj.refresh( queue, pd, wt, const_cast<Node<true,TR> *>( card.pb.nodes ) );
+        maj.refresh( queue, pd, wt, node_records( card ) );
         auto run_on = [&]( auto &c ) {
-            using C = std::decay_t<decltype( c )>;
-            launch_kernel( queue, &pack_weights<typename C::TK>, blocks_for( n ), BLOCK, 0, n, wt, const_cast<typename C::Wt *>( c.pb.w ) );
+            pack_card_weights( queue, c, n, wt );
             tm_maj.stop( queue );
             c.pb.w64 = Strided<TF,1>{ reinterpret_cast<const char *>( wt ), { SI( sizeof( double ) ) } };
             c.pb.res = StridedOut<TF,1>{ reinterpret_cast<char *>( s.a ), { SI( sizeof( double ) ) } };
             c.pb.fi = s.fi; c.pb.fj = s.fj; c.pb.fc = s.fc;
             c.counters = s.counters; c.pb.counters = s.counters;
-            c.pb.edges = s.edges; c.pb.nb_edges = s.nb_edges;
+            if constexpr ( DIM == 2 ) { c.pb.edges = s.edges; c.pb.nb_edges = s.nb_edges; }
             tm_diag.start( queue );
             c.run( queue, errors );
             tm_diag.stop( queue );
@@ -1157,13 +1206,17 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
         read_back( queue, &m, ( const Min1 * ) red_min.out, 1 );
         nu_min0 = m.m;
     }
-    double box_lo[ 2 ], box_hi[ 2 ];
-    read_back( queue, box_lo, reinterpret_cast<const double *>( pd.box_min.data().raw ), 2 );
-    read_back( queue, box_hi, reinterpret_cast<const double *>( pd.box_max.data().raw ), 2 );
+    double box_lo[ DIM ], box_hi[ DIM ];
+    read_back( queue, box_lo, reinterpret_cast<const double *>( pd.box_min.data().raw ), DIM );
+    read_back( queue, box_hi, reinterpret_cast<const double *>( pd.box_max.data().raw ), DIM );
+    double box_diam2 = 0, box_volume = 1;
+    for ( int k = 0; k < DIM; ++k ) {
+        box_diam2 += ( box_hi[ k ] - box_lo[ k ] ) * ( box_hi[ k ] - box_lo[ k ] );
+        box_volume *= box_hi[ k ] - box_lo[ k ];
+    }
 
     // ---- THE STAGES OF THE WIDTH CONTINUATION ( `Solve.h`, `Continuation.h` ): `s0, s0 / ratio, ... >= s_min`, then `0`
-    const double s0 = o[ O_CONV_S0 ] > 0 ? o[ O_CONV_S0 ]
-                    : 0.5 * std::sqrt( ( box_hi[ 0 ] - box_lo[ 0 ] ) * ( box_hi[ 0 ] - box_lo[ 0 ] ) + ( box_hi[ 1 ] - box_lo[ 1 ] ) * ( box_hi[ 1 ] - box_lo[ 1 ] ) );
+    const double s0 = o[ O_CONV_S0 ] > 0 ? o[ O_CONV_S0 ] : 0.5 * std::sqrt( box_diam2 );
     auto the_steps = [&]() { return sp::continuation_steps( s0, o[ O_CONV_RATIO ], o[ O_CONV_MIN ] > 0 ? o[ O_CONV_MIN ] : dh.min_scale( queue ) ); };
     std::vector<double> scales = continuation == CONT_ALWAYS && dh.possible ? the_steps() : std::vector<double>{ 0.0 };
     set_stage( scales[ 0 ] );
@@ -1175,17 +1228,18 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
         if ( tri->rep.d.min_a > cur->rep.d.min_a ) { std::swap( cur, tri ); std::swap( w, w2 ); start = sp::START_VORONOI; }
     }
     if ( ! stop_all && cur->rep.d.min_a <= 0 ) {         // seeds outside the domain: the similarity
-        reduce( queue, n, ExtentOf<TF>{ pos }, red_ext.partials, red_ext.out );
-        Extent2 ext;
-        read_back( queue, &ext, ( const Extent2 * ) red_ext.out, 1 );
+        reduce( queue, n, ExtentOf<DIM,TF>{ pos }, red_ext.partials, red_ext.out );
+        ExtentN<DIM> ext;
+        read_back( queue, &ext, ( const ExtentN<DIM> * ) red_ext.out, 1 );
         double a = 1;
-        for ( int k = 0; k < 2; ++k ) {
+        for ( int k = 0; k < DIM; ++k ) {
             const double span_dom = ( box_hi[ k ] - box_lo[ k ] ) * ( 1 - 2 * 0.1 ), span_pts = std::max( ext.hi[ k ] - ext.lo[ k ], 1e-300 );
             a = std::min( a, span_dom / span_pts );
         }
-        const double b0 = ( box_lo[ 0 ] + box_hi[ 0 ] ) / 2 - a * ( ext.lo[ 0 ] + ext.hi[ 0 ] ) / 2;
-        const double b1 = ( box_lo[ 1 ] + box_hi[ 1 ] ) / 2 - a * ( ext.lo[ 1 ] + ext.hi[ 1 ] ) / 2;
-        launch_kernel( queue, &similarity_weights<TF>, blocks_for( n ), BLOCK, 0, n, pos, a, b0, b1, w2 );
+        Shift3 b{};
+        for ( int k = 0; k < DIM; ++k )
+            b.v[ k ] = ( box_lo[ k ] + box_hi[ k ] ) / 2 - a * ( ext.lo[ k ] + ext.hi[ k ] ) / 2;
+        launch_kernel( queue, &similarity_weights<DIM,TF>, blocks_for( n ), BLOCK, 0, n, pos, a, b, w2 );
         diagram( w2, *tri );
         if ( tri->rep.d.min_a > cur->rep.d.min_a ) { std::swap( cur, tri ); std::swap( w, w2 ); start = sp::START_SIMILARITY; }
     }
@@ -1199,8 +1253,9 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     launch_kernel( queue, &pick_value, 1, 1, 0, ( const double * ) w, r0, gauge );
     launch_kernel( queue, &subtract_scalar, blocks_for( n ), BLOCK, 0, w, ( const double * ) gauge, 1.0, n );
 
-    /// the scale of a facet's coefficient ( `rho l / 2 delta` with `l ~ delta` ): the density, or the mean density of the box
-    const double c_scale = CONST ? rho : 1.0 / std::max( ( box_hi[ 0 ] - box_lo[ 0 ] ) * ( box_hi[ 1 ] - box_lo[ 1 ] ), 1e-300 );
+    /// the scale of a facet's coefficient ( `rho |facet| / 2 delta` ): in 2D `l ~ delta`, the density, or the mean density of
+    /// the box; in 3D `|facet| ~ delta^2`, times the spacing of the seeds `( |box| / n )^( 1 / 3 )`
+    const double c_scale = ( CONST ? rho : 1.0 / std::max( box_volume, 1e-300 ) ) * ( DIM == 3 ? std::cbrt( box_volume / double( std::max<SI>( n, 1 ) ) ) : 1.0 );
 
     // ---- THE AGGREGATION'S DETECTION ( `Aggregation::detect` ) on the laplacian just assembled and the accepted weights
     const SI heavy_cap = 4096;
@@ -1534,7 +1589,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
             bool already = false;
             double alpha_lim = -1;
             int nb_evals = 0;
-            if ( step_kind == STEP_LIMITS ) {
+            if constexpr ( DIM == 2 ) if ( step_kind == STEP_LIMITS ) {   // ( 3D: `trials`, refused in `SdotPlanNd` )
                 const double th0 = wall_now();
                 tm_lim.start( queue );
                 if constexpr ( CONST )
@@ -1700,39 +1755,47 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     launch_kernel( queue, &scatter_ranks<TF,TI>, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, ids, strided_out<TF,1>( weights ) );
     launch_kernel( queue, &scatter_ranks<TF,TI>, blocks_for( n ), BLOCK, 0, n, ( const double * ) cur->a, ids, strided_out<TF,1>( masses ) );
     launch_kernel( queue, &write_strided<TF>, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, strided_out<TF,1>( sorted_weights_out ) );
-    maj.refresh( queue, pd, w, const_cast<Node<true,TR> *>( card.pb.nodes ), strided_out<TF,2>( node_wa_out ), strided_out<TF,1>( node_wb_out ) );
-    CardD *cmom_p = nullptr;                             // the moments in the double kernel's form ( mixed ), or the one kernel's
-    if constexpr ( MIXED ) cmom_p = &cardd; else cmom_p = &card;
-    CardD &cmom = *cmom_p;
-    launch_kernel( queue, &pack_weights<typename VD::TK>, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, const_cast<typename CardD::Wt *>( cmom.pb.w ) );
-
+    maj.refresh( queue, pd, w, node_records( card ), strided_out<TF,2>( node_wa_out ), strided_out<TF,1>( node_wb_out ) );
     // ---- THE MOMENTS on the TRUE density ( `s = 0`, whatever stage the solve stopped at ) at the fitted weights ( barycentres,
-    // the cost ), a last walk
-    if ( ! stop_all ) {
+    // the cost ), a last walk -- by the double kernel ( mixed in 2D, or once a 3D mixed solve switched to it ), or by the one
+    // kernel of the solve. A 3D mixed solve that the float kernel finished takes them in float: its vertices are re-solved
+    // in double like the cells it converged on, and a double 3D walk costs four float ones ( 56 against 12 ms at 1e5 )
+    auto moments_on = [&]( auto &cm, auto mom_type ) {
+        using M = typename decltype( mom_type )::type;
+        pack_card_weights( queue, cm, n, ( const double * ) w );
+        if ( stop_all )
+            return;
         // the moments' card borrows the one of its kernel ( nodes, seeds, lists, finish store ), and writes its measures
         // and costs in the trial's measures and the direction, free now
-        MomT mom;
+        M mom;
         double *mres = tri->a, *mcost = d;
-        if ( mom.prepare( queue, pd, allocator, overflow, cmom.lend( true ) ) ) {
-            if constexpr ( CONST )
-                set_density( mom.pb, dens_in );
-            else {
-                dh.at( queue, 0, true );
-                mom.pb.dens = dh.dev;
-            }
-            mom.pb.nodes = card.pb.nodes;
-            mom.pb.w = cmom.pb.w;
-            mom.pb.w64 = Strided<TF,1>{ reinterpret_cast<const char *>( w ), { SI( sizeof( double ) ) } };
-            mom.pb.user_order = true;
-            mom.pb.res = StridedOut<TF,1>{ reinterpret_cast<char *>( mres ), { SI( sizeof( double ) ) } };
-            mom.pb.bary = strided_out<TF,2>( bary );
-            mom.pb.cost = StridedOut<TF,1>{ reinterpret_cast<char *>( mcost ), { SI( sizeof( double ) ) } };
-            mom.run( queue, errors );
-            reduce( queue, n, SumOf{ mcost }, red1.partials, red1.out );
-            cuda_check( cudaMemcpyAsync( const_cast<void *>( ( const void * ) cost.data().raw ), red1.out, sizeof( double ),
-                                         cudaMemcpyDeviceToDevice, queue.stream ), "copy of the cost" );
+        if ( ! mom.prepare( queue, pd, allocator, overflow, cm.lend( true ) ) )
+            return;
+        if constexpr ( CONST )
+            set_density( mom.pb, dens_in );
+        else {
+            dh.at( queue, 0, true );
+            mom.pb.dens = dh.dev;
         }
-    }
+        mom.pb.nodes = card.pb.nodes;
+        if constexpr ( DIM == 2 ) mom.pb.w = cm.pb.w;     // ( 3D: the seeds, borrowed )
+        mom.pb.w64 = Strided<TF,1>{ reinterpret_cast<const char *>( w ), { SI( sizeof( double ) ) } };
+        mom.pb.user_order = true;
+        mom.pb.res = StridedOut<TF,1>{ reinterpret_cast<char *>( mres ), { SI( sizeof( double ) ) } };
+        mom.pb.bary = strided_out<TF,2>( bary );
+        mom.pb.cost = StridedOut<TF,1>{ reinterpret_cast<char *>( mcost ), { SI( sizeof( double ) ) } };
+        mom.run( queue, errors );
+        reduce( queue, n, SumOf{ mcost }, red1.partials, red1.out );
+        cuda_check( cudaMemcpyAsync( const_cast<void *>( ( const void * ) cost.data().raw ), red1.out, sizeof( double ),
+                                     cudaMemcpyDeviceToDevice, queue.stream ), "copy of the cost" );
+    };
+    if constexpr ( ! MIXED )
+        moments_on( card, std::type_identity<MomT>{} );
+    else if constexpr ( DIM == 3 ) {
+        if ( use_double ) moments_on( cardd, std::type_identity<MomT>{} );
+        else              moments_on( card, std::type_identity<typename SolveCard<DIM,V,MEASURES | MOMENTS,TF,TI,D>::type>{} );
+    } else
+        moments_on( cardd, std::type_identity<MomT>{} );
 
     // ---- the capacity of the facets ( written into its ShapeVar: past it, loom runs the call again or raises )
     launch_kernel( queue, &set_shape_var<std::decay_t<decltype( sdot::kernel_form( queue, MutList(), work.nb_facets ) )>>, 1, 1, 0,

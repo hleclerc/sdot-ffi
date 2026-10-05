@@ -441,6 +441,21 @@ def card_overflow_warps_for( variant, nb_seeds, max_vertices, warps = 64, max_by
     return int( max( 4, min( int( warps ), fit ) ) )
 
 
+def card_overflow_slot_bytes( variant, nb_seeds, max_vertices ):
+    """the bytes of ONE slot of the last pass ( `Cell2D.cuh::WarpCell::bytes_for`, `Cell3D.cuh::MemCell::bytes_for` ) for
+    this variant: what `CardMemory` counts per slot"""
+    tk, tr = variant.split( "<" )[ 1 ].split( "," )[ :2 ]
+    fk, fr = ( 4 if tk.strip() == "float" else 8 ), ( 4 if tr.strip() == "int" else 8 )
+    if "gpu3d" in variant:
+        capv = max( 64, min( int( max_vertices ), 2 * int( nb_seeds ) + 8 ) )
+        capc = capv // 2 + 64
+        a16 = lambda b: ( b + 15 ) // 16 * 16
+        return ( 6 * a16( fk * capv ) + 4 * a16( 12 * capv ) + a16( fk * capv ) + a16( 4 * capv ) + 3 * a16( 8 * capv )
+                 + a16( fr * capc ) + 2 * a16( 4 * capc ) + a16( 32 * capc ) )
+    cap = max( 4, min( int( max_vertices ), int( nb_seeds ) + 4 ) )
+    return cap * ( 5 * fk + 2 * fr )
+
+
 def card_nnz_capacity( nb_seeds, dim = 2 ):
     """the first guess of the laplacian's entries: a planar graph has at most `3 n - 6` edges, each in two rows ( a
     float topology may add a few slivers: the margin, and loom grows it if it was not enough ); a 3D Laguerre graph has

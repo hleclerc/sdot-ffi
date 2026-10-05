@@ -33,7 +33,8 @@ run on the card, and the host only reads back the scalars it decides on -- so th
 tree itself is one more card call just before ( `gpu/Bsp2D.cuh`, `AaBsp._init_on_card` ): under `jax.jit` it is part of
 the jitted program, built at every call, from traced positions as well as from constant ones. It
 takes 2D problems in a box against a constant density, an `Image` on a regular grid or isotropic gaussians, with the width
-continuation of the CPU; anything else raises on a card ( the CPU solves it ).
+continuation of the CPU, and 3D problems in a box against a constant density ( the step `trials`, as on the CPU; the cells of
+`gpu/Cell3D.cuh` ); anything else raises on a card ( the CPU solves it ).
 
 = The starting point
 
@@ -232,12 +233,24 @@ def _card_linear_solves( row, col, val, dia, rhs, method = "mg", tol = 1e-6, smo
 #: the precision of the card multigrid's levels by default ( the outer flexible CG is in double either way ): float, the
 #: same iteration counts as double and 1.15-1.4x faster ( `calibration_lmo_today.md`, GPU step 5 )
 _CARD_MG_PRECISION = "float"
+#: the card multigrid's aggregates ( seeds per packet of tree ranks ) and Chebyshev degree, per dimension, when the tuning
+#: does not say: 2D `calibration_lmo_today.md` ( GPU step 5 ), 3D `calibration_n22.md` ( 3D step 2 )
+_CARD_MG_PACK = { 2: 4, 3: 8 }
+_CARD_MG_NU = { 2: 1, 3: 1 }
 
 
-def card_facet_capacity( nb_seeds ):
-    """the first guess of the upper facets of a 2D diagram ( a planar graph: at most `3 n - 6` edges, and a margin for the
-    slivers of a float topology ); loom grows it if a diagram wants more"""
+def card_facet_capacity( nb_seeds, dim = 2 ):
+    """the first guess of the upper facets of a diagram: in 2D a planar graph, at most `3 n - 6` edges, and a margin for the
+    slivers of a float topology; in 3D no bound, 7.8 per seed on a uniform cloud ( 15.5 neighbours ), FACET_RATIO_3D with
+    room for the denser clouds. Eagerly loom grows it if a diagram wants more; under a `jit` that is an error, hence the room"""
+    if int( dim ) == 3:
+        return int( _FACET_RATIO_3D * int( nb_seeds ) ) + 1024
     return 3 * int( nb_seeds ) + 512
+
+
+#: the upper facets per seed the card's 3D solve makes room for ( `card_facet_capacity` ): measured 7.8 on uniform clouds,
+#: 8.5 on the planes ( `calibration_n22.md`, 3D step 2 )
+_FACET_RATIO_3D = 10.0
 
 
 class _CardSolveWork( Aggregate ):
@@ -296,7 +309,7 @@ class SdotPlanNd:
 
     def _build( self, problem, settings, verbose, warm = None ):
         # two solvers: the CPU's ( `sdotplan/Solve.h`, host code on the CPU queue ) and, on a CUDA device, the card's
-        # ( `gpu/Newton2D.cuh`: 2D, a box, a constant density -- see `_build_card` ); any other device is refused
+        # ( `gpu/Newton2D.cuh`: 2D or 3D, a box -- see `_build_card` ); any other device is refused
         on_card = bool( getattr( driver.device, "is_cuda_gpu", False ) )
         if not driver.device.is_cpu and not on_card:
             raise NotImplementedError( f"SdotPlanNd: no solver for the device { driver.device } ( the CPU, or a CUDA card in 2D )" )
@@ -316,7 +329,8 @@ class SdotPlanNd:
         # the limits-based step only exists in 2D ( `sdotplan/Bounds.h` ); elsewhere, trials
         step = { "auto": "limits" if d == 2 else "trials" }.get( tun.step, tun.step )
         if step == "limits" and d != 2:
-            raise ValueError( "step = 'limits': 2D only for now ( see `sdotplan/Bounds.h` )" )
+            raise ValueError( "step = 'limits': 2D only, on the CPU as on the card ( the area polynomials along the direction, "
+                              "`sdotplan/Bounds.h`, `gpu/Newton2D.cuh`; in 3D: 'trials' or 'auto' )" )
         if step not in _STEP:
             raise ValueError( f"unknown step: { tun.step !r } ( 'auto', 'trials' or 'limits' )" )
         if tun.amg_variant not in _AMG_VARIANT:
@@ -347,10 +361,10 @@ class SdotPlanNd:
         # card, see below.
         # ON THE CARD, what the solve will take from the card, checked before anything is launched ( `CardMemory.py` )
         self._card_mg_recycle = None
-        if on_card and d == 2:
+        if on_card and d in ( 2, 3 ):
             traced = any( driver.is_traced( getattr( x, "raw", x ) ) for x in ( src_dist.positions, src_dist.weights )
                           if getattr( x, "is_defined", True ) )
-            self._card_mg_recycle = self._check_card_memory( int( src_dist.nb_diracs.value ), settings, jitted = traced )
+            self._card_mg_recycle = self._check_card_memory( int( src_dist.nb_diracs.value ), settings, jitted = traced, dim = d )
 
         accelerator = tun.accelerator
         pos_raw = getattr( src_dist.positions, "raw", src_dist.positions )
@@ -523,33 +537,31 @@ class SdotPlanNd:
         self._agg_dups = IntTensor[ Axis( ShapeVar( 2 * k ), name = "num_dup" ), dict( size = 64 ) ]( rows.reshape( -1 ) )
 
     @staticmethod
-    def _card_memory_kw( n, settings ):
+    def _card_memory_kw( n, settings, dim = 2 ):
         """what `CardMemory.card_solve_bytes` needs to know of the card's solve of `n` seeds with these `settings` ( the same
-        choices as `_build_card`: the kernels, the linear solver and its levels, the fourth pass's slots )"""
+        choices as `_build_card`: the kernels, the linear solver and its levels, the last pass's slots )"""
         from .AaBsp import AaBsp
-        from .PowerDiagram_Bsp import PowerDiagram_Bsp, card_overflow_warps_for, card_variant_for
+        from .PowerDiagram_Bsp import PowerDiagram_Bsp, card_overflow_slot_bytes, card_overflow_warps_for, card_variant_for
         tun = settings.tuning
         nodes = AaBsp.max_nb_nodes_for( n )
-        widest = card_variant_for( 32 if settings.precision == "fp32" else 64, n, nodes )
+        widest = card_variant_for( 32 if settings.precision == "fp32" else 64, n, nodes, dim )
         warps = card_overflow_warps_for( widest, n, PowerDiagram_Bsp.card_max_vertices, PowerDiagram_Bsp.card_overflow_warps,
                                          PowerDiagram_Bsp.card_overflow_bytes )
-        tk, tr = widest.split( "<" )[ 1 ].split( "," )[ :2 ]
-        per_vertex = 5 * ( 4 if tk.strip() == "float" else 8 ) + 2 * ( 4 if tr.strip() == "int" else 8 )
-        cap = max( 4, min( int( PowerDiagram_Bsp.card_max_vertices ), n + 4 ) )
-        warps = ( warps + 3 ) // 4 * 4                    # ( whole blocks of four warps, `Overflow::sized` )
+        warps = ( warps + 3 ) // 4 * 4                    # ( whole blocks of four warps, `Overflow::sized`, `Slots::sized` )
+        overflow_bytes = warps * card_overflow_slot_bytes( widest, n, PowerDiagram_Bsp.card_max_vertices )
         lin_name = tun.linear_solver
         linear = "host" if getattr( tun, "linear_host", False ) or lin_name in ( "cholesky", "amg" ) else "cg" if lin_name == "cg" else "mg"
         return dict( nb_nodes = nodes, precision = settings.precision, linear = linear,
                      mg_float = ( getattr( tun, "mg_precision", None ) or _CARD_MG_PRECISION ) == "float",
                      recycle = 2 if tun.mg_recycle is None else int( tun.mg_recycle ),
-                     shift = ( int( tun.mg_pack ).bit_length() - 1 ) if tun.mg_pack else 2,
+                     shift = int( tun.mg_pack or _CARD_MG_PACK[ dim ] ).bit_length() - 1,
                      smoothed = 1 if getattr( tun, "mg_smoothed", None ) is None else int( tun.mg_smoothed ),
                      stop = min( max( int( tun.mg_stop or 64 ), 16 ), 2048 ),
-                     overflow_bytes = warps * cap * per_vertex, max_iter = int( settings.max_iter ),
-                     keep_weights = bool( settings.keep_weights ) )
+                     overflow_bytes = overflow_bytes, max_iter = int( settings.max_iter ),
+                     keep_weights = bool( settings.keep_weights ), dim = dim )
 
     @staticmethod
-    def _check_card_memory( n, settings, jitted = False ):
+    def _check_card_memory( n, settings, jitted = False, dim = 2 ):
         """THE CARD'S MEMORY, before the tree and the solve ( `CardMemory.check_card_memory` ): a `MemoryError` that says what
         to do when the solve of `n` seeds does not fit in what XLA's pool has left. A VARIANT is chosen here when it helps: the
         multigrid's recycled solutions ( 16 bytes per seed each ) are given up, one then the other, before refusing -- unless
@@ -557,7 +569,7 @@ class SdotPlanNd:
         tracing, the program's own buffers are counted from the shapes ( `card_solve_bytes( jitted = True )` ), which the pool
         cannot show yet -- so that a jitted solve gives up its recycled solutions, or refuses, BEFORE XLA's ten seconds."""
         from .CardMemory import check_card_memory
-        kw = { **SdotPlanNd._card_memory_kw( n, settings ), "jitted": bool( jitted ) }
+        kw = { **SdotPlanNd._card_memory_kw( n, settings, dim ), "jitted": bool( jitted ) }
         if kw[ "linear" ] != "mg" or settings.tuning.mg_recycle is not None:
             check_card_memory( n, **kw )
             return None
@@ -572,9 +584,13 @@ class SdotPlanNd:
 
     def _build_card( self, pd, settings, step, verbose ):
         """THE CARD'S SOLVE ( `include/sdot/gpu/Newton2D.cuh` ): the same Newton, the same options and outputs as the CPU's, in
-        ONE ffi call whose handler drives the loop on the call's stream -- so it runs under `jax.jit` too. Taken in 2D, with
-        the BSP tree and a box domain ( `PowerDiagram_Bsp._card_takes` ); anything else is refused here rather than solved on
-        another path.
+        ONE ffi call whose handler drives the loop on the call's stream -- so it runs under `jax.jit` too. Taken in 2D and 3D,
+        with the BSP tree and a box domain ( `PowerDiagram_Bsp._card_takes` ); anything else is refused here rather than solved
+        on another path.
+
+        IN 3D ( `gpu/Cell3D.cuh`'s cells, the same solver ): a constant density, the step `trials` ( `limits` is refused in
+        `_build`, as on the CPU ), the multigrid's packets of 8 tree ranks ( `_CARD_MG_PACK` ); a mixed solve that the float
+        kernel finished takes its moments in float.
 
         The DENSITY ( `PowerDiagram_Bsp._card_solve_density`, `gpu/Density2D.cuh` ): a constant, an `Image` on a regular grid
         ( a diagonal frame, uniform knots ), or a sum of isotropic gaussians -- integrated on the cells' edges ( Green on the
@@ -592,15 +608,20 @@ class SdotPlanNd:
         tun = settings.tuning
         reason = None
         dens = None
-        if pd.dim_count != 2:
-            reason = "the card solves in 2D only ( 3D: the CPU )"
+        d = pd.dim_count
+        if d not in ( 2, 3 ):
+            reason = f"the card solves in 2D and 3D ( not { d }D )"
         elif not pd._card_takes():
             reason = "the card's cells take a box domain, the BSP tree and no neighbour memory"
         else:
             dens = pd._card_solve_density()
+            if d == 3 and dens is not None and dens[ "kind" ] != "const":
+                dens = None
             if dens is None:
                 reason = ( "the card integrates a constant density, an `Image` on a regular grid ( a diagonal frame, uniform knots, "
-                           "covering the box ) or isotropic gaussians in 2D -- not this distribution" )
+                           "covering the box ) or isotropic gaussians in 2D -- not this distribution" if d == 2 else
+                           "in 3D the card integrates a constant density only ( Lebesgue on the box, or an `Image` of equal values "
+                           "covering it ) -- not this distribution" )
         if reason is not None:
             raise NotImplementedError( f"SdotPlanNd on a CUDA device: { reason }. Use the CPU device ( LOOM_DEVICE=cpu ) "
                                        "for this problem." )
@@ -612,11 +633,11 @@ class SdotPlanNd:
         from .PowerDiagram_Bsp import card_variant_for
         nodes = int( pd.tree.nb_bsp_nodes.value )
         if settings.precision in ( "auto", "mixed" ):
-            variant = f"{ card_variant_for( 32, n, nodes ) }, { card_variant_for( 64, n, nodes ) }"
+            variant = f"{ card_variant_for( 32, n, nodes, d ) }, { card_variant_for( 64, n, nodes, d ) }"
         else:
-            variant = card_variant_for( 32 if settings.precision == "fp32" else 64, n, nodes )
-        # the cells' fourth pass: one budget for every diagram of the solve, sized on the widest kernel it runs
-        overflow_warps = pd._card_overflow_warps( card_variant_for( 32 if settings.precision == "fp32" else 64, n, nodes ) )
+            variant = card_variant_for( 32 if settings.precision == "fp32" else 64, n, nodes, d )
+        # the cells' last pass: one budget for every diagram of the solve, sized on the widest kernel it runs
+        overflow_warps = pd._card_overflow_warps( card_variant_for( 32 if settings.precision == "fp32" else 64, n, nodes, d ) )
 
         # the linear solver: the card's ( `Linear2D.cuh` ), or a CPU one of `Linear.cpp` on a copy of the laplacian
         lin_name = tun.linear_solver
@@ -627,6 +648,8 @@ class SdotPlanNd:
         pack = int( tun.mg_pack or 0 )
         if pack and ( pack & ( pack - 1 ) ):
             raise ValueError( f"mg_pack must be a power of two ( got { pack } )" )
+        if not pack and lin_kind != 2:                   # ( the card's multigrid: its packets per dimension; a host solver keeps its own )
+            pack = _CARD_MG_PACK[ d ]
         opts = [ 0.0 ] * len( _CARD_OPTIONS )
         def put( name, v ):
             opts[ _CARD_OPTIONS.index( name ) ] = float( v )
@@ -637,7 +660,7 @@ class SdotPlanNd:
         put( "amg_variant", _AMG_VARIANT[ tun.amg_variant ] ); put( "mg_shift", pack.bit_length() - 1 if pack else 0 )
         recycle = tun.mg_recycle if tun.mg_recycle is not None else getattr( self, "_card_mg_recycle", None )
         put( "mg_recycle", -1 if recycle is None else recycle ); put( "mg_rebuild", tun.mg_rebuild or 0 )
-        put( "mg_stop", tun.mg_stop or 0 ); put( "mg_nu", tun.mg_nu or 0 )
+        put( "mg_stop", tun.mg_stop or 0 ); put( "mg_nu", tun.mg_nu or ( _CARD_MG_NU[ d ] if lin_kind != 2 else 0 ) )
         put( "mg_kcycle", -1 if getattr( tun, "mg_kcycle", None ) is None else tun.mg_kcycle )
         put( "lin_maxit", 0 ); put( "trace", int( bool( verbose ) ) )
         mg_precision = getattr( tun, "mg_precision", None ) or _CARD_MG_PRECISION
@@ -706,7 +729,7 @@ class SdotPlanNd:
             barycenters = loom.out( barycenters ),
             cost = loom.out( cost ),
             clusters = loom.out( clusters ),
-            work = loom.out( work, capacities = { "nb_facets": card_facet_capacity( n ) } ),
+            work = loom.out( work, capacities = { "nb_facets": card_facet_capacity( n, d ) } ),
             **pd_kwargs,
         )
         pd._solver_weights_after( pd_produced )

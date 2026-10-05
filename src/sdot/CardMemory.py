@@ -25,9 +25,14 @@ RD = 12
 #: bytes of a node record ( `Cell2D.cuh::Node< true, TR >`, 16-aligned ) and of the majorants' work per node
 #: ( `Majorant2D.cuh::MajStats`, `MajRed` )
 NODE_BYTES, MAJ_BYTES = 48, 104 + 24
+#: the same in 3D ( `Cell3D.cuh::Node< true, TR >`, `Majorant3D.cuh::MajStatsN< 3 >`, `MajRed` )
+NODE_BYTES_3D, MAJ_BYTES_3D = 48, 152 + 24
 #: the coarse matrices of the card multigrid ( the smoothed level's `P`, `P^T`, the Galerkin products, with the 25 % room
 #: of `csr_room` ): entries per FINE unknown, measured on the uniform cloud ( 1e6 seeds: 86 MB of float entries )
 MG_COARSE_ENTRIES = 11.0
+#: ... and in 3D ( a denser graph, 15.5 neighbours per seed, but packets of 8: `SdotPlanNd._CARD_MG_PACK` ), measured on the
+#: uniform cloud ( 2e5 seeds, float and double levels: 11.2 )
+MG_COARSE_ENTRIES_3D = 11.0
 
 
 def _levels( n, shift, stop ):
@@ -40,7 +45,7 @@ def _levels( n, shift, stop ):
 
 
 def card_solve_bytes( n, nb_nodes = None, precision = "mixed", linear = "mg", mg_float = True, recycle = 2, shift = 2, smoothed = 1,
-                      stop = 64, overflow_bytes = 0, max_iter = 100, keep_weights = False, jitted = False ):
+                      stop = 64, overflow_bytes = 0, max_iter = 100, keep_weights = False, jitted = False, dim = 2 ):
     """the bytes the card's solve of `n` seeds takes, PER PART: a dict `{ name: bytes }`. `nb_nodes`: the tree's ( `None`: the
     one `AaBsp` builds for `n` ); `precision`: the kernels ( `fp32`, `fp64`, `mixed` -- `auto` is `mixed` on the card );
     `linear`: `mg`, `cg` or `host`; `overflow_bytes`: the fourth pass's slots ( `Cell2D.cuh::Overflow`, given by the caller
@@ -49,15 +54,20 @@ def card_solve_bytes( n, nb_nodes = None, precision = "mixed", linear = "mg", mg
     `jitted`: the check runs while TRACING, so `memory_stats()` cannot see the program's own buffers, which XLA takes when the
     program starts: its arguments and constants ( the positions and the masses, traced or not ), the masses normalized, the
     weights it returns. The part `jitted program` counts them from the shapes, 40 bytes per seed: measured on the card at
-    1e7 seeds ( `memory_analysis()` of the jitted solve: 1355 MB of XLA buffers where `tree` + `outputs` say 1000 )."""
+    1e7 seeds ( `memory_analysis()` of the jitted solve: 1355 MB of XLA buffers where `tree` + `outputs` say 1000 ).
+
+    `dim = 3`: the 3D solve ( `Cell3D.cuh`'s cards, no finish store nor edges, denser facets )."""
     from .AaBsp import AaBsp
+    from .SdotPlanNd import card_facet_capacity
     n = int( n )
     N = int( nb_nodes ) if nb_nodes is not None else AaBsp.max_nb_nodes_for( n )
     tr = 4 if n <= 2 ** 31 - 9 else 8
-    fcap = 3 * n + 512                                   # `SdotPlanNd.card_facet_capacity`
+    fcap = card_facet_capacity( n, dim )
     float_first = precision in ( "fp32", "mixed", "auto" )
     p = {}
     p[ "overflow slots" ] = int( overflow_bytes )
+    if int( dim ) == 3:
+        return _card_solve_bytes_3d( p, n, N, tr, fcap, precision, linear, mg_float, recycle, shift, smoothed, stop, max_iter, keep_weights, jitted )
     # the card ( `Card::prepare` ): nodes, packed seeds ( float4 + float2 or double2 + double ), two lists, the finish store
     cells = NODE_BYTES * N + 24 * n + 2 * tr * n
     if float_first:
@@ -89,6 +99,42 @@ def card_solve_bytes( n, nb_nodes = None, precision = "mixed", linear = "mg", mg
     p[ "outputs" ] = ( 8 + 8 + 16 + 8 + 8 + 8 ) * n + 24 * N + ( ( int( max_iter ) + 1 ) * 8 * n if keep_weights else 0 )
     if jitted:
         p[ "jitted program" ] = ( 16 + 8 + 8 + 8 ) * n          # positions, masses, normalized masses, the weights returned
+    return p
+
+
+def _linear_bytes( n, fcap, linear, mg_float, recycle, shift, smoothed, stop, coarse_entries ):
+    """the linear solver's part ( `CardLinear::prepare` ), see `card_solve_bytes`"""
+    if linear in ( "cg", "host" ):
+        return 0
+    tv = 4 if mg_float else 8
+    lin = 16 * int( recycle ) * n
+    if mg_float:
+        lin += 2 * fcap * 4
+    sizes = _levels( n, int( shift ), int( stop ) )
+    lin += 7 * tv * sizes[ 0 ] + sum( ( 14 * tv + 8 ) * m for m in sizes[ 1: ] )
+    lin += sum( 8 * ( sizes[ l ] + 1 ) + 8 * ( sizes[ l + 1 ] + 1 ) for l in range( min( int( smoothed ), len( sizes ) - 1 ) ) )
+    lin += int( coarse_entries * ( 4 + tv ) * n )
+    return lin
+
+
+def _card_solve_bytes_3d( p, n, N, tr, fcap, precision, linear, mg_float, recycle, shift, smoothed, stop, max_iter, keep_weights, jitted ):
+    """`card_solve_bytes` in 3D: the same takes as `Newton2D.cuh::solve` with `Cell3D.cuh`'s cards"""
+    # the cards ( `gpu3d::Card::prepare` ): node records, the packed seeds ( 32 bytes, both kernels ), two lists; mixed: the
+    # double kernel's seeds ( it borrows the rest ); the moments' card borrows everything
+    cells = NODE_BYTES_3D * N + 32 * n + 2 * tr * n
+    if precision in ( "mixed", "auto" ):
+        cells += 32 * n
+    p[ "cells" ] = cells
+    p[ "facets" ] = ( 2 * tr + 8 ) * fcap
+    p[ "diagram slots" ] = 2 * 8 * n                     # the measures of the two slots ( no edges in 3D )
+    p[ "majorants" ] = MAJ_BYTES_3D * N
+    p[ "newton vectors" ] = 5 * 8 * n
+    p[ "laplacian" ] = 8 * ( n + 1 ) + 2 * fcap * ( tr + 8 ) + 8 * n + 2 * 8 * ( n + 1 )
+    p[ "linear solver" ] = _linear_bytes( n, fcap, linear, mg_float, recycle, shift, smoothed, stop, MG_COARSE_ENTRIES_3D )
+    p[ "tree" ] = 32 * n + ( 48 + 24 + 8 ) * N
+    p[ "outputs" ] = ( 8 + 8 + 24 + 8 + 8 + 8 ) * n + 32 * N + ( ( int( max_iter ) + 1 ) * 8 * n if keep_weights else 0 )
+    if jitted:
+        p[ "jitted program" ] = ( 24 + 8 + 8 + 8 ) * n
     return p
 
 

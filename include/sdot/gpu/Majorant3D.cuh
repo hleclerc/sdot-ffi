@@ -192,6 +192,29 @@ __global__ void __launch_bounds__( BLOCK ) majorant_spread( int depth, SI n, Str
     }
 }
 
+/// STEP 3's rule for node `i`: the slope kept or dropped, the constant and its margin
+template<int D>
+__device__ __forceinline__ void majorant_of( const MajStatsN<D> &s, const MajRed &r, double ( &a )[ D ], double &wb ) {
+    double bb = s.wmax, amax = 0;
+    bool any = false;
+    for ( int d = 0; d < D; ++d ) { a[ d ] = s.a[ d ]; any |= a[ d ] != 0; }
+    const double spread = s.wmax - s.wmin;
+    if ( any ) {
+        const double rmin = gpu2d::double_of( r.rmin ), rmax = gpu2d::double_of( r.rmax );
+        const double u = 1 - double( D ) / ( s.m - 1 ), by_chance = sqrt( u > 0 ? u : 0.0 );
+        if ( rmax - rmin < 0.85 * by_chance * spread ) {
+            bb = rmax;
+            amax = gpu2d::double_of( r.amax );
+        } else
+            for ( int d = 0; d < D; ++d ) a[ d ] = 0;
+    }
+    wb = bb + 1e-6 * ( fabs( bb ) + spread + amax );
+    if ( s.m == 0 ) {
+        for ( int d = 0; d < D; ++d ) a[ d ] = 0;
+        wb = 0;
+    }
+}
+
 /// STEP 3, one thread per node: the choice of the slope, the constant and its margin
 template<int D,class TJ,class TW>
 __global__ void __launch_bounds__( BLOCK ) majorant_write( SI nb_nodes, const MajStatsN<D> *st, const MajRed *red,
@@ -199,29 +222,80 @@ __global__ void __launch_bounds__( BLOCK ) majorant_write( SI nb_nodes, const Ma
     const SI i = SI( blockIdx.x ) * BLOCK + threadIdx.x;
     if ( i >= nb_nodes )
         return;
-    const MajStatsN<D> s = st[ i ];
-    double a[ D ], bb = s.wmax, amax = 0;
-    bool any = false;
-    for ( int d = 0; d < D; ++d ) { a[ d ] = s.a[ d ]; any |= a[ d ] != 0; }
-    const double spread = s.wmax - s.wmin;
-    if ( any ) {
-        const double rmin = gpu2d::double_of( red[ i ].rmin ), rmax = gpu2d::double_of( red[ i ].rmax );
-        const double u = 1 - double( D ) / ( s.m - 1 ), by_chance = sqrt( u > 0 ? u : 0.0 );
-        if ( rmax - rmin < 0.85 * by_chance * spread ) {
-            bb = rmax;
-            amax = gpu2d::double_of( red[ i ].amax );
-        } else
-            for ( int d = 0; d < D; ++d ) a[ d ] = 0;
-    }
-    double wb = bb + 1e-6 * ( fabs( bb ) + spread + amax );
-    if ( s.m == 0 ) {
-        for ( int d = 0; d < D; ++d ) a[ d ] = 0;
-        wb = 0;
-    }
+    double a[ D ], wb;
+    majorant_of<D>( st[ i ], red[ i ], a, wb );
     for ( int d = 0; d < D; ++d )
         wa_out( i, d ) = TW( a[ d ] );
     wb_out( i ) = std::is_same_v<TW,float> ? TW( __double2float_ru( wb ) ) : TW( wb );   // rounded UP: still a majorant
 }
+
+/// STEP 3 for the card's Newton ( `Newton2D.cuh` ): the walk's float RECORDS ( `NodeT`: `Cell3D.cuh::Node< true, TR >`, box
+/// rounded outward, constant rounded up ), and the tree's tensors if `wa_out` is given ( what the diagram takes back )
+template<int D,class TB,class TJ,class TW,class NodeT>
+__global__ void __launch_bounds__( BLOCK ) majorant_write_nodes( SI nb_nodes, Strided<TB,3> box, Strided<TJ,1> beg, Strided<TJ,1> end,
+                                                                const MajStatsN<D> *st, const MajRed *red, NodeT *out,
+                                                                StridedOut<TW,2> wa_out, StridedOut<TW,1> wb_out ) {
+    const SI i = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( i >= nb_nodes )
+        return;
+    double a[ D ], wb;
+    majorant_of<D>( st[ i ], red[ i ], a, wb );
+    if ( out ) {
+        NodeT nd;
+        for ( int d = 0; d < D; ++d ) {
+            nd.lo[ d ] = __double2float_rd( double( box( i, 0, d ) ) );
+            nd.hi[ d ] = __double2float_ru( double( box( i, 1, d ) ) );
+            nd.a[ d ] = float( a[ d ] );
+        }
+        nd.b = __double2float_ru( wb );
+        nd.beg = decltype( nd.beg )( beg( i ) );
+        nd.end = decltype( nd.end )( end( i ) );
+        out[ i ] = nd;
+    }
+    if ( wa_out.p ) {
+        for ( int d = 0; d < D; ++d )
+            wa_out( i, d ) = TW( a[ d ] );
+        wb_out( i ) = std::is_same_v<TW,float> ? TW( __double2float_ru( wb ) ) : TW( wb );
+    }
+}
+
+/// THE REFRESH for a solver that redoes the majorants at every diagram ( `gpu2d::Majorants`' interface, any `D` ): the work
+/// buffers taken once, then the launches for one weight vector ( rank order ) into the walk's records
+template<int D,class TR,class TN>
+struct MajorantsN {
+    MajStatsN<D> *st = nullptr;
+    MajRed       *red = nullptr;
+    SI            nb_nodes = 0;
+    int           depth = 0;
+
+    bool prepare( auto &allocator, const auto &pd ) {
+        nb_nodes = SI( pd.tree.node_begin.shape( 0 ) );
+        depth = 0;
+        for ( SI m = nb_nodes; m; m >>= 1 )
+            ++depth;
+        st  = static_cast<MajStatsN<D> *>( take( allocator, SI( sizeof( MajStatsN<D> ) ) * std::max<SI>( nb_nodes, 1 ) ) );
+        red = static_cast<MajRed *>( take( allocator, SI( sizeof( MajRed ) ) * std::max<SI>( nb_nodes, 1 ) ) );
+        return st && red;
+    }
+
+    template<class PD,class NodeT,class TW = double>
+    void refresh( const CudaQueue &queue, const PD &pd, const double *w, NodeT *nodes, StridedOut<TW,2> wa = {}, StridedOut<TW,1> wb = {} ) const {
+        const SI n = SI( pd.nb_seeds() );
+        const auto box = strided( pd.tree.node_box );
+        const auto beg = strided( pd.tree.node_begin ), end = strided( pd.tree.node_end );
+        const auto pos = strided( pd.sorted_positions );
+        using TB = std::remove_const_t<typename std::decay_t<decltype( pd.tree.node_box )>::TF>;
+        using TJ = std::remove_const_t<typename std::decay_t<decltype( pd.tree.node_begin )>::TF>;
+        using TF = std::remove_const_t<typename std::decay_t<decltype( pd.sorted_positions )>::TF>;
+        for ( int h = 1; h <= depth; ++h ) {
+            const TN nb = TN( 1 ) << ( depth - h );
+            launch_kernel( queue, &majorant_up<D,TB,TJ,TF,TN>, int( ( SI( nb ) + BLOCK - 1 ) / BLOCK ), BLOCK, 0, depth, h, nb, box, beg, end, pos, w, st, red );
+        }
+        launch_kernel( queue, &majorant_spread<D,TJ,TF,TN>, blocks_for( n ), BLOCK, 0, depth, n, end, pos, w, ( const MajStatsN<D> * ) st, red );
+        launch_kernel( queue, &majorant_write_nodes<D,TB,TJ,TW,NodeT>, blocks_for( nb_nodes ), BLOCK, 0, nb_nodes, box, beg, end,
+                       ( const MajStatsN<D> * ) st, ( const MajRed * ) red, nodes, wa, wb );
+    }
+};
 
 /// `node_wa` / `node_wb` of the tree ( `node_box`, `node_begin`, `node_end`, preorder ) for the seeds `sorted_positions` /
 /// `sorted_weights` ( tree order ). `TN`: the node index.

@@ -128,6 +128,20 @@ struct Extent2 {
     }
 };
 
+/// the same in any dimension
+template<int D>
+struct ExtentN {
+    double lo[ D ], hi[ D ];
+    __host__ __device__ static ExtentN identity() {
+        ExtentN e;
+        for ( int d = 0; d < D; ++d ) { e.lo[ d ] = 1e300; e.hi[ d ] = -1e300; }
+        return e;
+    }
+    __device__ void combine( const ExtentN &o ) {
+        for ( int d = 0; d < D; ++d ) { lo[ d ] = fmin( lo[ d ], o.lo[ d ] ); hi[ d ] = fmax( hi[ d ], o.hi[ d ] ); }
+    }
+};
+
 // ---- elementwise helpers ----------------------------------------------------------------------------------------
 
 __global__ void __launch_bounds__( BLOCK ) fill_value( double *x, double v, SI n ) {

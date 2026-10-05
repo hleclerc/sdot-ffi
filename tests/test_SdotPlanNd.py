@@ -1064,9 +1064,10 @@ pickle.dump( out, open( sys.argv[ 2 ], "wb" ) )
 _OOM_SOLVE = """
 import os, sys, time, numpy
 from sdot import Image, Iterative, OtProblem, SumOfDiracs
-box = Image( values = numpy.ones( ( 1, 1 ) ), origin = [ 0.0, 0.0 ], frame = numpy.eye( 2 ) )
+dim = int( os.environ.get( "SDOT_TEST_DIM", "2" ) )
+box = Image( values = numpy.ones( ( 1, ) * dim ), origin = [ 0.0 ] * dim, frame = numpy.eye( dim ) )
 def solve( n, jit = False ):
-    pos = numpy.random.default_rng( 0 ).uniform( 0.001, 0.999, size = ( n, 2 ) )
+    pos = numpy.random.default_rng( 0 ).uniform( 0.001, 0.999, size = ( n, dim ) )
     it = Iterative( tol = 1e-6 / n, max_iter = 30 )
     if jit:
         import jax
@@ -1346,3 +1347,223 @@ if test( "the_card_aggregates_as_the_cpu" ):
     assert on.clusters is None and on.stats[ "status" ] == "converged", on.stats
     assert numpy.array_equal( numpy.asarray( on.weights ), numpy.asarray( off.weights ) )
     assert ( on.stats[ "nb_iter" ], on.stats[ "nb_diag" ] ) == ( off.stats[ "nb_iter" ], off.stats[ "nb_diag" ] )
+
+
+# -- ON THE CARD IN 3D ( `gpu/Newton2D.cuh` with `Cell3D.cuh`'s cells ) ------------------------------------------------------
+#
+# The same solve in 3D: a box, a constant density, the `trials` step ( the `limits` one is 2D, on the CPU as on the card ).
+# Checked against THE CPU's plan of the same problem ( `_cpu_solve`, a subprocess on the CPU device ): the same status, the
+# weights within the tolerance, the cost and the barycentres; and against the measures of the card's weights through the
+# PLAIN storage ( the generic 3D path with the BSP tree is wrong on a few cells of some clouds: `calibration_n22.md` ).
+
+_CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
+
+
+def _box_target_3d():
+    return _make_target( _CUBE )
+
+
+def _planes_cloud( n, rng, nb_planes = 4, sigma = 0.02 ):
+    """`n` seeds around `nb_planes` planes through the cube ( `bench/cases.py::planes_cloud`, the old campaign's 3D case )"""
+    pts = []
+    for _ in range( nb_planes ):
+        u = rng.normal( size = 3 )
+        u /= numpy.linalg.norm( u )
+        c = u @ numpy.full( 3, 0.5 ) + rng.uniform( -0.25, 0.25 )
+        v1 = numpy.cross( u, [ 1.0, 0.0, 0.0 ] if abs( u[ 0 ] ) < 0.9 else [ 0.0, 1.0, 0.0 ] )
+        v1 /= numpy.linalg.norm( v1 )
+        v2 = numpy.cross( u, v1 )
+        st = rng.uniform( -1.2, 1.2, size = ( 8 * n, 2 ) )
+        P = c * u + st[ :, :1 ] * v1 + st[ :, 1: ] * v2
+        P = P[ numpy.all( ( P > 0 ) & ( P < 1 ), axis = 1 ) ][ :n // nb_planes + 1 ]
+        pts.append( P + rng.normal( 0.0, sigma, size = ( len( P ), 1 ) ) * u )
+    P = numpy.concatenate( pts )
+    rng.shuffle( P )
+    return numpy.clip( P[ :n ], 1e-4, 1 - 1e-4 )
+
+
+def _plain_measures_3d( pos, w ):
+    """the measures of the cells of `( pos, w )` in the unit cube, through the PLAIN storage ( every seed cuts every cell:
+    no tree, no card )"""
+    pd = PowerDiagram( pos, numpy.asarray( w, dtype = float ).reshape( -1 ), boundaries = box_half_spaces( [ 0 ] * 3, [ 1 ] * 3 ),
+                       kernel_dtype = "FP64", accelerator = "plain" )
+    pd.use_card_cells = False
+    return numpy.asarray( pd.measures.value ).reshape( -1 )
+
+
+def _card_vs_cpu_3d( name, pos, nu, it, tun, wtol = 1e-7 ):
+    """the card's 3D solve and the CPU's: converged both, the plans within `wtol` ( relative to max |w| ), the costs and the
+    barycentres; the counts are printed ( the two multigrids give directions within their tolerance: the same decisions
+    in general, not to the bit )"""
+    n = len( pos )
+    plan = OtProblem( SumOfDiracs( pos, nu ), _make_target( _CUBE ) ).solve( Iterative( **it, tuning = Tuning( **tun ) ) )
+    cpu = _cpu_solve( pos, nu, _CUBE, it, tun )
+    st, cs = plan.stats, cpu[ "stats" ]
+    w, wc = numpy.asarray( plan.weights ).reshape( -1 ), cpu[ "weights" ]
+    gap = numpy.abs( w - wc ).max() / max( numpy.abs( wc ).max(), 1e-300 )
+    cgap = abs( float( plan.cost ) / cpu[ "cost" ] - 1 )
+    bgap = numpy.abs( numpy.asarray( plan.barycenters ) - cpu[ "bary" ] ).max() * n ** ( 1 / 3 )     # relative to the size of a cell
+    print( f"  { name }: card { st[ 'status' ] } { st[ 'nb_iter' ] } it / { st[ 'nb_diag' ] } diag / { st[ 'lin_nb_iter' ] } lin it, "
+           f"cpu { cs[ 'status' ] } { cs[ 'nb_iter' ] } it / { cs[ 'nb_diag' ] } diag; weights gap { gap :.1e}, cost gap { cgap :.1e}, "
+           f"barycentres gap { bgap :.1e}, residual { st[ 'residual' ] * n :.1e} ( relative )" )
+    assert plan.converged and cs[ "status" ] in ( "converged", "converged (aggregated)" ), ( name, st, cs )
+    assert st[ "start" ] == cs[ "start" ], ( name, st[ "start" ], cs[ "start" ] )
+    assert abs( st[ "domain_mass" ] - cs[ "domain_mass" ] ) < 1e-10, name
+    assert gap < wtol and cgap < 1e-9 and bgap < 1e-6, ( name, gap, cgap, bgap )
+    m = numpy.asarray( plan.cell_masses ).reshape( -1 )
+    tm = numpy.asarray( plan.target_masses ).reshape( -1 )
+    assert numpy.abs( m - tm ).max() <= it[ "tol" ] * ( 1 + 1e-9 ), name
+    return plan, cpu
+
+
+if test( "the_card_solves_the_transport_in_3d_as_the_cpu" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    rng = numpy.random.default_rng( 401 )
+    n = 3000
+    pos = rng.uniform( 0.001, 0.999, size = ( n, 3 ) )
+    nu = rng.uniform( 0.5, 1.5, n )
+    nu /= nu.sum()
+    it = dict( tol = 1e-10 / n, max_iter = 60 )
+    plan, cpu = _card_vs_cpu_3d( "uniform, fp64", pos, nu, dict( it, precision = "fp64" ), dict( step = "trials" ) )
+    # the cells of the card's weights, measured by the plain storage: the targets
+    g = _plain_measures_3d( pos, plan.weights )
+    tm = numpy.asarray( plan.target_masses ).reshape( -1 )
+    assert numpy.abs( g - tm ).max() < 1e-8 / n, numpy.abs( g - tm ).max() * n
+    assert numpy.asarray( plan.weights ).reshape( -1 )[ 0 ] == 0            # the gauge
+    assert plan.history[ -1 ][ "max_abs_residual" ] == plan.stats[ "residual" ]
+    # the other kernels and linear solvers: the same plan ( `auto` is the step `trials` in 3D )
+    ref = numpy.asarray( plan.weights ).reshape( -1 )
+    for name, precision, tuning in ( ( "fp32", "fp32", Tuning() ), ( "mixed ( auto )", "auto", Tuning( step = "auto" ) ),
+                                     ( "cg", "fp64", Tuning( linear_solver = "cg", linear_tol = 1e-8 ) ),
+                                     ( "host cholesky", "fp64", Tuning( linear_solver = "cholesky" ) ),
+                                     ( "double levels", "fp64", Tuning( mg_precision = "double" ) ),
+                                     ( "plain aggregation", "fp64", Tuning( mg_smoothed = 0 ) ) ):
+        p2 = OtProblem( SumOfDiracs( pos, nu ), _box_target_3d() ).solve( Iterative( **it, precision = precision, tuning = tuning ) )
+        gap = numpy.abs( numpy.asarray( p2.weights ).reshape( -1 ) - ref ).max() / numpy.abs( ref ).max()
+        print( f"  { name }: { p2.stats[ 'status' ] } { p2.stats[ 'nb_iter' ] } it / { p2.stats[ 'nb_diag' ] } diag / { p2.stats[ 'lin_nb_iter' ] } lin it, "
+               f"gap { gap :.1e}, double kernel from it { p2.stats[ 'it_double' ] }" )
+        assert p2.converged and gap < 1e-7, ( name, p2.stats, gap )
+    # given weights ( a warm start near the solution ), and diracs outside the domain ( the similarity start )
+    warm = OtProblem( SumOfDiracs( pos, nu ), _box_target_3d() ).solve( Iterative( **it, weights0 = ref * ( 1 + 1e-3 ) ) )
+    assert warm.converged and warm.stats[ "start" ] == "weights0" and warm.stats[ "nb_iter" ] <= 4, warm.stats
+    out = 0.5 + 1.6 * ( pos[ :400 ] - 0.5 )
+    _card_vs_cpu_3d( "seeds outside the cube ( similarity start )", out, numpy.ones( 400 ) / 400, dict( tol = 1e-10 / 400, max_iter = 80 ), {} )
+
+
+if test( "the_card_solves_the_planes_in_3d_as_the_cpu" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    # the old campaign's 3D case ( seeds around four planes, sigma 0.02 ): equal volumes from the Voronoi ( `planes_voronoi` ),
+    # then targets of varied masses
+    rng = numpy.random.default_rng( 402 )
+    n = 6000
+    pos = _planes_cloud( n, rng )
+    it = dict( tol = 1e-10 / n, max_iter = 80 )
+    plan, _ = _card_vs_cpu_3d( "planes, equal volumes, mixed", pos, numpy.ones( n ) / n, dict( it, precision = "auto" ), {} )
+    g = _plain_measures_3d( pos, plan.weights )
+    assert numpy.abs( g - 1 / n ).max() < 1e-8 / n, numpy.abs( g - 1 / n ).max() * n
+    nu = numpy.exp( rng.normal( 0, 0.5, n ) )
+    _card_vs_cpu_3d( "planes, varied masses, fp64", pos, nu / nu.sum(), dict( it, precision = "fp64" ), {} )
+
+
+if test( "the_card_3d_solve_runs_under_jit" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    # the eager solve and the jitted one, to the bit: the masses traced, then the positions too ( the tree built in the program )
+    import jax
+    rng = numpy.random.default_rng( 403 )
+    n = 4000
+    pos = rng.uniform( 0.001, 0.999, size = ( n, 3 ) )
+    nu = rng.uniform( 0.5, 1.5, n )
+
+    def solve( p, m ):
+        plan = OtProblem( SumOfDiracs( p, m ), _box_target_3d() ).solve( Iterative( tol = 1e-10 / n, max_iter = 60 ) )
+        return plan.weights.raw, plan.cost.raw, plan.stats[ "nb_diag" ], plan.stats[ "status" ]
+
+    we, ce, de, se = solve( pos, nu )
+    assert se == "converged", se
+    wj, cj, dj, _ = jax.jit( lambda m: solve( pos, m ) )( nu )
+    assert numpy.array_equal( numpy.asarray( wj ), numpy.asarray( we ) ), numpy.abs( numpy.asarray( wj ) - numpy.asarray( we ) ).max()
+    assert float( cj ) == float( ce ) and float( dj ) == float( de ), ( cj, ce, dj, de )
+    f = jax.jit( solve )
+    assert numpy.array_equal( numpy.asarray( f( pos, nu )[ 0 ] ), numpy.asarray( we ) )
+    pos2 = numpy.clip( pos + 1e-3 * rng.normal( size = pos.shape ), 0.001, 0.999 )
+    assert numpy.array_equal( numpy.asarray( f( pos2, nu )[ 0 ] ), numpy.asarray( solve( pos2, nu )[ 0 ] ) )
+    print( f"  { int( de ) } diagrams, jit == eager" )
+
+
+if test( "the_card_3d_solve_refuses_what_it_does_not_solve" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    rng = numpy.random.default_rng( 404 )
+    pos = rng.uniform( 0.1, 0.9, size = ( 200, 3 ) )
+    # the step `limits`: 2D only ( the CPU's 3D has no area polynomials either )
+    try:
+        OtProblem( SumOfDiracs( pos ), _box_target_3d() ).solve( Iterative( tuning = Tuning( step = "limits" ) ) )
+        raise AssertionError( "step = 'limits' must be refused in 3D" )
+    except ValueError as e:
+        assert "2D only" in str( e ) and "'trials'" in str( e ), str( e )
+    # a density that is not a constant: an image of varied values, gaussians
+    for dst in ( Image( values = 1 + rng.random( ( 4, 4, 4 ) ), origin = [ 0.0 ] * 3, frame = 0.25 * numpy.eye( 3 ) ),
+                 SumOfGaussians( numpy.full( ( 1, 3 ), 0.5 ), numpy.array( [ 0.2 ] ) ) ):
+        try:
+            OtProblem( SumOfDiracs( pos ), dst ).solve()
+            raise AssertionError( f"a 3D density { type( dst ).__name__ } must be refused on the card" )
+        except NotImplementedError as e:
+            assert "3D" in str( e ) and "constant density" in str( e ) and "LOOM_DEVICE=cpu" in str( e ), str( e )
+
+
+if test( "the_card_3d_memory_model_follows_the_solve" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    from sdot.CardMemory import card_solve_bytes
+    from sdot.SdotPlanNd import SdotPlanNd
+    rng = numpy.random.default_rng( 405 )
+    n = 200_000
+    pos = rng.uniform( 0.001, 0.999, size = ( n, 3 ) )
+    for name, it in ( ( "mixed", Iterative( tol = 1e-8 / n, max_iter = 30 ) ),
+                      ( "fp64, double levels", Iterative( tol = 1e-8 / n, max_iter = 30, precision = "fp64", tuning = Tuning( mg_precision = "double" ) ) ),
+                      ( "fp32", Iterative( tol = 1e-7 / n, max_iter = 30, precision = "fp32" ) ),   # ( the float kernel alone floors at 3e-8 here )
+                      ( "fp64, cg", Iterative( tol = 1e-8 / n, max_iter = 30, precision = "fp64", tuning = Tuning( linear_solver = "cg", linear_tol = 1e-8 ) ) ) ):
+        plan = OtProblem( SumOfDiracs( pos ), _box_target_3d() ).solve( it )
+        assert plan.converged, ( name, plan.stats )
+        parts = card_solve_bytes( n, **SdotPlanNd._card_memory_kw( n, it, 3 ) )
+        took, model = plan.stats[ "scratch_bytes" ], sum( v for k, v in parts.items() if k not in ( "tree", "outputs" ) )
+        print( f"  { name }: took { took / n :.1f} bytes per seed, model { model / n :.1f}" )
+        assert abs( model - took ) < 0.08 * took, ( name, took, model )
+
+
+if test( "the_card_refuses_a_3d_solve_that_does_not_fit_at_once" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    n = 1_000_000                                # ~1 GB for the 3D solve, the pool ~0.5 GB
+    for mode, ( kind, t, msg ) in zip( ( "eager", "jit" ), _oom_runs( n, [ "eager", "jit" ], SDOT_TEST_DIM = "3" ) ):
+        print( f"  { mode }: { kind } after { t :.2f} s: { msg[ :200 ] }..." )
+        assert kind == "MemoryError" and t < 5, ( mode, kind, t, msg )
+        assert f"solve of { n } seeds needs about" in msg and "LOOM_DEVICE=cpu" in msg, msg
+
+
+if test( "the_card_aggregates_in_3d_as_the_cpu" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    for name, ( pos, groups ) in _degenerate_clouds( 3, 17 ).items():
+        n = len( pos )
+        tol = ( 1e-9 if "1e-12" in name else 1e-11 ) / n
+        for precision in ( "fp64", "auto" ):
+            plan = OtProblem( SumOfDiracs( pos ), _box_target_3d() ).solve( Iterative( tol = tol, max_iter = 60, precision = precision ) )
+            _check_aggregated( f"card 3D { name } { precision }", plan, pos, groups, tol )
+            g = _plain_measures_3d( pos, plan.weights )
+            nu = numpy.asarray( plan.target_masses ).reshape( -1 )
+            alone = numpy.ones( n, dtype = bool )
+            for members, _ in groups:
+                alone[ members ] = False
+                assert abs( g[ members ].sum() - nu[ members ].sum() ) < 1e-8 / n, ( name, g[ members ].sum() - nu[ members ].sum() )
+            assert numpy.abs( g[ alone ] - nu[ alone ] ).max() < 1e-8 / n, name
