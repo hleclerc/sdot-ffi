@@ -206,9 +206,9 @@ weights (the `equal` files are the solution: it checks the witness, it is not a 
 * **Supernodal CHOLMOD** (3D factor x38 on the factorization): the new Cholesky is Eigen's simplicial LDLT.
 * **`fp32 -> fp64` switch** (`--kernel mixte`, § 19.10): `--kernel` is `double` or `float` only. (Measured useless on the
   Xeon, `s ~ 1`; it was meant for GPUs.)
-* **Coincident-seed agglomeration** (§ 23.6-23.12): `Iterative( aggregate = ... )` is accepted but not wired (step 7 of
-  `notes/2026-10-02-sdotplan.md`): `lines_equal` stays at the old `STAGNATION 2.35e-06` floor, and the
-  deduplicated `lines_voronoi` is what makes the old 78-diagram number reproducible.
+* ~~Coincident-seed agglomeration~~ (§ 23.6-23.12): wired, on by default (`Iterative( aggregate = True )`, `--aggregate=yes|no`):
+  `lines_equal` ends "converged (aggregated)" (the full problem stays at the doubles' floor, 2.35e-6), see the aggregation section
+  of `calibration_lmo_today.md`. The deduplicated `lines_voronoi` is still what makes the old 78-diagram number reproducible.
 * **Lifting** (`relèvement` of the old campaign, § 8.5, § 13-16: raising weights of empty cells; multiscale) and the limits step in **3D** (`step = 'limits'`
   raises there).
 * **Same random draws**: numpy is not `mt19937_64` (uniform clouds are statistically, not pointwise, the old ones).
