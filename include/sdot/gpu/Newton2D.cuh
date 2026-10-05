@@ -97,12 +97,12 @@ enum LinKind : int { LIN_CG = 0, LIN_MG = 1, LIN_HOST = 2 };
 // ---- the residual ( `Newton.h::g_of / gp_of` ) -----------------------------------------------------------------------
 
 __host__ __device__ inline double g_of( double x, int r, double p ) {
-    x = fmax( x, 1e-8 );
+    x = fmax( x, 1e-300 );
     if ( r == RES_POWER ) return p == 0 ? log( x ) : ( pow( x, p ) - 1 ) / p;
     return r == RES_LOG ? log( x ) : x - 1;
 }
 __host__ __device__ inline double gp_of( double x, int r, double p ) {
-    x = fmax( x, 1e-8 );
+    x = fmax( x, 1e-300 );
     if ( r == RES_POWER ) return pow( x, p - 1 );
     return r == RES_LOG ? 1 / x : 1.0;
 }
@@ -1093,6 +1093,14 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
                     if ( stop_all ) { st_status = failed ? sp::S_FAILURE : sp::S_CAPACITY; break; }
                     continue;
                 }
+            }
+            if ( ! taken && res_cur != RES_LIN ) {          // a refused log step: the iteration again in LIN ( `Newton.h` )
+                res_cur = RES_LIN;
+                if ( stage == 0 ) it_switch = it;
+                if ( trace ) std::printf( "      switch: residual -> lin ( the step of the log residual is refused )\n" );
+                --nb_iter;
+                --it;
+                continue;
             }
             if ( ! taken ) { st_status = sp::S_STAGNATION; break; }
             t_last = t;

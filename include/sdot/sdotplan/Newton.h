@@ -43,7 +43,7 @@
 // The Newton system and the merit of the damping can be written on `g( a_i / nu_i )` instead of
 // `a_i - nu_i`: the same solution, another Newton and another judge. With the power family
 //
-//     g_p( x ) = ( x^p - 1 ) / p,   g_p'( x ) = x^( p - 1 ),   g_0 = log,   x = a_i / nu_i ( floored at 1e-8 )
+//     g_p( x ) = ( x^p - 1 ) / p,   g_p'( x ) = x^( p - 1 ),   g_0 = log,   x = a_i / nu_i ( floored at 1e-300 )
 //
 // `p = 1` is LIN ( up to the sign ), `p = 0` is LOG. The direction solves `L d = b` with
 // `b_i = ( nu_i / g'( x_i ) ) ( c - g( x_i ) )`, `c` the weighted mean that makes `b` sum to zero ( the
@@ -54,7 +54,9 @@
 // hard 2D cases, -37 % in 3D ( README § 24 ). LIN is the true Newton and the one that converges
 // quadratically at the end, so the residual SWITCHES to LIN, once and for all, as soon as
 // `max |a - nu| / nu <= switch_residual` ( 2 ): near the solution every residual gives the same
-// direction. The default is the old one: LOG, then LIN. `residual = LIN` is the previous behaviour.
+// direction. It switches too when the damping refuses a step of the log residual ( the iteration done
+// again in LIN: a cell under 1e-8 of its target, whose request the linear solver loses ). The default is the old one: LOG, then LIN.
+// `residual = LIN` is the previous behaviour.
 //
 // = What an iteration costs
 //
@@ -155,14 +157,15 @@ struct Newton {
         return std::sqrt( s );
     }
 
-    /// `g( x )` and `g'( x )` of the residual `r`, `x = a / nu` floored away from zero
+    /// `g( x )` and `g'( x )` of the residual `r`, `x = a / nu` floored away from zero. The floor only keeps an EMPTY cell finite
+    /// ( `log 1e-300 = -691` ): at 1e-8 the merit was flat for the cells under 1e-8 of their target, and judged their steps blind
     static double g_of( double x, int r, double p ) {
-        x = std::max( x, 1e-8 );
+        x = std::max( x, 1e-300 );
         if ( r == NewtonOptions::POWER ) return p == 0 ? std::log( x ) : ( std::pow( x, p ) - 1 ) / p;
         return r == NewtonOptions::LOG ? std::log( x ) : x - 1;
     }
     static double gp_of( double x, int r, double p ) {
-        x = std::max( x, 1e-8 );
+        x = std::max( x, 1e-300 );
         if ( r == NewtonOptions::POWER ) return std::pow( x, p - 1 );
         return r == NewtonOptions::LOG ? 1 / x : 1;
     }
@@ -364,6 +367,20 @@ struct Newton {
                     std::printf( "  alpha* %.2e%s", alpha_lim, t < t_lim0 ? " REFUSED" : "" );
                 std::printf( "\n" );
                 std::fflush( stdout );
+            }
+            // A REFUSED STEP OF THE LOG RESIDUAL is no stagnation yet: a cell far under its target asks for `a_i ( c - log x_i )`,
+            // which the linear solver may lose next to the other cells' requests -- three seeds 1e-10 apart, the middle cell
+            // at 5e-9 of its target, at the Voronoi start where the aggregation cannot see them ( weights 0 ) -- and the merit,
+            // which does see that cell, refuses the step. LIN asks for the whole gap: the iteration is done again with it
+            if ( ! taken && res_cur != NewtonOptions::LIN ) {
+                bal.set_weights( w );
+                res_cur = NewtonOptions::LIN;
+                st.it_switch = it;
+                --st.nb_iter;
+                --it;
+                if ( o.trace )
+                    std::printf( "      switch: residual -> lin ( the step of the log residual is refused )\n" );
+                continue;
             }
             if ( ! taken ) {
                 bal.set_weights( w );                    // the diagram takes the accepted weights back
