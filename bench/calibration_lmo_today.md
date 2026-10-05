@@ -1374,3 +1374,110 @@ vectors 40, majorants 27, overflow slots 10; plus the tree's and the outputs' XL
   solve runs ( 6.3 s, peak 7.74 GB, no recycled solution ); 7.30 GB pool: `MemoryError` in 0.05 s. Eager unchanged.
 * Test: `test_SdotPlanNd::the_card_memory_check_counts_the_jitted_program` ( pure Python, the pool faked ).
 * Risk: buffers of the user's own program around the solve ( other arrays it computes ) are still invisible while tracing.
+
+# Aggregation of near-coincident seeds ( 2026-10-05 ): `lines_equal` converges
+
+## The criterion ( `sdotplan/Aggregation.h` )
+
+* Two seeds `delta` apart are split by a plane whose offset is `( w_i - w_j ) / 2 delta`. The mass one ulp of their weights moves
+  between them is `m_ij = c_ij ulp( max( |w_i|, |w_j| ) )`, with `c_ij = int_facet rho / 2 delta` the facet's coefficient of the
+  laplacian. No weight vector places that plane better than `m_ij`. The pair is merged when `m_ij > tau_ij / 4`, where
+  `tau_ij = max( tol_abs, tol_rel min( nu_i, nu_j ), 1e-12 nu )`. A pair lands at best within half an ulp step, and 0.43 of
+  one was measured on `lines_equal`. The 1e-12 floor stops a tolerance below what any mass reaches from merging ordinary
+  pairs: without it, `tol = 1e-15 / n` merged 1259 seeds of a uniform 3000.
+* Both factors are read ON THE DIAGRAM, at the current weights. The facets carry the local spacing and the length of the
+  facet. That length is what a position-only estimate gets wrong: the `lines_equal` pair has a 0.078 facet against a
+  4.5e-4 median spacing, and a position-only bound was 570x loose, so it would have merged pairs of uniform clouds. Delaunay
+  contains the EMST, so every close pair is a facet ( § 23.8 ).
+* The cost is a max over the laplacian's diagonal per iteration (plus max |w|). The facets are scanned only when that max
+  passes `tau_min / ( 4 ulp( max |w| ) )`. On uniform 1e5 the diagonal is ~1e3 and the bound ~1e9. Merges are latched.
+* EXACT DUPLICATES are not seen by the diagram. Two equal points each get the whole merged cell, so the cell is counted
+  twice and the solve stagnated at 2e-2. They are found by a hash of the positions in `SdotPlanNd` ( 2.8 ms at 1e5, 22 ms
+  at 1e6, M-series; traced positions are not checked ). They are kept empty: the k-th duplicate gets `w_rep - k gap`, with
+  `gap = 1e-6 |p|^2`, because the generic 3D cell mistakes `0 . x <= 0` and near-equal gaps. Their linear rows are linked to
+  their representative, because an isolated row broke the 3D multigrid ( 1e5 iterations ). The representative carries their
+  targets.
+* ON THE CARD, also merged: any coefficient past 1e9 times a facet's scale. The float kernel makes the coefficient of a
+  1e-12 pair infinite, and the multigrid failed at the first iteration, before any weight had grown.
+
+## The method
+
+* The aggregated problem is solved on the TRUE diagram, not on a cloud whose clusters are moved to their barycentre.
+  § 23.10 measured 4.3e-2 on the neighbours that way, and only a Newton on the full cloud could undo it.
+* The stopping test and the merit read each member's share of its cluster's mass, `nu_i a_r / nu_r`.
+* The direction stays the full Newton one, so the planes inside a cluster are placed as well as the doubles allow.
+* On the card the internal coefficients are capped at 1e6 x scale in the system and the members' directions tied. The split
+  is then corrected by the exact `k x k` blocks: one two-level step.
+* Once the aggregated test passes comes THE RE-SPLITTING: Newton steps on each merged cell's local problem, with the rest of
+  the diagram fixed. Each step costs one diagram and is kept while the members' residual decreases ( at most 4 ).
+* Status `converged (aggregated)` means the aggregated problem passed and the full one did not. `residual` is the aggregated
+  residual, `residual_full` the full one ( duplicates answered for by their representative ). `nb_clusters`,
+  `nb_aggregated`, `nb_duplicates` and `nb_polish` report what was done. `SdotPlanNd.clusters` gives each seed's smallest
+  index in its cluster.
+* Mixed kernel on the card, fixed on the way: at the switch from float to double, the target is now rescaled to the domain
+  mass the double kernel measures. The float sum is off by about 1e-11, which left a uniform 3e-11 floor that a tight
+  tolerance never passed.
+
+## `lines_equal` ( n = 1e5, rtol 1e-6; the pair 75020 / 82077 is 1.009e-8 apart )
+
+CPU, lmo-numpy, 8 threads, min of 3, s:
+
+| step | aggregate | status | aggregated / full residual | it / diag | total |
+|---|---|---|---|---|---|
+| limits | no | stagnation | 2.35e-6 / 2.35e-6 | 13 / 23 | 4.741 |
+| limits | yes | converged (aggregated) | 3.76e-7 / 2.35e-6 | 12 / 20 ( 1 re-split ) | 4.405 |
+| trials | no | stagnation | 2.35e-6 / 2.35e-6 | 16 / 57 | 8.518 |
+| trials | yes | converged (aggregated) | 5.59e-8 / 2.35e-6 | 15 / 34 ( 1 re-split ) | 6.092 |
+
+Card, n22 RTX A6000, `--jit=yes`, min of 3, jit wall, s:
+
+| kernel | aggregate | status | aggregated / full | it / diag | wall |
+|---|---|---|---|---|---|
+| double | no | stagnation | 2.35e-6 / 2.35e-6 | 15 / 18 | 0.671 |
+| double | yes | converged (aggregated) | 3.57e-7 / 3.04e-6 | 14 / 17 ( 2 re-split ) | 0.627 |
+| mixed | no | stagnation | 2.35e-6 / 2.35e-6 | 17 / 36 | 0.728 |
+| mixed | yes | converged (aggregated) | 5.25e-7 / 3.04e-6 | 16 / 34 ( 2 re-split ) | 0.663 |
+
+* The full residual stays at the floor of the doubles, 2.35e-6 or the neighbouring ulp 3.05e-6. The re-split cannot do
+  better with a weight vector ( § 23.11 ). The cost of transport is blind to it ( § 23.12 ).
+* The floor depends on the GAUGE. `ulp( w )` is taken at `|w| = 0.11` because `w_0 = 0`. A gauge centred on the worst
+  cluster would remove the floor for that cluster, but `weights[ 0 ] == 0` is part of the interface: not done.
+
+## Unchanged ( same counts, aggregate yes / no )
+
+| case | where | it / diag | time yes / no ( s ) |
+|---|---|---|---|
+| uniform2d, trials | CPU lmo | 6 / 8 | 1.091 / 1.086 |
+| uniform2d, limits | CPU lmo | 6 / 7 | 1.018 / 1.021 |
+| uniform3d | CPU lmo | 5 / 6 | 2.306 / 2.248 ( C++ 2.10 / 2.05 ) |
+| lines_voronoi, trials | CPU lmo | 14 / 32 | 5.276 / 5.271 |
+| lines_voronoi, limits | CPU lmo | 12 / 19 | 3.995 / 4.039 |
+| uniform2d, limits, double / mixed | card | 5 / 6 | 0.098 / 0.097, 0.072 / 0.072 |
+| lines_voronoi, limits, double / mixed | card | 12 / 13 | 0.495 / 0.496, 0.287 / 0.286 |
+
+Weights, residuals and counts are identical to the bit in the tests ( `the_aggregation_changes_nothing_without_such_seeds` ).
+
+## Tests
+
+* `test_SdotPlanNd` locally ( jax CPU ): 22 pass.
+  * `the_aggregation_merges_what_the_doubles_cannot_separate`: 2D ( trials, limits ) and 3D. It covers an exact pair, an
+    exact triple, pairs at 1e-9 and 1e-12, a triple at 1e-10, and a pair plus a duplicate. Each case converges, the clusters
+    are found, each cluster holds its mass, the other cells their own, and a duplicate's cell is empty. Each one fails
+    without aggregation.
+  * `the_aggregation_changes_nothing_without_such_seeds`: the result is bit-identical.
+* On n22 ( GPU, `XLA_PYTHON_CLIENT_MEM_FRACTION=0.2`, the card shared ): 17 pass, including `the_card_aggregates_as_the_cpu`
+  ( the same clouds, double and mixed, the generic measures of the card's weights, and jit ).
+* `the_card_refuses_a_solve_that_does_not_fit_at_once` fails on n22's 48 GB card whatever the change. The pool it sets is
+  0.05 x 48 GB, which holds the 1e6 solve the test expects to be refused: its sizes are for an 11 GB card.
+
+## What remains approximate
+
+* The members' own `cell_masses`, `barycenters` and their part of `cost_and_position_grad` are those of the returned weights,
+  so they are only good to within the floor. An exact duplicate's cell is empty and its representative holds both. The
+  cluster as a whole is exact. The adjoint is not split between the members.
+* The re-split is a local Newton on weights, so it stops at the same floor as the old campaign's plane bisection. Clusters
+  of more than 64 members are not re-split.
+* On the card, the coupling between the clusters' internal planes and their neighbours is linearised once per iteration.
+  At 1e-12 apart the card's cells place the merged cell to about 5e-11 of its mass, against 5e-14 on the CPU.
+* At `tol` close to 1e-12 relative, the mixed kernel merges an ordinary pair of a uniform 4000-seed cloud. The status still
+  says `converged`.
