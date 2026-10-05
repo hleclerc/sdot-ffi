@@ -7,7 +7,9 @@
 // A dedicated path, written for the card ( `PowerDiagram_Bsp._card_variant` decides when it applies; 3D, a
 // distribution that is not a constant, a domain that is not a box, the neighbour memory keep the generic path
 // of `diagram/Ops.h` ). It is the old GPU campaign's kernel ( `nsdot/gpu_des_familles`, `FilMsk2D.cuh` +
-// `Arbre.cuh` + `Mesures.cu` + `Hess2D.cuh` ) brought to this code base.
+// `Arbre.cuh` + `Mesures.cu` + `Hess2D.cuh` ) brought to this code base. The card's SOLVE also gives its cells a
+// density that is not a constant ( `Problem::dens`, `Density2D.cuh`: an image, gaussians ), integrated on the edges of
+// the finished cell -- measures, facets, moments; not the adjoint.
 //
 // = WHAT A CELL GIVES ( `Out`, a compile-time set: what is not asked for is not compiled )
 //
@@ -63,6 +65,7 @@
 
 #include <loom/support/kernels/CudaQueue.h>
 #include <loom/support/common_types.h>
+#include "Density2D.cuh"
 #include <loom/support/Ct.h>
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -310,8 +313,9 @@ struct Counters {
     unsigned long long pad[ 3 ];
 };
 
-/// EVERYTHING A CELL READS AND WRITES, by value ( kernel parameters )
-template<class _V,class TF,class TI,bool _W,unsigned _OUT>
+/// EVERYTHING A CELL READS AND WRITES, by value ( kernel parameters ). `D`: the density ( `Density2D.cuh` ), `DensConst` the
+/// cells' own closed forms ( `rho` )
+template<class _V,class TF,class TI,bool _W,unsigned _OUT,class _D = DensConst>
 struct Problem {
     using V   = _V;
     using TK  = typename V::TK;
@@ -319,8 +323,11 @@ struct Problem {
     using TN  = typename V::TN;
     using Pos = typename KernelSeeds<TK>::Pos;
     using Wt  = typename KernelSeeds<TK>::Wt;
+    using D   = _D;
     static constexpr bool     W   = _W;
     static constexpr unsigned OUT = _OUT;
+    static constexpr bool     CONST_DENSITY = std::is_same_v<D,DensConst>;
+    static_assert( CONST_DENSITY || ! ( OUT & VJP ), "the adjoint of the card's cells is written for a constant density" );
 
     // ---- the diagram
     const Node<W,TR> *nodes;                             ///< in float for both kernels: the pruning is in float
@@ -334,6 +341,7 @@ struct Problem {
     int               depth;
     double            rho;                               ///< the ( constant ) density, if `rho_dev` is null
     const TF         *rho_dev;                           ///< ... or read on the card ( a 0-d tensor of the call )
+    [[no_unique_address]] D dens;                        ///< ... or a density ( `Density2D.cuh` ), integrated on the edges
     bool              user_order;                        ///< per-cell outputs at the user's index ( else at the rank )
 
     // ---- what the cells write ( see `Out` )
@@ -990,6 +998,59 @@ __device__ __forceinline__ void finish_cell( const Pb &pb, typename Pb::TR k, co
         pb.nb_edges[ k ] = ne;
     }
 
+    if constexpr ( ! Pb::CONST_DENSITY ) {
+        // A DENSITY ( `Density2D.cuh` ): the circulations on the edges, `int rho ds` for the facets ( no adjoint here )
+        using D = typename Pb::D;
+        constexpr bool MOM = OUT & MOMENTS;
+        constexpr int  VB = 32;                          ///< gaussians: the vertices kept for the corners, past them walked again
+        double a2 = 0, vbx[ std::is_same_v<D,DensGauss> ? VB : 1 ], vby[ std::is_same_v<D,DensGauss> ? VB : 1 ];
+        int nv = 0;
+        unsigned t = 0;
+        DensSums acc;
+        DensState<D> st;
+        for_each_edge<EDGE_TERMS>( pb, o, cell, [&]( double ax, double ay, double bx, double by, TR c, double d2 ) {
+            a2 += ax * by - bx * ay;
+            double line;
+            if constexpr ( std::is_same_v<D,DensImage> ) {
+                const double Ox = o.x - pb.dens.x0, Oy = o.y - pb.dens.y0;
+                line = image_edge<MOM>( pb.dens, st.ref, Ox + ax, Oy + ay, Ox + bx, Oy + by, acc );
+            } else {
+                if ( nv < VB ) { vbx[ nv ] = ax; vby[ nv ] = ay; }
+                ++nv;
+                line = ( bool( OUT & FACETS ) || MOM ) ? gauss_lines<MOM>( pb.dens, o.x, o.y, ax, ay, bx, by, acc ) : 0.0;
+            }
+            if constexpr ( bool( OUT & FACETS ) ) {
+                if ( c > k && fok ) {
+                    const unsigned long long q = fbase + t++;
+                    pb.fi[ q ] = k;
+                    pb.fj[ q ] = c;
+                    pb.fc[ q ] = d2 > 0 ? line / ( 2 * sqrt( d2 ) ) : 0.0;
+                }
+            }
+        } );
+        const double sg = a2 < 0 ? -1.0 : 1.0;
+        DensSums r;
+        if constexpr ( std::is_same_v<D,DensImage> )
+            r = image_finish( pb.dens, acc, sg, o.x, o.y );
+        else {
+            r.mx = sg * acc.mx; r.my = sg * acc.my; r.m2 = sg * acc.m2;
+            if ( nv <= VB )
+                gauss_cell<MOM>( pb.dens, o.x, o.y, [&]( auto &&f ) { for ( int i = 0; i < nv; ++i ) f( vbx[ i ], vby[ i ], vbx[ i + 1 < nv ? i + 1 : 0 ], vby[ i + 1 < nv ? i + 1 : 0 ] ); }, r );
+            else
+                gauss_cell<MOM>( pb.dens, o.x, o.y, [&]( auto &&f ) {
+                    for_each_edge<false>( pb, o, cell, [&]( double ax, double ay, double bx, double by, TR, double ) { f( ax, ay, bx, by ); } ); }, r );
+        }
+        if constexpr ( bool( OUT & MEASURES ) )
+            pb.res( pb.user( k ) ) = TF( r.m );
+        if constexpr ( MOM ) {
+            const SI u = pb.user( k );
+            pb.bary( u, 0 ) = TF( r.m > 0 ? o.x + r.mx / r.m : o.x );
+            pb.bary( u, 1 ) = TF( r.m > 0 ? o.y + r.my / r.m : o.y );
+            pb.cost( u ) = TF( r.m2 );
+        }
+        return;
+    }
+
     double a2 = 0, m1x = 0, m1y = 0, m2 = 0, gw = 0, gpx = 0, gpy = 0;
     unsigned t = 0;
     for_each_edge<EDGE_TERMS>( pb, o, cell, [&]( double ax, double ay, double bx, double by, TR c, double d2 ) {
@@ -1283,6 +1344,13 @@ inline void *take( auto &allocator, SI nb_bytes ) {
     auto p = reinterpret_cast<std::uintptr_t>( v.data().raw );
     if ( ! p )
         return nullptr;
+    // `SDOT_CARD_POISON=1`: every byte taken set to 0xff ( a NaN in every double ) -- a read before a write then shows at
+    // once, whatever the pool held before ( a debugging aid: it costs a memset per `take` )
+    static const bool poison = std::getenv( "SDOT_CARD_POISON" ) && *std::getenv( "SDOT_CARD_POISON" ) != '0';
+    if ( poison ) {
+        cuda_check( cudaMemset( reinterpret_cast<void *>( p ), 0xff, size_t( nb_bytes + 16 ) ), "poison" );
+        cuda_check( cudaDeviceSynchronize(), "poison ( sync )" );
+    }
     return reinterpret_cast<void *>( ( p + 15 ) & ~std::uintptr_t( 15 ) );
 }
 
@@ -1322,9 +1390,9 @@ struct Overflow {
 /// the seeds; `run` launches the passes -- everything `pb` points to ( the outputs ) is the caller's. Nothing is read
 /// back ( but with `SDOT_CARD_STATS=1` ). This is the object a solver keeps across its diagrams ( `SdotPlanNd`, step 2 ):
 /// `prepare` again when the weights change ( it rebuilds the nodes from the tree's majorants ), `run` per diagram.
-template<class V,bool W,unsigned OUT,class TF,class TI>
+template<class V,bool W,unsigned OUT,class TF,class TI,class D = DensConst>
 struct Card {
-    using Pb  = Problem<V,TF,TI,W,OUT>;
+    using Pb  = Problem<V,TF,TI,W,OUT,D>;
     using TK  = typename V::TK;
     using TR  = typename V::TR;
     using Pos = typename Pb::Pos;

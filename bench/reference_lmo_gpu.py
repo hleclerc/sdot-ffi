@@ -93,6 +93,20 @@ GPU += [
 ]
 
 
+#: THE DENSITIES on the old card ( `doc/08-densites.md` ): the synthetic image WITHOUT hole ( 90:1, `cases.synthetic_image(
+#: hole = False )` ), double, a uniform cloud. One diagram ( measures + facets, kernel only, ns / seed ) and whole Newton solves
+#: ( the CONTRAST continuation `( 1 - s ) + s rho` in K uniform steps, CG, trials from the previous step doubled ).
+GPU_DENSITY = [
+    dict( what = "diagram", case = "uniform2d", n = 1_000_000, image = 0,   ns_per_seed = 96.6,  source = "doc/08-densites.md l.76 ( no image )" ),
+    dict( what = "diagram", case = "uniform2d", n = 1_000_000, image = 512, ns_per_seed = 103.9, source = "doc/08-densites.md l.76 ( +7 % )" ),
+    dict( what = "diagram", case = "uniform2d", n = 1_000_000, image = 2048, ns_per_seed = 101.6, source = "doc/08-densites.md l.76" ),
+    dict( what = "newton", case = "image", n = 200_000, image = 512, steps = 1, iterations = 1341, seconds = 318, source = "doc/08-densites.md l.278 ( rho, K = 1 )" ),
+    dict( what = "newton", case = "image", n = 200_000, image = 512, steps = 8, iterations = 662,  seconds = 164, source = "doc/08-densites.md l.278 ( rho, K = 8 )" ),
+    dict( what = "newton", case = "lebesgue", n = 200_000, image = 0, steps = 1, iterations = 7,   seconds = 1.0, source = "doc/08-densites.md l.275" ),
+]
+# ( doc/06-ce-qui-reste.md l.10 repeats the +7 % of the 512^2 image at 1e6; the old card had no gaussian density. )
+
+
 def gpu_rows( case, n, kernel ):
     """every row for this case / kernel at THIS n ( within 1 %: the deduplicated lines cloud has 99 944 seeds )"""
     return [ r for r in GPU if r[ "case" ] == case and r[ "kernel" ] == kernel and abs( r[ "n" ] - n ) <= 0.01 * r[ "n" ] ]

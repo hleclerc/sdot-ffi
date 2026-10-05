@@ -49,7 +49,7 @@ import benchlib
 import cases
 import reference_lmo
 
-CASE_CHOICES = [ "uniform", "lines_voronoi", "lines_equal", "planes_voronoi", "planes_equal" ]
+CASE_CHOICES = [ "uniform", "lines_voronoi", "lines_equal", "planes_voronoi", "planes_equal", *cases.DENSITY_CASES ]
 
 if p := bench( "newton",
                case          = Param( "uniform", choices = CASE_CHOICES, help = "the case ( see cases.py ); `uniform` uses --dim" ),
@@ -75,7 +75,10 @@ if p := bench( "newton",
                rtol          = Param( 1e-6, help = "stop on max|a-nu|/nu <= rtol ( the campaign: 1e-6 )" ),
                tol           = Param( 0.0, help = "or on max|a-nu| <= tol, in normalized masses ( 0: off ); the library's default is 1e-8" ),
                max_iter      = Param( 100, help = "Newton steps, at most" ),
-               continuation  = Param( "never", choices = [ "never", "auto", "always" ], help = "width continuation ( the old Newton has none )" ),
+               continuation  = Param( "default", choices = [ "default", "never", "auto", "always" ], help = "width continuation ( default: never on Lebesgue -- the old Newton has none --, always on a density, as § 9 / § 12 )" ),
+               conv_start    = Param( 0.5, help = "DENSITY: the first width of the continuation ( § 9: 0.5; 0: half the diameter of the domain )" ),
+               sigma         = Param( 0.02, help = "DENSITY gauss4: the scale of the widths ( § 9: 0.05, 0.02, 0.01 )" ),
+               image_size    = Param( 512, help = "DENSITY image / image_hole: pixels per side ( § 12: 512 )" ),
                memory        = Param( -1, help = "neighbour memories per seed ( -1: the default of the dimension, 0: none )" ),
                start         = Param( "zero", choices = [ "zero", "file" ], help = "weights 0 ( Voronoi ) or the weights of the file ( the `equal` ones are the solution: 0 iterations )" ),
                ref           = Param( "", help = "variant of reference_lmo.NEWTON to compare with ( kmt, kmt_log, best, model; default: kmt for trials, best for limits )" ),
@@ -109,24 +112,36 @@ if p := bench( "newton",
     import time
     from sdot import Image, Iterative, OtProblem, SumOfDiracs, Tuning
 
-    name = f"uniform{ p.dim }d" if p.case == "uniform" else p.case
-    dim = cases.dimension( name )
-    n_want = p.n or ( 100_000 if p.case == "uniform" else None )
-    pos, w_file, d = cases.case( name, n = n_want, seed = p.seed )
+    density = p.case in cases.DENSITY_CASES
+    if density:
+        # THE DENSITY CASES ( `cases.py` ): the seeds uniform in the unit square, the target the old campaign's density
+        name = p.case + ( f"_s{ p.sigma :g}" if p.case == "gauss4" else f"_{ p.image_size }" )
+        dim = d = 2
+        pos, w_file = cases.uniform( p.n or cases.DENSITY_N[ p.case ], 2, p.seed )
+    else:
+        name = f"uniform{ p.dim }d" if p.case == "uniform" else p.case
+        dim = cases.dimension( name )
+        n_want = p.n or ( 100_000 if p.case == "uniform" else None )
+        pos, w_file, d = cases.case( name, n = n_want, seed = p.seed )
     n = len( pos )
     print( "  " + benchlib.env_report() + "; " + benchlib.driver_line() )
+    continuation = p.continuation if p.continuation != "default" else ( "always" if density else "never" )
 
     # Lebesgue on the unit domain: ONE tile of density 1 -- the domain is the support of the target
-    target = lambda: Image( values = numpy.ones( ( 1, ) * d ), origin = [ 0.0 ] * d, frame = numpy.eye( d ) )
+    if density:
+        target = lambda: cases.density_target( p.case, sigma = p.sigma, size = p.image_size )
+    else:
+        target = lambda: Image( values = numpy.ones( ( 1, ) * d ), origin = [ 0.0 ] * d, frame = numpy.eye( d ) )
 
     def settings( n_points, max_iter ):
-        return Iterative( tol = p.tol, max_iter = max_iter, continuation = p.continuation,
+        return Iterative( tol = p.tol, max_iter = max_iter, continuation = continuation,
                           precision = { "double": "fp64", "float": "fp32", "mixed": "mixed" }[ p.kernel ],
                           weights0 = w_file[ :n_points ] if p.start == "file" else None,
                           aggregate = False,            # not wired yet in the C++ ( see README, gap list )
                           tuning = Tuning( step = p.step, linear_solver = p.linear_solver, mass_rtol = p.rtol,
                                            residual = p.residual, residual_power = p.residual_power, residual_switch = p.residual_switch,
                                            restart_factor = p.restart_factor, amg_variant = p.amg_variant, linear_tol = p.linear_tol or None,
+                                           conv_start = ( p.conv_start or None ) if density else None,
                                            mg_pack = p.mg_pack or None, mg_recycle = None if p.mg_recycle < 0 else p.mg_recycle,
                                            mg_rebuild = p.mg_rebuild or None, mg_stop = p.mg_stop or None, mg_nu = p.mg_nu or None,
                                            mg_kcycle = None if p.mg_kcycle < 0 else p.mg_kcycle,
@@ -219,10 +234,18 @@ if p := bench( "newton",
 
     # -- the old numbers to compare with
     variant = p.ref or reference_lmo.variant_of( p.step if p.step != "auto" else ( "limits" if dim == 2 else "trials" ), p.residual )
-    ref = reference_lmo.newton_ref( name, variant ) if abs( n - 100_000 ) <= 1000 and p.start == "zero" else None
-    if ref and ref.get( "seconds" ) is None:       # an old row with iterations but no total time: nothing to divide by
-        ref = None
-    others = [ r for r in reference_lmo.newton_variants( name ) if abs( n - 100_000 ) <= 1000 and p.start == "zero" ]
+    if density:
+        # the density rows ( `reference_lmo.DENSITY` ): `kmt` for trials, `limits` for limits ( the old § 9 / § 12 paths )
+        dvar = p.ref or ( "limits" if p.step in ( "limits", "auto" ) else "kmt" )
+        rows = reference_lmo.density_rows( p.case, n, sigma = p.sigma, size = p.image_size )
+        ref = next( ( r for r in rows if r[ "variant" ] == dvar and r.get( "seconds" ) ), None )
+        others = rows
+        variant = dvar
+    else:
+        ref = reference_lmo.newton_ref( name, variant ) if abs( n - 100_000 ) <= 1000 and p.start == "zero" else None
+        if ref and ref.get( "seconds" ) is None:       # an old row with iterations but no total time: nothing to divide by
+            ref = None
+        others = [ r for r in reference_lmo.newton_variants( name ) if abs( n - 100_000 ) <= 1000 and p.start == "zero" ]
 
     res_rel = st[ "residual" ] * n                    # max|a - nu| / nu, with nu = 1 / n
     p.results.update( n = n, dim = d, threads = benchlib.nb_threads(), kernel = p.kernel, step = p.step,
@@ -232,7 +255,8 @@ if p := bench( "newton",
                       t_total_wall = wall, t_total_cpp = st[ "t_total" ], t_diag = st[ "t_diag" ], t_majorant = st[ "t_majorant" ],
                       t_asm = st[ "t_asm" ], t_lin = st[ "t_lin" ], t_lim = st[ "t_lim" ],
                       residual_rel = res_rel, start = st[ "start" ], lin_nb_iter = st[ "lin_nb_iter" ],
-                      on_card = int( on_card ), t_tree = t_tree, t_tree_kernels = t_tree_kern, nb_limit_rounds = st[ "nb_limit_rounds" ] )
+                      on_card = int( on_card ), t_tree = t_tree, t_tree_kernels = t_tree_kern, nb_limit_rounds = st[ "nb_limit_rounds" ],
+                      continuation = continuation, nb_continuation_steps = st[ "nb_continuation_steps" ] )
     if on_card:
         p.results.update( linear_host = p.linear_host, jit = p.jit,
                           t_eager_wall = best[ 0 ] if best else None, t_eager_kernels = kern[ "ms" ] / 1e3 if kern else None,
@@ -266,12 +290,17 @@ if p := bench( "newton",
             print( "  heaviest kernel slots: " + "; ".join( f"{ r[ 'code_name' ] }#{ r[ 'slot' ] } { r[ 'ms' ] :.1f} ms x{ r[ 'count' ] }" for r in top ) )
     if w_gap is not None:
         print( f"  weights vs { p.compare }: max gap { w_gap :.2e} ( x n, after the gauge )" )
+    if density:
+        print( f"  density { name }, continuation { continuation }: { st[ 'nb_continuation_steps' ] } stages; cost { float( numpy.asarray( sol.cost ) ) if sol else float( 'nan' ) :.12e}" )
     print( f"  min of { p.reps } ( warm-up apart ); residual max|a-nu|/nu = { res_rel :.2e}; start { st[ 'start' ] }; switch at it { st[ 'it_switch' ] }; backtracks { st[ 'nb_backtracks' ] }; "
            f"linear iterations { st[ 'lin_nb_iter' ] }; C++ total { st[ 't_total' ] :.3f} s"
            + ( f"; witness { witness :.1e}" if witness is not None else "" ) )
     if ref:
         print( f"  old ( { variant } ): { ref[ 'iterations' ] } it, { ref[ 'diagrams' ] } diag, { ref[ 'seconds' ] } s -- { ref[ 'source' ] }" )
-    elif others:
+    if density and others:
+        print( "  old rows for this case: " + "; ".join( f"{ r[ 'variant' ] }: { r.get( 'iterations' ) } it, { r.get( 'diagrams' ) } diag, "
+                                                         f"{ r.get( 'seconds' ) } s ( { r[ 'path' ] } )" for r in others ) )
+    elif others and not ref:
         print( f"  old rows for this case: " + "; ".join( f"{ r[ 'variant' ] } { r[ 'seconds' ] } s ( { r[ 'iterations' ] } it, { r[ 'diagrams' ] } diag )" for r in others ) )
-    else:
+    elif not ref:
         print( "  ( no old number at this n / for this case )" )

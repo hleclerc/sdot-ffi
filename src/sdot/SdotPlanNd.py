@@ -32,7 +32,8 @@ The same solve, in ONE ffi call too, whose handler drives the Newton loop on the
 run on the card, and the host only reads back the scalars it decides on -- so the solve runs under `jax.jit` as well. The
 tree itself is one more card call just before ( `gpu/Bsp2D.cuh`, `AaBsp._init_on_card` ): under `jax.jit` it is part of
 the jitted program, built at every call, from traced positions as well as from constant ones. It
-takes 2D problems in a box against a CONSTANT density; anything else raises on a card ( the CPU solves it ).
+takes 2D problems in a box against a constant density, an `Image` on a regular grid or isotropic gaussians, with the width
+continuation of the CPU; anything else raises on a card ( the CPU solves it ).
 
 = The starting point
 
@@ -139,7 +140,9 @@ class _Options( Aggregate ):
 #: the card solver's options, ONE real tensor ( `gpu/Newton2D.cuh::Opt`, same order )
 _CARD_OPTIONS = [ "tol_abs", "tol_rel", "t_min", "mult_ok", "factor", "maxit", "max_backtracks", "step", "residual", "power", "switch",
                   "lin", "host_method", "lin_tol", "amg_variant", "mg_shift", "mg_recycle", "mg_rebuild", "mg_stop", "mg_nu", "mg_kcycle",
-                  "lin_maxit", "trace", "mg_float", "mg_smoothed" ]
+                  "lin_maxit", "trace", "mg_float", "mg_smoothed",
+                  "continuation", "conv_threshold", "conv_s0", "conv_ratio", "conv_min", "conv_possible", "min_scale",
+                  "img_x0", "img_y0", "img_hx", "img_hy", "img_nx", "img_ny" ]
 
 
 def _card_linear_solves( row, col, val, dia, rhs, method = "mg", tol = 1e-6, smoothed = None, precision = "float", recycle = 2, rebuild = 1,
@@ -427,31 +430,37 @@ class SdotPlanNd:
     def _build_card( self, pd, settings, step, verbose ):
         """THE CARD'S SOLVE ( `include/sdot/gpu/Newton2D.cuh` ): the same Newton, the same options and outputs as the CPU's, in
         ONE ffi call whose handler drives the loop on the call's stream -- so it runs under `jax.jit` too. Taken in 2D, with
-        the BSP tree, a box domain and a CONSTANT density ( `PowerDiagram_Bsp._card_variant` ); anything else is refused
-        here rather than solved on another path: an `Image` or gaussians need the card's cells to integrate a density,
-        which they do not do yet.
+        the BSP tree and a box domain ( `PowerDiagram_Bsp._card_takes` ); anything else is refused here rather than solved on
+        another path.
+
+        The DENSITY ( `PowerDiagram_Bsp._card_solve_density`, `gpu/Density2D.cuh` ): a constant, an `Image` on a regular grid
+        ( a diagonal frame, uniform knots ), or a sum of isotropic gaussians -- integrated on the cells' edges ( Green on the
+        rows of the image, the polar corners and `erf`s of the gaussians ), never by cutting the cells. The WIDTH CONTINUATION
+        is the CPU's ( `sdotplan/Continuation.h`: the same options, stages and targets; the image blurred on the card by the
+        same filter, the gaussians widened ).
 
         What differs from the CPU ( said in `Newton2D.cuh` ): `step = "limits"` is the exact step of the area polynomials
         ( all the cells, from the accepted diagram's edges ) checked by the trial diagram, not the CPU's local limits with a
-        first trial `beta`; the linear solver is the card's multigrid ( `"auto"`, `"mg"` ) or CG ( `"cg"` ), or the CPU's
-        through a copy of the laplacian ( `"cholesky"`, `"amg"`, or `Tuning( linear_host = True )` ); there is no width
-        continuation ( `"always"` is refused, `"auto"` proceeds without )."""
+        first trial `beta` -- for a density that is not a constant, the frozen cells' masses bisected ( the CPU bisects exact
+        cells ); the linear solver is the card's multigrid ( `"auto"`, `"mg"` ) or CG ( `"cg"` ), or the CPU's through a copy
+        of the laplacian ( `"cholesky"`, `"amg"`, or `Tuning( linear_host = True )` ); the moments of a gaussian density are
+        closed forms ( the CPU's a quadrature )."""
         import numpy as np
         tun = settings.tuning
         reason = None
+        dens = None
         if pd.dim_count != 2:
             reason = "the card solves in 2D only ( 3D: the CPU )"
-        elif settings.continuation == "always":
-            reason = "the width continuation needs a convolved density, which the card does not integrate yet"
-        variant = pd._card_variant() if reason is None else None
-        if reason is None and variant is None:
-            reason = ( "the card's cells take a box domain, a CONSTANT density ( no density, or an `Image` with all its "
-                       "values equal on exactly the box ), the BSP tree and no neighbour memory -- an `Image` / gaussian "
-                       "density on the card is not there yet" )
+        elif not pd._card_takes():
+            reason = "the card's cells take a box domain, the BSP tree and no neighbour memory"
+        else:
+            dens = pd._card_solve_density()
+            if dens is None:
+                reason = ( "the card integrates a constant density, an `Image` on a regular grid ( a diagonal frame, uniform knots, "
+                           "covering the box ) or isotropic gaussians in 2D -- not this distribution" )
         if reason is not None:
             raise NotImplementedError( f"SdotPlanNd on a CUDA device: { reason }. Use the CPU device ( LOOM_DEVICE=cpu ) "
                                        "for this problem." )
-        variant, rho = variant
         n = int( pd.nb_points.value )
         # THE KERNEL'S FLOAT, chosen here: `fp64` / `fp32` one kernel; `auto` / `mixed` the float kernel, then the double one
         # from the iteration where a float step stagnates ( `Newton2D.cuh`: a cut decided in float on a degenerate cloud stops
@@ -492,6 +501,11 @@ class SdotPlanNd:
             raise ValueError( f"mg_precision: 'float' or 'double' ( got { mg_precision !r } )" )
         put( "mg_float", int( mg_precision == "float" ) )
         put( "mg_smoothed", -1 if getattr( tun, "mg_smoothed", None ) is None else tun.mg_smoothed )
+        put( "continuation", _CONTINUATION[ settings.continuation ] ); put( "conv_threshold", tun.conv_threshold )
+        put( "conv_s0", tun.conv_start or 0.0 ); put( "conv_ratio", tun.conv_ratio ); put( "conv_min", tun.conv_min or 0.0 )
+        put( "conv_possible", int( dens.get( "conv_possible", True ) ) ); put( "min_scale", dens.get( "min_scale", 0.0 ) )
+        for name, v in zip( ( "img_x0", "img_y0", "img_hx", "img_hy", "img_nx", "img_ny" ), dens.get( "geom", [ 0.0 ] * 6 ) ):
+            put( name, v )
         options = RealTensor[ Axis( ShapeVar( len( _CARD_OPTIONS ) ), name = "num_card_opt" ) ]( np.asarray( opts, dtype = np.float64 ) )
 
         weights = RealTensor[ pd.num_point ]()
@@ -505,20 +519,37 @@ class SdotPlanNd:
         pd_expr, pd_kwargs, pd_produced = pd._solver_weights_call()
         limits = f"{ int( pd.card_max_vertices ) }, { overflow_warps }"
 
+        # the density: its tensors, and how the handler hands them over ( `DensityHost2D.cuh` )
+        def axis( m, name ):
+            return Axis( ShapeVar( int( m ) ), name = name )
+        if dens[ "kind" ] == "const":
+            name, dens_expr = "sdotplan_solve_card_2d", "args.inputs.density"
+            dens_args = dict( density = RealTensor( np.float64( dens[ "rho" ] ) ) )
+        elif dens[ "kind" ] == "image":
+            nx, ny = int( dens[ "geom" ][ 4 ] ), int( dens[ "geom" ][ 5 ] )
+            name, dens_expr = "sdotplan_solve_card_2d_image", "sdot::gpu2d::image_in( args.inputs.img_values )"
+            dens_args = dict( img_values = RealTensor[ axis( nx * ny, "num_card_pixel" ) ]( dens[ "values" ] ) )
+        else:
+            ng = int( dens[ "sigma" ].shape[ 0 ] )
+            name, dens_expr = "sdotplan_solve_card_2d_gauss", "sdot::gpu2d::gauss_in( args.inputs.g_pos, args.inputs.g_sigma, args.inputs.g_mass )"
+            dens_args = dict( g_pos = RealTensor[ axis( ng, "num_card_gauss" ), axis( 2, "num_card_gdim" ) ]( dens[ "pos" ] ),
+                              g_sigma = RealTensor[ axis( ng, "num_card_gauss_s" ) ]( dens[ "sigma" ] ),
+                              g_mass = RealTensor[ axis( ng, "num_card_gauss_m" ) ]( dens[ "mass" ] ) )
+
         loom.ffi_call(
-            "sdotplan_solve_card_2d",
+            name,
             FfiCode.inline(
                 f"sdot::gpu2d::solve<{ variant }>( queue, args.inputs.power_diagram, args.inputs.nu, args.inputs.w0, args.inputs.options, "
                 "args.outputs.weights, args.outputs.history, args.outputs.stats, args.outputs.cell_masses, args.outputs.barycenters, "
                 "args.outputs.cost, args.outputs.sorted_weights_out, args.outputs.node_wa_out, args.outputs.node_wb_out, args.outputs.work, "
-                f"args.errors, args.allocator, args.inputs.density, { limits } );",
+                f"args.errors, args.allocator, { dens_expr }, { limits } );",
                 includes = [ "sdot/gpu/Newton2D.cuh" ], sources = [ "sdot/sdotplan/Linear.cpp" ], allocator = True ),
             failures = pd._card_failures(),
             power_diagram = pd,
             nu = self._masses,
             w0 = w0,
             options = options,
-            density = RealTensor( np.float64( rho ) ),
+            **dens_args,
             weights = loom.out( weights ),
             history = loom.out( history, writes = ( [ "rows", "nb_steps", "weights" ] if settings.keep_weights
                                                     else [ "rows", "nb_steps" ] ),

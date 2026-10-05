@@ -155,17 +155,22 @@ class PowerDiagram_Bsp( PowerDiagram ):
             return None
         return float( vals[ 0 ] )
 
+    def _card_takes( self ):
+        """whether the card's cells take this diagram, its density apart: 2D, a box domain, the BSP tree, no neighbour memory,
+        a CUDA device ( and neither `use_card_cells = False` nor `SDOT_CARD_CELLS=0` )"""
+        import os
+        if not self.use_card_cells or os.environ.get( "SDOT_CARD_CELLS", "1" ).lower() in ( "0", "no", "false", "off" ):
+            return False
+        if self.dim_count != 2 or self.memo_counts.is_defined:
+            return False
+        if not getattr( driver.device, "is_cuda_gpu", False ):
+            return False
+        return self.box_min.is_defined and not self.bnd_directions.is_defined
+
     def _card_variant( self ):
         """`( C++ variant, density )` of the dedicated kernel for this diagram, or `None` ( the generic path ) --
         see `card_variant_for` for what is chosen from the inputs"""
-        import os
-        if not self.use_card_cells or os.environ.get( "SDOT_CARD_CELLS", "1" ).lower() in ( "0", "no", "false", "off" ):
-            return None
-        if self.dim_count != 2 or self.memo_counts.is_defined:
-            return None
-        if not getattr( driver.device, "is_cuda_gpu", False ):
-            return None
-        if not self.box_min.is_defined or self.bnd_directions.is_defined:
+        if not self._card_takes():
             return None
         rho = self._card_density()
         if rho is None:
@@ -174,6 +179,65 @@ class PowerDiagram_Bsp( PowerDiagram ):
         variant = card_variant_for( fp_size( self._domain_cell().kernel_dtype ), int( self.nb_points.value ),
                                     int( self.tree.nb_bsp_nodes.value ) )
         return variant, rho
+
+    def _card_solve_density( self ):
+        """WHAT THE CARD'S SOLVE INTEGRATES ( `gpu/Density2D.cuh` ), or `None` when it can not:
+
+          * `kind = "const"`: `rho`, and for the width continuation whether the CPU would convolve the distribution
+            ( `conv_possible`: an `Image` of equal values does, to itself; no distribution does not ) and its `min_scale`;
+          * `kind = "image"`: an `Image` with a DIAGONAL frame and UNIFORM knots ( a regular grid ), the domain inside it:
+            `values` flattened `j * nx + i` ( `i` along x ), `geom = ( x0, y0, hx, hy, nx, ny )`, `min_scale`
+            ( `Convolved< Image >::min_scale` );
+          * `kind = "gauss"`: isotropic `SumOfGaussians`: `pos`, `sigma`, `mass` ( the backend's arrays, traced or not ).
+
+        The geometry of an image is read on the host ( it is a constant of the problem ); its values are not."""
+        rho = self._card_density()
+        dist = self.distribution
+        from .distributions.Image import Image
+        from .distributions.SumOfGaussians import SumOfGaussians
+        if rho is not None:
+            res = dict( kind = "const", rho = rho, conv_possible = isinstance( dist, Image ), min_scale = 0.0 )
+            if isinstance( dist, Image ):
+                geo = dist._grid_geometry()
+                d, frame, origin, lo, hi = geo
+                shape = np.asarray( dist.shape.value, dtype = int ).reshape( -1 )
+                steps = [ float( np.sqrt( ( frame[ a ] ** 2 ).sum() ) * ( hi[ a ] - lo[ a ] ) / max( shape[ a ], 1 ) ) for a in range( d ) ]
+                res[ "min_scale" ] = min( steps ) / 4
+            return res
+        if isinstance( dist, SumOfGaussians ):
+            if int( dist.nb_dims.value ) != 2 or len( dist.sigmas.shape ) != 1 or dist.batch_axes:
+                return None
+            return dict( kind = "gauss", pos = dist.positions.raw, sigma = dist.sigmas.raw, mass = dist.weights.raw )
+        if isinstance( dist, Image ):
+            try:
+                geo = dist._grid_geometry()
+                if geo is None or dist.batch_axes:
+                    return None
+                d, frame, origin, lo, hi = geo
+                shape = np.asarray( dist.shape.value, dtype = int ).reshape( -1 )
+                if d != 2 or np.any( frame != np.diag( np.diag( frame ) ) ) or np.any( np.diag( frame ) <= 0 ):
+                    return None
+                if dist.knots.is_defined:
+                    knots = np.asarray( dist.knots, dtype = float ).reshape( d, -1 )
+                    for a in range( d ):
+                        k = knots[ a, :shape[ a ] + 1 ]
+                        if np.abs( np.diff( k ) - ( k[ -1 ] - k[ 0 ] ) / shape[ a ] ).max() > 1e-12 * max( abs( k[ -1 ] - k[ 0 ] ), 1e-300 ):
+                            return None
+                mi = np.asarray( self.box_min, dtype = float ).reshape( -1 )
+                ma = np.asarray( self.box_max, dtype = float ).reshape( -1 )
+            except ( TypeError, ValueError, RuntimeError ):
+                return None
+            f = np.diag( frame )
+            x0 = origin + f * lo
+            h = f * ( hi - lo ) / shape
+            x1 = x0 + h * shape
+            tol = 1e-12 * max( float( np.abs( np.concatenate( [ x0, x1 ] ) ).max() ), 1.0 )
+            if np.any( mi < x0 - tol ) or np.any( ma > x1 + tol ):
+                return None                                  # the Green tables of a row assume the cells inside the image
+            raw = dist.values.raw
+            return dict( kind = "image", values = raw.T.reshape( -1 ), geom = [ x0[ 0 ], x0[ 1 ], h[ 0 ], h[ 1 ], shape[ 0 ], shape[ 1 ] ],
+                         min_scale = float( min( h ) ) / 4 )
+        return None
 
     def _card_call( self, name, variant, rho, facets = False, moments = False, with_vjp = True ):
         """the measures ( and per `facets` / `moments` the laplacian's CSR, the barycentres and costs ) on the card"""

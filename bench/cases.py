@@ -197,6 +197,52 @@ def planes_cloud( n, nb_planes = 4, sigma = 0.02, seed = 0 ):
     return numpy.clip( P[ :n ], EPS, 1 - EPS ), numpy.zeros( n )
 
 
+# -- the DENSITIES of the old campaign ( the target of the transport, the seeds uniform ) ---------------------------------
+#
+#   gauss4       § 9  ( `solver/Densite.h::densite_jeu`, 4 gaussians ): centres ( 0.26, 0.30 ), ( 0.72, 0.26 ), ( 0.34, 0.74 ),
+#                ( 0.76, 0.70 ), widths `sigma x { 1, 0.7, 1.3, 1 }`, masses 0.35, 0.25, 0.25, 0.15, no floor; the domain is the
+#                unit square ( `SumOfGaussians( support_box = ... )` ); n = 1e5, the width continuation sqrt( 2 ) from s = 0.5
+#   image        § 12 ( `solver/Image.h::image_synthese`, the GPU campaign's image, doc/08 ): N x N pixels on the unit square,
+#                a smooth background `0.1 + 0.9 ( sin 3 pi x cos 2 pi y )^2`, a sharp disk ( +3 ), a thin band ( +5 ); n = 2e4
+#   image_hole   the same with an EMPTY square ( `x in ( 0.62, 0.86 ), y in ( 0.10, 0.34 )`: 5.8 % of the pixels at zero )
+
+DENSITY_CASES = ( "gauss4", "image", "image_hole" )
+
+#: the size of the density cases in the old campaign
+DENSITY_N = { "gauss4": 100_000, "image": 20_000, "image_hole": 20_000 }
+
+
+def gauss4( sigma = 0.02 ):
+    """`( centres [ 4, 2 ], widths [ 4 ], masses [ 4 ] )` of the old default set ( `densite_jeu`, `nb_gauss >= 4` )"""
+    centres = numpy.array( [ [ 0.26, 0.30 ], [ 0.72, 0.26 ], [ 0.34, 0.74 ], [ 0.76, 0.70 ] ] )
+    return centres, sigma * numpy.array( [ 1.0, 0.7, 1.3, 1.0 ] ), numpy.array( [ 0.35, 0.25, 0.25, 0.15 ] )
+
+
+def synthetic_image( size = 512, hole = True ):
+    """THE OLD SYNTHETIC IMAGE ( `image_synthese` ), as `Image.values`: `[ size, size ]`, the FIRST index along x ( pixel
+    `( i, j )` is `[ i, i + 1 ] x [ j, j + 1 ] / size` )"""
+    c = ( numpy.arange( size ) + 0.5 ) / size
+    x, y = numpy.meshgrid( c, c, indexing = "ij" )
+    r = 0.10 + 0.9 * ( numpy.sin( 3 * numpy.pi * x ) * numpy.cos( 2 * numpy.pi * y ) ) ** 2
+    r = r + 3.0 * ( ( x - 0.30 ) ** 2 + ( y - 0.70 ) ** 2 < 0.15 ** 2 )
+    r = r + 5.0 * ( numpy.abs( x - y ) < 0.02 )
+    if hole:
+        r = numpy.where( ( x > 0.62 ) & ( x < 0.86 ) & ( y > 0.10 ) & ( y < 0.34 ), 0.0, r )
+    return r
+
+
+def density_target( name, sigma = 0.02, size = 512 ):
+    """the TARGET of a density case ( an `sdot` distribution, imported here: this file declares no work )"""
+    from sdot import Image, SumOfGaussians
+    if name == "gauss4":
+        c, s, m = gauss4( sigma )
+        return SumOfGaussians( c, s, weights = m, support_box = ( [ 0.0, 0.0 ], [ 1.0, 1.0 ] ) )
+    if name in ( "image", "image_hole" ):
+        return Image( values = synthetic_image( size, hole = name == "image_hole" ), origin = [ 0.0, 0.0 ],
+                      frame = numpy.eye( 2 ) / size )
+    raise ValueError( f"unknown density case { name !r } ( { ', '.join( DENSITY_CASES ) } )" )
+
+
 # -- the entry point -------------------------------------------------------------------------------
 
 def case( name, n = None, seed = 0, wscale = 0.0 ):

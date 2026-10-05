@@ -140,6 +140,61 @@ def variant_of( step, residual ):
     return "kmt" if residual == "lin" else "kmt_log"
 
 
+# -- THE DENSITIES ( § 9 gaussians, § 12 image ) ------------------------------------------------------------
+# The old bench's own density paths, which are NOT the library's: § 9 is the width continuation of the library ( sqrt( 2 )
+# from s = 0.5, the gaussians widened -- the same path ), § 12 a box-blur ( three running means, a B-spline ) continuation
+# with an ADAPTIVE scale or a hand-tuned geometric one, the library a gaussian blur and the fixed sqrt( 2 ) ratio. `path`
+# says which. `variant`: `kmt` = trials ( `--pas essais` ), `limits` = `--pas essai-limites` ( the mass bisection, § 9.7 ).
+# n = 1e5 for § 9 ( `--threads 8`, Cholesky ), 2e4 for § 12 ( 8 threads ); the seeds uniform; tolerance `1e-6` relative.
+
+DENSITY = [
+    # § 9, 4 gaussians ( `cases.gauss4` ), the domain the unit square, continuation sqrt( 2 ) from s = 0.5 down to sigma / 4, then 0
+    dict( case = "gauss4", sigma = 0.05, n = 100_000, variant = "kmt",    iterations = 72,  diagrams = 123, backtracks = 39,  seconds = 39,
+          path = "width continuation sqrt2 from 0.5, previous weights", source = "README l.1254 ( § 9.2 ), l.1448 ( § 9.7: 123 (39) )" ),
+    dict( case = "gauss4", sigma = 0.05, n = 100_000, variant = "limits", iterations = None, diagrams = 97, backtracks = 1, seconds = None,
+          path = "width continuation sqrt2 from 0.5, mass limits", source = "README l.1448 ( § 9.7: 97 (1) )" ),
+    dict( case = "gauss4", sigma = 0.02, n = 100_000, variant = "kmt",    iterations = 139, diagrams = 400, backtracks = 246, seconds = 124,
+          path = "width continuation sqrt2 from 0.5, previous weights", source = "README l.1544 ( § 10: 400 (139), 124 s ); l.1266 ( § 9.2: 93 s ), l.1449" ),
+    dict( case = "gauss4", sigma = 0.02, n = 100_000, variant = "limits", iterations = 130, diagrams = 204, backtracks = 2,   seconds = 108,
+          path = "width continuation sqrt2 from 0.5, mass limits", source = "README l.1545 ( § 10: 204 (130), 108 s ); l.1449 ( § 9.7: 204 (2) )" ),
+    dict( case = "gauss4", sigma = 0.01, n = 100_000, variant = "kmt",    iterations = 192, diagrams = 645, backtracks = 436, seconds = 153,
+          path = "width continuation sqrt2 from 0.5, previous weights", source = "README l.1267 ( § 9.2 ), l.1450" ),
+    dict( case = "gauss4", sigma = 0.01, n = 100_000, variant = "limits", iterations = None, diagrams = 288, backtracks = 3,  seconds = None,
+          path = "width continuation sqrt2 from 0.5, mass limits", source = "README l.1450 ( § 9.7: 288 (3) )" ),
+    # § 12, the synthetic image 512^2 ( `cases.synthetic_image` ), n = 2e4, `--pas essai-limites`
+    dict( case = "image_hole", size = 512, n = 20_000, variant = "limits", iterations = None, diagrams = 100, seconds = 3.9,
+          path = "box-blur continuation, hand-tuned geometric scale", source = "README l.1964 ( § 12.6, conv, with hole )" ),
+    dict( case = "image_hole", size = 512, n = 20_000, variant = "limits", iterations = None, diagrams = 124, seconds = 4.9,
+          path = "box-blur continuation, adaptive ( both criteria )", source = "README l.1966 ( § 12.6, conv, with hole )" ),
+    dict( case = "image_hole", size = 512, n = 20_000, variant = "limits", iterations = None, diagrams = 113, seconds = 4.36,
+          path = "box-blur continuation, step chooser target 800 ( the best with hole )", source = "README l.2083 ( § 12.6.2 )" ),
+    dict( case = "image_hole", size = 512, n = 20_000, variant = "limits_direct", iterations = None, diagrams = 33, seconds = None,
+          path = "no continuation: STAGNATION", source = "README l.1963 ( § 12.6: x 33 )" ),
+    dict( case = "image", size = 512, n = 20_000, variant = "limits", iterations = None, diagrams = 90, seconds = 3.6,
+          path = "box-blur continuation, hand-tuned geometric scale", source = "README l.1964 ( § 12.6, conv, without hole )" ),
+    dict( case = "image", size = 512, n = 20_000, variant = "limits", iterations = None, diagrams = 95, seconds = 3.7,
+          path = "box-blur continuation, adaptive ( both criteria ): the brief's `--chemin conv --adaptatif`", source = "README l.1966 ( § 12.6 )" ),
+    dict( case = "image", size = 512, n = 20_000, variant = "limits", iterations = None, diagrams = 83, seconds = 3.31,
+          path = "box-blur continuation, step chooser target 3200 ( the best of the bench )", source = "README l.2085 ( § 12.6.2 )" ),
+    dict( case = "image", size = 512, n = 20_000, variant = "limits_direct", iterations = 226, diagrams = 448, backtracks = 2, seconds = 16.5,
+          path = "no continuation ( contrast 60:1 ), mass limits", source = "README l.1863 ( § 12.4 )" ),
+    dict( case = "image", size = 512, n = 20_000, variant = "kmt_direct", iterations = 100, diagrams = 1041, backtracks = 940, seconds = 12.1,
+          path = "no continuation, trials from t = 1: NOT CONVERGED ( residual 18.2 -> 15.5 )", source = "README l.1862 ( § 12.4 )" ),
+    # n = 1e5: only the FLOOR path ( `( 1 - t ) + t rho`, 14 geometric steps ), not comparable step by step
+    dict( case = "image", size = 512, n = 100_000, variant = "limits", iterations = 397, diagrams = 792, seconds = 188,
+          path = "floor continuation ( melange, 14 geometric steps ), Cholesky", source = "README l.3227 / l.3240 ( § 15.17 )" ),
+    dict( case = "image", size = 512, n = 100_000, variant = "limits", iterations = None, diagrams = 796, seconds = 90.72,
+          path = "floor continuation, AMG ( spai0, 1e-6 )", source = "README l.3457 ( § 17.3 )" ),
+]
+
+
+def density_rows( case, n, sigma = None, size = None ):
+    """the rows of `DENSITY` for this case ( `n` within 1 %; the gaussians' `sigma`, the image's `size` )"""
+    return [ r for r in DENSITY if r[ "case" ] == case and abs( r[ "n" ] - n ) <= 0.01 * r[ "n" ]
+             and ( r.get( "sigma" ) is None or sigma is None or abs( r[ "sigma" ] - sigma ) < 1e-12 )
+             and ( r.get( "size" ) is None or size is None or r[ "size" ] == size ) ]
+
+
 # -- THE LINEAR SOLVER ----------------------------------------------------------------------------------
 # totals of a whole Newton solve ( or of one factorization, as said ), n = 1e5, seconds
 

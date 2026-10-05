@@ -24,6 +24,26 @@ the python package `sdot`, so that a number measured here can be set next to the
 | `planes_voronoi` | 3 | 100 000 | 4 planes, sigma 0.02; weights 0 |
 | `planes_equal` | 3 | 100 000 | the same cloud, weights = equal volumes (made by the old bench itself) |
 
+The DENSITY cases ( `bench_newton` only; the seeds uniform in the unit square, the target the old campaign's density,
+`cases.density_target` ):
+
+| name | n | target | old |
+|---|---|---|---|
+| `gauss4` | 1e5 | 4 gaussians, widths `--sigma` x { 1, 0.7, 1.3, 1 } ( 0.05, 0.02, 0.01 ), the unit square as domain | § 9 |
+| `image` | 2e4 | the synthetic image `--image-size`^2 ( 512 ): smooth background, sharp disk, thin band, 60-90:1 | § 12, GPU doc/08 |
+| `image_hole` | 2e4 | the same with an empty square ( 5.8 % of the pixels at zero ) | § 12 |
+
+They default to the width continuation ( `--continuation=always`, from `--conv-start=0.5`, ratio sqrt( 2 ): the old § 9
+path; § 12 used a box-blur with an adaptive scale, so its rows are a reference, not the same path ). Their old numbers are
+`reference_lmo.DENSITY` ( and `reference_lmo_gpu.GPU_DENSITY` ), printed under the table:
+
+```bash
+errand -k bench --env lmo-numpy bench_newton --case=gauss4 --sigma=0.02,0.05 --step=trials,limits --threads=8 --reps=1
+errand -k bench --env lmo-jax   bench_newton --case=gauss4 --sigma=0.02,0.05 --step=trials,limits --kernel=float,mixed,double
+errand -k bench --env lmo-numpy bench_newton --case=image,image_hole --step=trials,limits --threads=8
+errand -k bench --env lmo-jax   bench_newton --case=image,image_hole --step=trials,limits --kernel=float,mixed,double
+```
+
 Domain: the unit square / cube. The four hard clouds are the text files of
 `2d_des_familles/cases` (`#` header lines, then `n`, then `x y [z] w` per line). The directory is
 `$SDOT_CASES_DIR`, by default `~/nsdot/2d_des_familles/cases` (the same path on `lmo`). `python cases.py`
@@ -52,8 +72,8 @@ micromamba --root-prefix ~/.mamba run -n prj-jax errand -k bench --env jax --no-
 
 On `lmo` (an rsync of the whole `~/Projects` tree to `/home/leclerc/Projects-rsync`, environments
 `lmo-numpy`, `lmo-torch`, `lmo-jax` of `errand-envs.py`). `lmo-numpy` is the CPU (by construction); `lmo-jax` is the GPU
-environment: there `bench_diagram` times the card's cells and `bench_newton` the card's solve ( 2D, a box, a constant
-density: `gpu/Newton2D.cuh` ), see "On the GPU" below.
+environment: there `bench_diagram` times the card's cells and `bench_newton` the card's solve ( 2D, a box; a constant
+density, an image or gaussians, the width continuation: `gpu/Newton2D.cuh` ), see "On the GPU" below.
 
 ```bash
 errand -k bench --env lmo-numpy "bench_diagram" --case=uniform --dim=2 --n=1000000 --threads=8 --pin=yes --kernel=double --reps=3

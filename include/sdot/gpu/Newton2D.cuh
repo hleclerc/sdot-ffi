@@ -1,8 +1,8 @@
 #pragma once
 
 // =====================================================================================
-// THE TRANSPORT SOLVED ON THE CARD ( 2D, a box, a constant density ): what `sdotplan/Solve.h` + `Newton.h` do on the
-// CPU, for the `SdotPlanNd` of a CUDA driver, in ONE ffi call -- so it runs under `jax.jit` like in eager.
+// THE TRANSPORT SOLVED ON THE CARD ( 2D, a box; a constant density, an image or gaussians ): what `sdotplan/Solve.h` +
+// `Newton.h` do on the CPU, for the `SdotPlanNd` of a CUDA driver, in ONE ffi call -- so it runs under `jax.jit` like in eager.
 //
 // The handler is HOST code ( loom's `FfiCode.inline` ): it drives the Newton loop and launches everything on the call's
 // stream. The vectors live on the card, IN TREE RANKS ( the order of `sorted_positions`, of the facets, of the
@@ -41,11 +41,22 @@
 //           the check being the trial diagram ); then the same damping as TRIALS. The CPU's `beta` ( a first trial grown by
 //           `mult_lim` ) has no use here: the polynomial pass costs a fraction of a diagram, so it is done every time.
 //
+// = The density and the width continuation ( `Density2D.cuh`, `DensityHost2D.cuh` )
+//
+//   A constant ( the cells' closed forms ), an `Image` on a regular grid ( Green on its rows ) or isotropic gaussians ( the
+//   polar corners, `erf`s ): integrated on the cells' edges, the mass, the facets of the laplacian and the moments. The
+//   WIDTH CONTINUATION is `Solve.h`'s, stage for stage: the same widths ( `s0` half the diameter of the box or given, divided by
+//   `ratio` down to the distribution's scale, then 0 ), the same triggers ( `always`; `auto` when the best start leaves a
+//   cell under `threshold` times the smallest target ), the target rescaled to the domain's mass of each stage, a Newton per
+//   stage from the previous weights, the moments on the true density. The density of a stage is made on the card ( the
+//   image blurred by the CPU's filter, the gaussians widened ).
+//
+//   The step `limits` with a density: the mass along `w + t d` is no polynomial, but the cell with its edges FROZEN is still
+//   known at every `t`, so the forward and backward passes bisect its mass ( `AlphaForwardDens`, `AlphaBackwardDens` ).
+//
 // = What it does not do ( yet )
 //
-//   * a density that is not a constant ( `Image`, gaussians ): the cells only integrate a constant; `SdotPlanNd` refuses;
-//   * the width continuation ( it needs a convolved density ); `auto` proceeds without it;
-//   * 3D, other domains than a box, the neighbour memory.
+//   * 3D, other domains than a box, the neighbour memory; an image on a rotated or irregular grid.
 //
 // = Failures
 //
@@ -58,7 +69,9 @@
 
 #include "Majorant2D.cuh"
 #include "Linear2D.cuh"
+#include "DensityHost2D.cuh"
 #include "../sdotplan/Report.h"
+#include "../sdotplan/Continuation.h"
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -72,8 +85,11 @@ enum Opt : int {
     O_TOL_ABS = 0, O_TOL_REL, O_T_MIN, O_MULT_OK, O_FACTOR, O_MAXIT, O_MAX_BACKTRACKS, O_STEP, O_RESIDUAL, O_POWER, O_SWITCH,
     O_LIN, O_HOST_METHOD, O_LIN_TOL, O_AMG_VARIANT, O_MG_SHIFT, O_MG_RECYCLE, O_MG_REBUILD, O_MG_STOP, O_MG_NU, O_MG_KCYCLE,
     O_LIN_MAXIT, O_TRACE, O_MG_FLOAT, O_MG_SMOOTHED,
+    O_CONTINUATION, O_CONV_THRESHOLD, O_CONV_S0, O_CONV_RATIO, O_CONV_MIN, O_CONV_POSSIBLE, O_MIN_SCALE,
+    O_IMG_X0, O_IMG_Y0, O_IMG_HX, O_IMG_HY, O_IMG_NX, O_IMG_NY,
     NB_OPTS
 };
+enum ContinuationKind : int { CONT_NEVER = 0, CONT_AUTO = 1, CONT_ALWAYS = 2 };
 enum StepKind : int { STEP_TRIALS = 0, STEP_LIMITS = 1 };
 enum ResidualKind : int { RES_LIN = 0, RES_LOG = 1, RES_POWER = 2 };
 enum LinKind : int { LIN_CG = 0, LIN_MG = 1, LIN_HOST = 2 };
@@ -410,6 +426,125 @@ struct AlphaBackward {
     }
 };
 
+// ---- THE MASS OF A CELL ALONG THE DIRECTION, for a density that is not a constant ( the step ) --------------------------------
+//
+// The mass along `w + t d` is not a polynomial any more, but with its edges frozen the cell is still known at every `t`: its
+// vertices are the crossings of consecutive lines, each line's offset affine in `t`. So the step is the same as for a constant
+// ( forward on the accepted diagram's edges, backward on the trial's ), each root found by a BISECTION on the frozen cell's
+// mass ( the CPU's `Bounds.h` bisects too, on exact cells: `1e-2` relative, the admissible end ).
+
+/// the mass of the cell of rank `k` whose cuts are `edges[ q * n + k ]`, `q < nb`, frozen, at the weights `w + t d`: `false` if
+/// two consecutive lines are nearly parallel ( no say ). Counterclockwise as the cell it comes from: a cell that turns inside
+/// out has a negative mass ( it is crushed ).
+template<class TF,class TR,class D>
+__device__ bool frozen_mass( const Strided<TF,2> &pos, const Strided<TF,1> &box_min, const Strided<TF,1> &box_max, const double *w, const double *d,
+                             double t, const TR *edges, SI n, SI k, int nb, const D &dens, double &m ) {
+    const double px = double( pos( k, 0 ) ), py = double( pos( k, 1 ) );
+    const double box[ 4 ] = { double( box_min( 0 ) ) - px, double( box_min( 1 ) ) - py, double( box_max( 0 ) ) - px, double( box_max( 1 ) ) - py };
+    double ax, ay, ao, ad;
+    line_along( pos, w, d, t, k, edges[ SI( nb - 1 ) * n + k ], px, py, box, ax, ay, ao, ad );
+    DensSums acc;
+    DensState<D> st;
+    double fx = 0, fy = 0, qx = 0, qy = 0;
+    for ( int i = 0; i < nb; ++i ) {
+        double bx, by, bo, bd;
+        line_along( pos, w, d, t, k, edges[ SI( i ) * n + k ], px, py, box, bx, by, bo, bd );
+        const double det = ax * by - ay * bx;
+        if ( ! ( det * det > DET_MIN * DET_MIN * ( ax * ax + ay * ay ) * ( bx * bx + by * by ) ) )
+            return false;
+        const double inv = 1 / det;
+        const double vx = ( ao * by - bo * ay ) * inv, vy = ( ax * bo - bx * ao ) * inv;
+        if ( i == 0 ) { fx = vx; fy = vy; }
+        else density_edge_mass( dens, st, px, py, qx, qy, vx, vy, acc );
+        qx = vx; qy = vy;
+        ax = bx; ay = by; ao = bo;
+    }
+    density_edge_mass( dens, st, px, py, qx, qy, fx, fy, acc );
+    m = acc.m;
+    return true;
+}
+
+/// the bisection on `[ lo, hi ]`, `mass( lo ) >= eps > mass( hi )`: the admissible end, to `1e-2` relative and above zero
+template<class F>
+__device__ double mass_bisection( double lo, double hi, double eps, const F &mass ) {
+    for ( int round = 0; round < 64; ++round ) {
+        if ( hi - lo <= 1e-2 * hi && lo > 0 )
+            break;
+        const double mid = 0.5 * ( lo + hi );
+        double m;
+        if ( mass( mid, m ) && m >= eps ) lo = mid;
+        else                               hi = mid;
+    }
+    return lo;
+}
+
+/// FORWARD, every cell of the accepted diagram ( a density ): the first `t` in `( 0, 1 ]` where its frozen mass falls under `eps`
+/// -- looked for at `t = 1` and at the bottom of its area's parabola ( where a cell that dips then grows back is thinnest );
+/// `1e300`: none seen
+template<class TF,class TR,class D>
+struct AlphaForwardDens {
+    Strided<TF,2> pos;
+    Strided<TF,1> box_min, box_max;
+    const double *w, *d;
+    const TR     *edges;
+    const int    *nb_edges;
+    SI            n;
+    D             dens;
+    double        eps;
+    __device__ void operator()( SI k, Min1 &acc ) const {
+        const int nb = nb_edges[ k ];
+        if ( nb < 3 )
+            return;
+        auto mass = [&]( double t, double &m ) { return frozen_mass( pos, box_min, box_max, w, d, t, edges, n, k, nb, dens, m ); };
+        double m1, hi = -1;
+        if ( ! mass( 1.0, m1 ) )
+            return;
+        if ( m1 < eps )
+            hi = 1;
+        else {
+            double a0, a1, a2;
+            if ( area_polynomial( pos, box_min, box_max, w, d, 0.0, edges, n, k, nb, a0, a1, a2 ) && a2 > 0 ) {
+                const double ts = -a1 / ( 2 * a2 );
+                double ms;
+                if ( ts > 0 && ts < 1 && mass( ts, ms ) && ms < eps )
+                    hi = ts;
+            }
+        }
+        if ( hi < 0 )
+            return;
+        acc.m = fmin( acc.m, mass_bisection( 0.0, hi, eps, mass ) );
+    }
+};
+
+/// BACKWARD, the cells of the trial diagram ( at `t_trial` ) under the floor ( a density ): where their frozen mass crossed `eps`
+/// going back; half the trial when the frozen cell is under the floor at `t = 0` too
+template<class TF,class TR,class D>
+struct AlphaBackwardDens {
+    Strided<TF,2> pos;
+    Strided<TF,1> box_min, box_max;
+    const double *w, *d, *a;
+    const TR     *edges;
+    const int    *nb_edges;
+    SI            n;
+    D             dens;
+    double        eps, t_trial;
+    __device__ void operator()( SI k, MinCount &acc ) const {
+        if ( ! ( a[ k ] < eps ) )
+            return;
+        acc.c += 1;
+        double target = 0.5 * t_trial;
+        const int nb = nb_edges[ k ];
+        auto mass = [&]( double t, double &m ) { return frozen_mass( pos, box_min, box_max, w, d, t, edges, n, k, nb, dens, m ); };
+        double m0;
+        if ( nb >= 3 && mass( 0.0, m0 ) && m0 >= eps ) {
+            const double tg = mass_bisection( 0.0, t_trial, eps, mass );
+            if ( tg > 0 && tg < t_trial )
+                target = tg;
+        }
+        acc.m = fmin( acc.m, target );
+    }
+};
+
 // ---- the timers ---------------------------------------------------------------------------------------------------------
 
 /// the card's time of a stage: two events around it, read once the stream has passed them ( after a read back )
@@ -446,22 +581,25 @@ struct Slot {
 
 /// THE SOLVE ( see the header ). `pd`: the diagram ( its tree, its positions; its weights are not read ); `nu_in`, `w0_in`:
 /// user order; `opts_in`: `NB_OPTS` reals. Outputs as `sdotplan::solve`, plus the diagram's `sorted_weights_out`,
-/// `node_wa_out`, `node_wb_out` and `work` ( the capacity `nb_facets` ). `max_vertices`, `overflow_warps`: the cells' fourth
-/// pass ( `Cell2D.cuh::Overflow` ).
+/// `node_wa_out`, `node_wb_out` and `work` ( the capacity `nb_facets` ). `dens_in`: the density ( a 0-d tensor: a constant;
+/// `image_in( ... )`, `gauss_in( ... )`: `DensityHost2D.cuh` ). `max_vertices`, `overflow_warps`: the cells' fourth pass
+/// ( `Cell2D.cuh::Overflow` ).
 template<class V,class VD = V>
 void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const auto &w0_in, const auto &opts_in,
             auto &&weights, auto &&hist, auto &&stats, auto &&masses, auto &&bary, auto &&cost,
             auto &&sorted_weights_out, auto &&node_wa_out, auto &&node_wb_out, auto &&work,
-            const auto &errors_, auto &allocator, const auto &rho_in, int max_vertices, int overflow_warps ) {
+            const auto &errors_, auto &allocator, const auto &dens_in, int max_vertices, int overflow_warps ) {
     using PD = std::decay_t<decltype( pd )>;
     using TF = TFOf<PD>;
     using TI = TIOf<PD>;
     using TR = typename V::TR;
     using TN = typename V::TN;
-    using TK = typename V::TK;
-    using CardT = Card<V,true,MEASURES | FACETS | EDGES,TF,TI>;
-    using CardD = Card<VD,true,MEASURES | FACETS | EDGES,TF,TI>;
-    using MomT  = Card<VD,true,MEASURES | MOMENTS,TF,TI>;
+    using DH = typename DensityHostOf<std::decay_t<decltype( dens_in )>>::type;
+    using D  = typename DH::Dev;
+    constexpr bool CONST = std::is_same_v<D,DensConst>;
+    using CardT = Card<V,true,MEASURES | FACETS | EDGES,TF,TI,D>;
+    using CardD = Card<VD,true,MEASURES | FACETS | EDGES,TF,TI,D>;
+    using MomT  = Card<VD,true,MEASURES | MOMENTS,TF,TI,D>;
     constexpr bool MIXED = ! std::is_same_v<V,VD>;       // the float kernel first, the double one once the float stagnates
     static_assert( std::is_same_v<typename V::TR,typename VD::TR> && std::is_same_v<typename V::TN,typename VD::TN>, "one tree, one rank type" );
     static_assert( std::is_same_v<TF,double>, "the card's solver works on float64 positions" );
@@ -489,6 +627,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     const double power = o[ O_POWER ], switch_residual = o[ O_SWITCH ];
     const int lin_kind = int( o[ O_LIN ] );
     const bool trace = o[ O_TRACE ] != 0;
+    const int continuation = int( o[ O_CONTINUATION ] );
 
     // ---- the fourth pass's slots, ONE budget for every card of the solve ( they run one after the other ), sized for the
     // largest cell form ( the double kernel's, MIXED )
@@ -498,17 +637,27 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     if ( ! overflow.slots )
         return;
 
+    // ---- the density ( `DensityHost2D.cuh` ): a constant, or the image / gaussians as given ( `s = 0` )
+    DH dh;
+    if constexpr ( CONST ) {
+        dh.possible = o[ O_CONV_POSSIBLE ] != 0;
+        dh.scale = o[ O_MIN_SCALE ];
+    } else if ( ! dh.prepare( queue, allocator, dens_in, &o[ O_IMG_X0 ] ) )
+        return;
+
     // ---- the card's diagram, its two slots, the majorants
     CardT card;
     if ( ! card.prepare( queue, pd, allocator, overflow ) )
         return;
-    set_density( card.pb, rho_in );
     double rho = 1;
-    if constexpr ( requires { rho_in.data().raw; } ) {
-        cuda_check( cudaMemcpyAsync( &rho, rho_in.data().raw, sizeof( double ), cudaMemcpyDeviceToHost, queue.stream ), "read of the density" );
-        cuda_check( cudaStreamSynchronize( queue.stream ), "sync ( density )" );
-    } else
-        rho = double( rho_in );
+    if constexpr ( CONST ) {
+        set_density( card.pb, dens_in );
+        if constexpr ( requires { dens_in.data().raw; } ) {
+            cuda_check( cudaMemcpyAsync( &rho, dens_in.data().raw, sizeof( double ), cudaMemcpyDeviceToHost, queue.stream ), "read of the density" );
+            cuda_check( cudaStreamSynchronize( queue.stream ), "sync ( density )" );
+        } else
+            rho = double( dens_in );
+    }
     card.pb.user_order = false;
     const SI fcap = std::max<SI>( SI( work.nb_facets.max ), 1 );
     card.pb.fcap = fcap;
@@ -520,11 +669,23 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     if constexpr ( MIXED ) {
         if ( ! cardd.prepare( queue, pd, allocator, overflow ) )
             return;
-        set_density( cardd.pb, rho_in );
+        if constexpr ( CONST )
+            set_density( cardd.pb, dens_in );
         cardd.pb.user_order = false;
         cardd.pb.fcap = fcap;
         cardd.pb.nodes = card.pb.nodes;
     }
+    /// the density at the width `s` for the cards of the descent ( a constant: nothing to do )
+    double s_current = 0;
+    auto set_stage = [&]( double s ) {
+        s_current = s;
+        if constexpr ( ! CONST ) {
+            dh.at( queue, s, false );
+            card.pb.dens = dh.dev;
+            if constexpr ( MIXED )
+                cardd.pb.dens = dh.dev;
+        }
+    };
     Slot<TR> slots[ 2 ];
     for ( Slot<TR> &s : slots ) {
         s.a = vec( n );
@@ -543,7 +704,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
         return;
 
     // ---- the vectors ( ranks ), the reductions, the laplacian, the linear solver
-    double *nu = vec( n ), *w = vec( n ), *w2 = vec( n ), *d = vec( n ), *b = vec( n ), *gauge = vec( 1 );
+    double *nu = vec( n ), *nu0 = vec( n ), *w = vec( n ), *w2 = vec( n ), *d = vec( n ), *b = vec( n ), *gauge = vec( 1 );
     SI *r0_dev = static_cast<SI *>( take( allocator, SI( sizeof( SI ) ) ) );
     Report *rep_dev = static_cast<Report *>( take( allocator, SI( sizeof( Report ) ) ) );
     RedSlot<DiagRed> red_diag;
@@ -553,7 +714,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     RedSlot<Min1> red_min;
     RedSlot<MinCount> red_mc;
     RedSlot<Extent2> red_ext;
-    if ( ! nu || ! w || ! w2 || ! d || ! b || ! gauge || ! r0_dev || ! rep_dev || ! red_diag.take_from( allocator ) || ! red1.take_from( allocator )
+    if ( ! nu || ! nu0 || ! w || ! w2 || ! d || ! b || ! gauge || ! r0_dev || ! rep_dev || ! red_diag.take_from( allocator ) || ! red1.take_from( allocator )
          || ! red2.take_from( allocator ) || ! redm.take_from( allocator ) || ! red_min.take_from( allocator ) || ! red_mc.take_from( allocator )
          || ! red_ext.take_from( allocator ) )
         return;
@@ -611,7 +772,8 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     launch_kernel( queue, &find_rank0<TI>, blocks_for( n ), BLOCK, 0, n, ids, r0_dev );
     SI r0 = 0;
     read_back( queue, &r0, ( const SI * ) r0_dev, 1 );
-    launch_kernel( queue, &gather_ranks<TF,TI>, blocks_for( n ), BLOCK, 0, n, strided( nu_in ), ids, nu );
+    launch_kernel( queue, &gather_ranks<TF,TI>, blocks_for( n ), BLOCK, 0, n, strided( nu_in ), ids, nu0 );
+    cuda_check( cudaMemcpyAsync( nu, nu0, sizeof( double ) * n, cudaMemcpyDeviceToDevice, queue.stream ), "copy of the target" );
 
     /// the report of slot `s` against the current target, residual and floor ( reductions, one read back )
     auto report = [&]( Slot<TR> &s ) {
@@ -656,18 +818,19 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     std::vector<double> rows;                            // the history, written to the card at the end
     const SI cap_steps = SI( hist.rows.shape( 0 ) );
     SI nb_steps = 0;
+    int nb_steps_before = 0;                             // the steps of the previous stages
     auto after_step = [&]( int it, double t, int nb_evals ) {
         if ( nb_steps >= cap_steps ) return;
         const Report &r = cur->rep;
         double row[ sp::NB_HIST ];
-        row[ sp::H_STEP ] = it;
+        row[ sp::H_STEP ] = nb_steps_before + it;
         row[ sp::H_T ] = t;
         row[ sp::H_RESIDUAL_L2 ] = std::sqrt( r.d.sum_d2 );
         row[ sp::H_MIN_MASS ] = r.d.min_a;
         row[ sp::H_MAX_RESIDUAL ] = r.d.max_abs;
         row[ sp::H_NB_DIAG ] = nb_diag;
         row[ sp::H_NB_EVALS ] = nb_evals;
-        row[ sp::H_S ] = 0;
+        row[ sp::H_S ] = s_current;
         rows.insert( rows.end(), row, row + sp::NB_HIST );
         if constexpr ( std::decay_t<decltype( hist.weights )>::is_valid )
             launch_kernel( queue, &scatter_row<TF,TI>, blocks_for( n ), BLOCK, 0, n, nb_steps, ( const double * ) w, ids,
@@ -686,19 +849,29 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     } else
         launch_kernel( queue, &fill_value, blocks_for( n ), BLOCK, 0, w, 0.0, n );
     int start = given ? sp::START_GIVEN : sp::START_VORONOI;
-    reduce( queue, n, SumOf{ nu }, red1.partials, red1.out );
+    reduce( queue, n, SumOf{ nu0 }, red1.partials, red1.out );
     Sum1 snu;
     read_back( queue, &snu, ( const Sum1 * ) red1.out, 1 );
-    double nu_min = 0;
+    double nu_min0 = 0;
     {
-        reduce( queue, n, MinOf{ nu }, red_min.partials, red_min.out );
+        reduce( queue, n, MinOf{ nu0 }, red_min.partials, red_min.out );
         Min1 m;
         read_back( queue, &m, ( const Min1 * ) red_min.out, 1 );
-        nu_min = m.m;
+        nu_min0 = m.m;
     }
+    double box_lo[ 2 ], box_hi[ 2 ];
+    read_back( queue, box_lo, reinterpret_cast<const double *>( pd.box_min.data().raw ), 2 );
+    read_back( queue, box_hi, reinterpret_cast<const double *>( pd.box_max.data().raw ), 2 );
+
+    // ---- THE STAGES OF THE WIDTH CONTINUATION ( `Solve.h`, `Continuation.h` ): `s0, s0 / ratio, ... >= s_min`, then `0`
+    const double s0 = o[ O_CONV_S0 ] > 0 ? o[ O_CONV_S0 ]
+                    : 0.5 * std::sqrt( ( box_hi[ 0 ] - box_lo[ 0 ] ) * ( box_hi[ 0 ] - box_lo[ 0 ] ) + ( box_hi[ 1 ] - box_lo[ 1 ] ) * ( box_hi[ 1 ] - box_lo[ 1 ] ) );
+    auto the_steps = [&]() { return sp::continuation_steps( s0, o[ O_CONV_RATIO ], o[ O_CONV_MIN ] > 0 ? o[ O_CONV_MIN ] : dh.min_scale( queue ) ); };
+    std::vector<double> scales = continuation == CONT_ALWAYS && dh.possible ? the_steps() : std::vector<double>{ 0.0 };
+    set_stage( scales[ 0 ] );
 
     diagram( w, *cur );
-    if ( ! stop_all && given && cur->rep.d.min_a < 1e-3 * nu_min ) {   // a warm start that empties a cell: the Voronoi, if better
+    if ( ! stop_all && given && cur->rep.d.min_a < 1e-3 * nu_min0 ) {   // a warm start that empties a cell: the Voronoi, if better
         launch_kernel( queue, &fill_value, blocks_for( n ), BLOCK, 0, w2, 0.0, n );
         diagram( w2, *tri );
         if ( tri->rep.d.min_a > cur->rep.d.min_a ) { std::swap( cur, tri ); std::swap( w, w2 ); start = sp::START_VORONOI; }
@@ -707,180 +880,214 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
         reduce( queue, n, ExtentOf<TF>{ pos }, red_ext.partials, red_ext.out );
         Extent2 ext;
         read_back( queue, &ext, ( const Extent2 * ) red_ext.out, 1 );
-        double lo[ 2 ], hi[ 2 ];
-        read_back( queue, lo, reinterpret_cast<const double *>( pd.box_min.data().raw ), 2 );
-        read_back( queue, hi, reinterpret_cast<const double *>( pd.box_max.data().raw ), 2 );
         double a = 1;
         for ( int k = 0; k < 2; ++k ) {
-            const double span_dom = ( hi[ k ] - lo[ k ] ) * ( 1 - 2 * 0.1 ), span_pts = std::max( ext.hi[ k ] - ext.lo[ k ], 1e-300 );
+            const double span_dom = ( box_hi[ k ] - box_lo[ k ] ) * ( 1 - 2 * 0.1 ), span_pts = std::max( ext.hi[ k ] - ext.lo[ k ], 1e-300 );
             a = std::min( a, span_dom / span_pts );
         }
-        const double b0 = ( lo[ 0 ] + hi[ 0 ] ) / 2 - a * ( ext.lo[ 0 ] + ext.hi[ 0 ] ) / 2;
-        const double b1 = ( lo[ 1 ] + hi[ 1 ] ) / 2 - a * ( ext.lo[ 1 ] + ext.hi[ 1 ] ) / 2;
+        const double b0 = ( box_lo[ 0 ] + box_hi[ 0 ] ) / 2 - a * ( ext.lo[ 0 ] + ext.hi[ 0 ] ) / 2;
+        const double b1 = ( box_lo[ 1 ] + box_hi[ 1 ] ) / 2 - a * ( ext.lo[ 1 ] + ext.hi[ 1 ] ) / 2;
         launch_kernel( queue, &similarity_weights<TF>, blocks_for( n ), BLOCK, 0, n, pos, a, b0, b1, w2 );
         diagram( w2, *tri );
         if ( tri->rep.d.min_a > cur->rep.d.min_a ) { std::swap( cur, tri ); std::swap( w, w2 ); start = sp::START_SIMILARITY; }
     }
     const double min_start_mass = cur->rep.d.min_a;
-
-    // ---- the target at the scale of what the domain holds, the gauge
-    const double domain_mass = cur->rep.d.sum_a;
-    if ( domain_mass > 0 && snu.s > 0 && domain_mass != snu.s ) {
-        launch_kernel( queue, &scale_values, blocks_for( n ), BLOCK, 0, n, nu, domain_mass / snu.s );
-        nu_min *= domain_mass / snu.s;
+    // AUTO: the density is missing where cells are -> the continuation, from the same start
+    if ( ! stop_all && continuation == CONT_AUTO && dh.possible && scales.size() == 1 && min_start_mass < o[ O_CONV_THRESHOLD ] * nu_min0 ) {
+        scales = the_steps();
+        set_stage( scales[ 0 ] );
+        diagram( w, *cur );
     }
     launch_kernel( queue, &pick_value, 1, 1, 0, ( const double * ) w, r0, gauge );
     launch_kernel( queue, &subtract_scalar, blocks_for( n ), BLOCK, 0, w, ( const double * ) gauge, 1.0, n );
-    report( *cur );
 
-    // ---- THE NEWTON LOOP ( `Newton.h::solves` )
+    // ---- THE STAGES, each a Newton ( `Newton.h::solves` )
     int status = sp::S_RUNNING, nb_iter = 0, nb_backtracks = 0, it_switch = -1, nb_limit_rounds = 0;
     SI nb_cell_lim = 0;
-    double residual0 = 0, residual_max = cur->rep.d.max_abs, t_last = 1;
+    double residual0 = 0, eps0 = 0, residual_max = cur->rep.d.max_abs, domain_mass = 0;
     if ( stop_all ) status = failed ? sp::S_FAILURE : sp::S_CAPACITY;
-    after_step( 0, 0, 1 );
-    for ( int it = 0; it < maxit && status == sp::S_RUNNING; ++it ) {
-        const double worst = cur->rep.d.max_abs, worst_rel = cur->rep.d.max_rel;
-        if ( switch_residual > 0 && res_cur != RES_LIN && worst_rel <= switch_residual ) {
-            res_cur = RES_LIN;
-            it_switch = it;
-            if ( trace ) std::printf( "      switch: residual -> lin ( max|a-nu|/nu %.3e <= %.3e )\n", worst_rel, switch_residual );
+    for ( size_t stage = 0; stage < scales.size() && ! stop_all; ++stage ) {
+        if ( stage > 0 ) {                               // the next density: the measures of the start redone
+            set_stage( scales[ stage ] );
+            diagram( w, *cur );
+            if ( stop_all ) { status = failed ? sp::S_FAILURE : sp::S_CAPACITY; break; }
         }
-        if ( it == 0 ) {
-            eps = 0.5 * std::min( nu_min, cur->rep.d.min_a );
-            residual0 = worst;
+        // the target at the scale of what the domain holds of THIS density
+        domain_mass = cur->rep.d.sum_a;
+        cuda_check( cudaMemcpyAsync( nu, nu0, sizeof( double ) * n, cudaMemcpyDeviceToDevice, queue.stream ), "copy of the target" );
+        double nu_min = nu_min0;
+        if ( domain_mass > 0 && snu.s > 0 && domain_mass != snu.s ) {
+            launch_kernel( queue, &scale_values, blocks_for( n ), BLOCK, 0, n, nu, domain_mass / snu.s );
+            nu_min *= domain_mass / snu.s;
         }
-        report( *cur );                                  // its merit in the residual in use, its cells under the floor
-        const double nr = merit_of( cur->rep, res_cur );
-        residual_max = worst;
-        if ( worst <= tol_abs || ( tol_rel > 0 && worst_rel <= tol_rel ) ) {
-            if ( trace ) std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  CONVERGED\n", it, nr, worst );
-            status = sp::S_CONVERGED;
-            break;
-        }
-        ++nb_iter;
-        const int g0 = nb_diag;
+        if ( trace && scales.size() > 1 )
+            std::printf( "  stage %d / %d : s = %.4e, domain mass %.6f, smallest mass %.3e\n", int( stage + 1 ), int( scales.size() ), s_current,
+                         domain_mass, cur->rep.d.min_a );
+        res_cur = residual;
+        eps = 0;
+        report( *cur );
 
-        // the right-hand side, projected on the range; the laplacian of the accepted diagram
-        tm_asm.start( queue );
-        if ( res_cur != RES_LIN )
-            reduce( queue, n, RhsSums{ cur->a, nu, power, res_cur }, red2.partials, red2.out );
-        launch_kernel( queue, &rhs_kernel, blocks_for( n ), BLOCK, 0, n, ( const double * ) cur->a, ( const double * ) nu, power, res_cur,
-                       ( const Sum2 * ) red2.out, b );
-        reduce( queue, n, SumOf{ b }, red1.partials, red1.out );
-        launch_kernel( queue, &subtract_scalar, blocks_for( n ), BLOCK, 0, b, reinterpret_cast<const double *>( red1.out ), 1.0 / double( n ), n );
-        card.pb.fi = cur->fi; card.pb.fj = cur->fj; card.pb.fc = cur->fc;
-        card.counters = cur->counters; card.pb.counters = cur->counters;
-        assemble_laplacian_in( queue, card, lws, lrow, lcol, lval, ldia );
-        tm_asm.stop( queue );
+        int st_status = sp::S_RUNNING;
+        double t_last = 1;
+        after_step( 0, 0, 1 );
+        for ( int it = 0; it < maxit; ++it ) {
+            const double worst = cur->rep.d.max_abs, worst_rel = cur->rep.d.max_rel;
+            if ( switch_residual > 0 && res_cur != RES_LIN && worst_rel <= switch_residual ) {
+                res_cur = RES_LIN;
+                if ( stage == 0 ) it_switch = it;
+                if ( trace ) std::printf( "      switch: residual -> lin ( max|a-nu|/nu %.3e <= %.3e )\n", worst_rel, switch_residual );
+            }
+            if ( it == 0 ) {
+                eps = 0.5 * std::min( nu_min, cur->rep.d.min_a );
+                if ( stage == 0 ) { residual0 = worst; eps0 = eps; }
+            }
+            report( *cur );                              // its merit in the residual in use, its cells under the floor
+            const double nr = merit_of( cur->rep, res_cur );
+            residual_max = worst;
+            if ( worst <= tol_abs || ( tol_rel > 0 && worst_rel <= tol_rel ) ) {
+                if ( trace ) std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  CONVERGED\n", it, nr, worst );
+                st_status = sp::S_CONVERGED;
+                break;
+            }
+            ++nb_iter;
+            const int g0 = nb_diag;
 
-        // the direction
-        const double tl0 = wall_now();
-        const bool solved = lin_kind == LIN_HOST ? host.solve( queue, L, b, d )
-                          : lin_float ? linf.solve( queue, allocator, L, b, d ) : lin.solve( queue, allocator, L, b, d );
-        t_lin += wall_now() - tl0;
-        tm_asm.collect();
-        if ( ! solved ) {
-            status = sp::S_LINEAR_FAILURE;
-            break;
-        }
-        launch_kernel( queue, &pick_value, 1, 1, 0, ( const double * ) d, r0, gauge );
-        launch_kernel( queue, &subtract_scalar, blocks_for( n ), BLOCK, 0, d, ( const double * ) gauge, 1.0, n );
+            // the right-hand side, projected on the range; the laplacian of the accepted diagram
+            tm_asm.start( queue );
+            if ( res_cur != RES_LIN )
+                reduce( queue, n, RhsSums{ cur->a, nu, power, res_cur }, red2.partials, red2.out );
+            launch_kernel( queue, &rhs_kernel, blocks_for( n ), BLOCK, 0, n, ( const double * ) cur->a, ( const double * ) nu, power, res_cur,
+                           ( const Sum2 * ) red2.out, b );
+            reduce( queue, n, SumOf{ b }, red1.partials, red1.out );
+            launch_kernel( queue, &subtract_scalar, blocks_for( n ), BLOCK, 0, b, reinterpret_cast<const double *>( red1.out ), 1.0 / double( n ), n );
+            card.pb.fi = cur->fi; card.pb.fj = cur->fj; card.pb.fc = cur->fc;
+            card.counters = cur->counters; card.pb.counters = cur->counters;
+            assemble_laplacian_in( queue, card, lws, lrow, lcol, lval, ldia );
+            tm_asm.stop( queue );
 
-        // ---- the step
-        double t = std::min( 1.0, mult_ok * t_last );
-        bool already = false;
-        double alpha_lim = -1;
-        int nb_evals = 0;
-        if ( step_kind == STEP_LIMITS ) {
-            const double th0 = wall_now();
-            tm_lim.start( queue );
-            reduce( queue, n, AlphaForward<TF,TR>{ pos, box_min, box_max, w, d, cur->edges, cur->nb_edges, n, rho, eps }, red_min.partials, red_min.out );
-            Min1 am;
-            read_back( queue, &am, ( const Min1 * ) red_min.out, 1 );
-            tm_lim.stop( queue );
-            tm_lim.collect();
-            t_lim_host += wall_now() - th0;
-            t = am.m >= 1 ? 1.0 : factor * am.m;
-            double t_done = -1;
-            for ( int round = 0; round < 8; ++round ) {
-                launch_kernel( queue, &trial_weights, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, ( const double * ) d, t, r0, w2 );
-                diagram( w2, *tri );
-                ++nb_evals;
-                t_done = t;
-                if ( stop_all || tri->rep.d.nb_below == 0 )
-                    break;
-                ++nb_limit_rounds;
-                const double th1 = wall_now();
+            // the direction
+            const double tl0 = wall_now();
+            const bool solved = lin_kind == LIN_HOST ? host.solve( queue, L, b, d )
+                              : lin_float ? linf.solve( queue, allocator, L, b, d ) : lin.solve( queue, allocator, L, b, d );
+            t_lin += wall_now() - tl0;
+            tm_asm.collect();
+            if ( ! solved ) {
+                st_status = sp::S_LINEAR_FAILURE;
+                break;
+            }
+            launch_kernel( queue, &pick_value, 1, 1, 0, ( const double * ) d, r0, gauge );
+            launch_kernel( queue, &subtract_scalar, blocks_for( n ), BLOCK, 0, d, ( const double * ) gauge, 1.0, n );
+
+            // ---- the step
+            double t = std::min( 1.0, mult_ok * t_last );
+            bool already = false;
+            double alpha_lim = -1;
+            int nb_evals = 0;
+            if ( step_kind == STEP_LIMITS ) {
+                const double th0 = wall_now();
                 tm_lim.start( queue );
-                reduce( queue, n, AlphaBackward<TF,TR>{ pos, box_min, box_max, w, d, tri->a, tri->edges, tri->nb_edges, n, rho, eps, t },
-                        red_mc.partials, red_mc.out );
-                MinCount mc;
-                read_back( queue, &mc, ( const MinCount * ) red_mc.out, 1 );
+                if constexpr ( CONST )
+                    reduce( queue, n, AlphaForward<TF,TR>{ pos, box_min, box_max, w, d, cur->edges, cur->nb_edges, n, rho, eps }, red_min.partials, red_min.out );
+                else
+                    reduce( queue, n, AlphaForwardDens<TF,TR,D>{ pos, box_min, box_max, w, d, cur->edges, cur->nb_edges, n, card.pb.dens, eps },
+                            red_min.partials, red_min.out );
+                Min1 am;
+                read_back( queue, &am, ( const Min1 * ) red_min.out, 1 );
                 tm_lim.stop( queue );
                 tm_lim.collect();
-                t_lim_host += wall_now() - th1;
-                nb_cell_lim += SI( mc.c );
-                const double al = std::min( t, mc.m );
-                if ( trace )
-                    std::printf( "      trial t %.3e : %llu cells below eps, local limit %.3e\n", t, mc.c, al );
-                t = factor * al;
-                if ( t < t_min ) break;
+                t_lim_host += wall_now() - th0;
+                t = am.m >= 1 ? 1.0 : factor * am.m;
+                if constexpr ( ! CONST ) {               // no positive limit seen: the trials' first step
+                    if ( ! ( t >= t_min ) )
+                        t = std::min( 1.0, mult_ok * t_last );
+                }
+                double t_done = -1;
+                for ( int round = 0; round < 8; ++round ) {
+                    launch_kernel( queue, &trial_weights, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, ( const double * ) d, t, r0, w2 );
+                    diagram( w2, *tri );
+                    ++nb_evals;
+                    t_done = t;
+                    if ( stop_all || tri->rep.d.nb_below == 0 )
+                        break;
+                    ++nb_limit_rounds;
+                    const double th1 = wall_now();
+                    tm_lim.start( queue );
+                    if constexpr ( CONST )
+                        reduce( queue, n, AlphaBackward<TF,TR>{ pos, box_min, box_max, w, d, tri->a, tri->edges, tri->nb_edges, n, rho, eps, t },
+                                red_mc.partials, red_mc.out );
+                    else
+                        reduce( queue, n, AlphaBackwardDens<TF,TR,D>{ pos, box_min, box_max, w, d, tri->a, tri->edges, tri->nb_edges, n, card.pb.dens, eps, t },
+                                red_mc.partials, red_mc.out );
+                    MinCount mc;
+                    read_back( queue, &mc, ( const MinCount * ) red_mc.out, 1 );
+                    tm_lim.stop( queue );
+                    tm_lim.collect();
+                    t_lim_host += wall_now() - th1;
+                    nb_cell_lim += SI( mc.c );
+                    const double al = std::min( t, mc.m );
+                    if ( trace )
+                        std::printf( "      trial t %.3e : %llu cells below eps, local limit %.3e\n", t, mc.c, al );
+                    t = factor * al;
+                    if ( t < t_min ) break;
+                }
+                if ( t < t_min ) t = t_done / 2;
+                already = t == t_done;
+                alpha_lim = t;
+                if ( trace ) std::printf( "      alpha* %.3e -> trial %.3e\n", am.m, t );
             }
-            if ( t < t_min ) t = t_done / 2;
-            already = t == t_done;
-            alpha_lim = t;
-            if ( trace ) std::printf( "      alpha* %.3e -> trial %.3e\n", am.m, t );
-        }
 
-        // ---- THE DAMPING
-        bool taken = false;
-        const double t_lim0 = t;
-        for ( int trial = 0; trial < max_backtracks && ! stop_all; ++trial ) {
-            if ( ! ( trial == 0 && already ) ) {
-                launch_kernel( queue, &trial_weights, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, ( const double * ) d, t, r0, w2 );
-                diagram( w2, *tri );
-                ++nb_evals;
-                if ( stop_all ) break;
+            // ---- THE DAMPING
+            bool taken = false;
+            const double t_lim0 = t;
+            for ( int trial = 0; trial < max_backtracks && ! stop_all; ++trial ) {
+                if ( ! ( trial == 0 && already ) ) {
+                    launch_kernel( queue, &trial_weights, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, ( const double * ) d, t, r0, w2 );
+                    diagram( w2, *tri );
+                    ++nb_evals;
+                    if ( stop_all ) break;
+                }
+                const double m2 = tri->rep.d.min_a, n2r = merit_of( tri->rep, res_cur );
+                if ( m2 >= eps && std::isfinite( n2r ) && n2r <= ( 1 - t / 2 ) * nr && n2r < nr ) { taken = true; break; }
+                t /= 2;
+                ++nb_backtracks;
+                if ( t < t_min )
+                    break;
             }
-            const double m2 = tri->rep.d.min_a, n2r = merit_of( tri->rep, res_cur );
-            if ( m2 >= eps && std::isfinite( n2r ) && n2r <= ( 1 - t / 2 ) * nr && n2r < nr ) { taken = true; break; }
-            t /= 2;
-            ++nb_backtracks;
-            if ( t < t_min )
-                break;
-        }
-        if ( trace ) {
-            std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  %llu empty  step %.2e  %d diag  [majorant %.3f  diag %.3f  asm %.3f  lin %.3f  lim %.3f]",
-                         it, nr, worst, cur->rep.d.nb_empty, t, nb_diag - g0, tm_maj.total, tm_diag.total, tm_asm.total, t_lin, tm_lim.total );
-            if ( alpha_lim >= 0 ) std::printf( "  alpha* %.2e%s", alpha_lim, t < t_lim0 ? " REFUSED" : "" );
-            std::printf( "\n" );
-            std::fflush( stdout );
-        }
-        if ( stop_all ) { status = failed ? sp::S_FAILURE : sp::S_CAPACITY; break; }
-        if constexpr ( MIXED ) {
-            if ( ! taken && ! use_double ) {
-                // THE FLOAT KERNEL STAGNATES ( a cut decided in float on a degenerate cloud: its merit stops decreasing ):
-                // the double kernel from here on, the accepted diagram measured again with it, and the iteration done again
-                use_double = true;
-                it_double = it;
-                if ( trace ) std::printf( "      switch: kernel float -> double ( the float step stagnates )\n" );
-                diagram( w, *cur );
-                if ( stop_all ) { status = failed ? sp::S_FAILURE : sp::S_CAPACITY; break; }
-                continue;
+            if ( trace ) {
+                std::printf( "    it %2d  |r|_2 %.3e  max|a-nu| %.3e  %llu empty  step %.2e  %d diag  [majorant %.3f  diag %.3f  asm %.3f  lin %.3f  lim %.3f]",
+                             it, nr, worst, cur->rep.d.nb_empty, t, nb_diag - g0, tm_maj.total, tm_diag.total, tm_asm.total, t_lin, tm_lim.total );
+                if ( alpha_lim >= 0 ) std::printf( "  alpha* %.2e%s", alpha_lim, t < t_lim0 ? " REFUSED" : "" );
+                std::printf( "\n" );
+                std::fflush( stdout );
             }
+            if ( stop_all ) { st_status = failed ? sp::S_FAILURE : sp::S_CAPACITY; break; }
+            if constexpr ( MIXED ) {
+                if ( ! taken && ! use_double ) {
+                    // THE FLOAT KERNEL STAGNATES ( a cut decided in float on a degenerate cloud: its merit stops decreasing ):
+                    // the double kernel from here on, the accepted diagram measured again with it, and the iteration done again
+                    use_double = true;
+                    it_double = it;
+                    if ( trace ) std::printf( "      switch: kernel float -> double ( the float step stagnates )\n" );
+                    diagram( w, *cur );
+                    if ( stop_all ) { st_status = failed ? sp::S_FAILURE : sp::S_CAPACITY; break; }
+                    continue;
+                }
+            }
+            if ( ! taken ) { st_status = sp::S_STAGNATION; break; }
+            t_last = t;
+            std::swap( w, w2 );
+            std::swap( cur, tri );
+            after_step( it + 1, t, nb_evals );
         }
-        if ( ! taken ) { status = sp::S_STAGNATION; break; }
-        t_last = t;
-        std::swap( w, w2 );
-        std::swap( cur, tri );
-        after_step( it + 1, t, nb_evals );
+        if ( st_status == sp::S_RUNNING )
+            st_status = sp::S_MAX_ITERATIONS;
+        if ( st_status != sp::S_CAPACITY && st_status != sp::S_FAILURE )
+            residual_max = cur->rep.d.max_abs;
+        status = st_status;
+        nb_steps_before = nb_steps > 0 ? int( rows[ SI( nb_steps - 1 ) * sp::NB_HIST + sp::H_STEP ] ) + 1 : 0;
+        if ( st_status == sp::S_LINEAR_FAILURE || stop_all )
+            break;
     }
-    if ( status == sp::S_RUNNING ) {
-        status = sp::S_MAX_ITERATIONS;
-        residual_max = cur->rep.d.max_abs;
-    } else if ( status == sp::S_CONVERGED || status == sp::S_STAGNATION || status == sp::S_LINEAR_FAILURE )
-        residual_max = cur->rep.d.max_abs;
 
     // ---- what comes out: the weights and the measures ( user order ), the diagram's weights and majorants
     launch_kernel( queue, &scatter_ranks<TF,TI>, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, ids, strided_out<TF,1>( weights ) );
@@ -892,12 +1099,18 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     CardD &cmom = *cmom_p;
     launch_kernel( queue, &pack_weights<typename VD::TK>, blocks_for( n ), BLOCK, 0, n, ( const double * ) w, const_cast<typename CardD::Wt *>( cmom.pb.w ) );
 
-    // ---- THE MOMENTS at the fitted weights ( barycentres, the cost ), a last walk
+    // ---- THE MOMENTS on the TRUE density ( `s = 0`, whatever stage the solve stopped at ) at the fitted weights ( barycentres,
+    // the cost ), a last walk
     if ( ! stop_all ) {
         MomT mom;
         double *mres = vec( n ), *mcost = vec( n );
         if ( mres && mcost && mom.prepare( queue, pd, allocator, overflow ) ) {
-            set_density( mom.pb, rho_in );
+            if constexpr ( CONST )
+                set_density( mom.pb, dens_in );
+            else {
+                dh.at( queue, 0, true );
+                mom.pb.dens = dh.dev;
+            }
             mom.pb.nodes = card.pb.nodes;
             mom.pb.w = cmom.pb.w;
             mom.pb.w64 = Strided<TF,1>{ reinterpret_cast<const char *>( w ), { SI( sizeof( double ) ) } };
@@ -934,7 +1147,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     st[ sp::T_ASM ] = tm_asm.total;
     st[ sp::T_LIN ] = t_lin;
     st[ sp::T_LIM ] = tm_lim.total;
-    st[ sp::EPS ] = eps;
+    st[ sp::EPS ] = eps0;
     st[ sp::DOMAIN_MASS ] = domain_mass;
     st[ sp::NB_OVERFLOWED ] = 0;
     st[ sp::NB_CELL_LIM ] = double( nb_cell_lim );
@@ -943,7 +1156,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     st[ sp::LIN_NB_ITER ] = ls.nb_iter;
     st[ sp::LIN_WORST ] = ls.worst;
     st[ sp::START ] = start;
-    st[ sp::NB_CONTINUATION_STEPS ] = 1;
+    st[ sp::NB_CONTINUATION_STEPS ] = double( scales.size() );
     st[ sp::MIN_START_MASS ] = min_start_mass;
     st[ sp::IT_SWITCH ] = it_switch;
     st[ sp::IT_DOUBLE ] = it_double;

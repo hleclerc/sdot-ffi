@@ -712,11 +712,13 @@ __global__ void __launch_bounds__( GAL_DENSE_BLOCK ) sa_galerkin_dense( CsrView<
                                                                        const SI *crow, TC *ccol, TV *cval, TV *cdia ) {
     __shared__ unsigned lo[ GAL_DENSE ];
     __shared__ int      hi[ GAL_DENSE ];
+    __shared__ unsigned char mk[ FILL ? GAL_DENSE : 1 ];   ///< FILL: the columns touched ( a sum may round to zero, the column stays:
+                                                             ///< the count pass saw it -- a gap would leave its slot unwritten )
     __shared__ int      pre[ GAL_DENSE_BLOCK ];
     __shared__ double   red[ GAL_DENSE_BLOCK / 32 ];
     const int t = threadIdx.x;
     const SI a = blockIdx.x, nc = Pt.n;
-    for ( SI b = t; b < nc; b += GAL_DENSE_BLOCK ) { lo[ b ] = 0; hi[ b ] = 0; }
+    for ( SI b = t; b < nc; b += GAL_DENSE_BLOCK ) { lo[ b ] = 0; hi[ b ] = 0; if constexpr ( FILL ) mk[ b ] = 0; }
     const SI tb = Pt.row[ a ], te = Pt.row[ a + 1 ];
     double scale = 1;
     if constexpr ( FILL ) {
@@ -739,7 +741,7 @@ __global__ void __launch_bounds__( GAL_DENSE_BLOCK ) sa_galerkin_dense( CsrView<
             const double c = u == 0 ? double( A.dia[ i ] ) : - double( A.val[ rb + u - 1 ] );
             for ( SI q = P.row[ j ]; q < P.row[ j + 1 ]; ++q ) {
                 const SI b = P.col[ q ];
-                if constexpr ( FILL ) fx_add( lo + b, hi + b, __double2ll_rn( wi * c * double( P.val[ q ] ) * scale ) );
+                if constexpr ( FILL ) { fx_add( lo + b, hi + b, __double2ll_rn( wi * c * double( P.val[ q ] ) * scale ) ); mk[ b ] = 1; }
                 else hi[ b ] = 1;                        // ( the count marks the columns only )
             }
         }
@@ -753,7 +755,7 @@ __global__ void __launch_bounds__( GAL_DENSE_BLOCK ) sa_galerkin_dense( CsrView<
         bool on = false;
         long long v = 0;
         if ( b < nc ) {
-            if constexpr ( FILL ) { v = fx_value( lo[ b ], hi[ b ] ); on = ( lo[ b ] | unsigned( hi[ b ] ) ) != 0; }
+            if constexpr ( FILL ) { v = fx_value( lo[ b ], hi[ b ] ); on = mk[ b ] != 0; }
             else on = hi[ b ] != 0;
         }
         if ( b == a ) { if constexpr ( FILL ) d = double( v ) / scale; on = false; }
@@ -993,6 +995,13 @@ __global__ void __launch_bounds__( BLOCK ) convert_values( SI n, const TA *src, 
     if ( i < n ) dst[ i ] = TB( src[ i ] );
 }
 
+/// the same over the entries of a CSR only ( their count `row[ nr ]` read on the card: past it, nothing was written )
+template<class TA,class TB>
+__global__ void __launch_bounds__( BLOCK ) convert_csr_values( SI cap, const SI *row, SI nr, const TA *src, TB *dst ) {
+    const SI i = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( i < cap && i < row[ nr ] ) dst[ i ] = TB( src[ i ] );
+}
+
 /// A FIXED SEQUENCE OF LAUNCHES, captured once and replayed whole ( a CUDA graph ). Captured again only when what the
 /// launches point to changes ( a coarse level reallocated, another output vector ). `SDOT_CARD_GRAPHS=0`: plain launches.
 struct Graph {
@@ -1220,6 +1229,7 @@ struct CardLinear {
     /// the count of a CSR on the card ( `cnt` -> `row` by a scan ), read back; room from the pool if the capacity is short
     template<class T>
     bool csr_room( const CudaQueue &queue, auto &allocator, SI nr, SI *row, SI &cap, TC *&col, T *&val ) {
+        zero_fill( queue, scan.cnt + nr, SI( sizeof( SI ) ) );   // ( the counts are `nr`: the scan reads one more )
         exclusive_scan( queue, scan.sums, static_cast<const SI *>( scan.cnt ), row, nr + 1 );
         SI nnz = 0;
         read_back( queue, &nnz, static_cast<const SI *>( row + nr ), 1 );
@@ -1479,7 +1489,7 @@ struct CardLinear {
         if constexpr ( SAME )
             lev[ 0 ].A = A;
         else {                                           // the fine level in `TV`: a copy of the values, at each solve
-            launch_kernel( queue, &convert_values<double,TV>, blocks_for( nnz_cap ), BLOCK, 0, nnz_cap, A.val, val0 );
+            launch_kernel( queue, &convert_csr_values<double,TV>, blocks_for( nnz_cap ), BLOCK, 0, nnz_cap, ( const SI * ) A.row, n, A.val, val0 );
             launch_kernel( queue, &convert_values<double,TV>, blocks_for( n ), BLOCK, 0, n, A.dia, dia0 );
             lev[ 0 ].A = CsrView<TC,TV>{ n, A.row, A.col, val0, dia0 };
         }

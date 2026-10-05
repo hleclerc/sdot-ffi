@@ -60,12 +60,15 @@ class SumOfGaussians( Distribution ):
 
     current_mass     : ComputedAttribute[ RealTensor, ( "weights", ) ]
 
-    def __init__( self, positions, sigmas, weights = None, target_mass = 1.0, support_sigmas = 6.0, **kwargs ):
+    def __init__( self, positions, sigmas, weights = None, target_mass = 1.0, support_sigmas = 6.0, support_box = None, **kwargs ):
         """`positions`: `[ n, d ]`. `sigmas`: `[ n ]` (isotropic). `weights`: `[ n ]`, the MASS of
         each gaussian -- all equal by default. `support_sigmas`: the declared support, in
-        standard deviations ( see the class docstring ); `None` to declare none."""
+        standard deviations ( see the class docstring ); `None` to declare none. `support_box`: `( lo, hi )`, a box declared
+        as the support instead ( the domain of a transport: the unit square of the old campaign's densities, § 9 ) -- the mass
+        outside it is lost, as beyond `support_sigmas`."""
         self.__base_init__( positions = positions, sigmas = sigmas, target_mass = target_mass, **kwargs )
         self.support_sigmas = None if support_sigmas is None else float( support_sigmas )
+        self.support_box = None if support_box is None else tuple( numpy.asarray( b, dtype = float ).reshape( -1 ) for b in support_box )
         if weights is not None:
             self.weights = weights
         elif self.weights.is_undefined:
@@ -92,12 +95,17 @@ class SumOfGaussians( Distribution ):
             current_mass = self.target_mass,
             batch_axes = self.batch_axes,
             support_sigmas = self.support_sigmas,
+            support_box = self.support_box,
         )
 
     def bounding_half_spaces( self ):
         """the box `[ c_i - k s_i, c_i + k s_i ]` united over the gaussians ( see the class
         docstring ) -- `None` without `support_sigmas`, or when the parameters are not readable on the
         host side ( under `jit` ): bounding is an optimization, it must not break the call"""
+        if self.support_box is not None:
+            lo, hi = self.support_box
+            d = len( lo )
+            return numpy.concatenate( [ numpy.eye( d ), -numpy.eye( d ) ] ), numpy.concatenate( [ hi, -lo ] )
         if self.support_sigmas is None:
             return None
         try:

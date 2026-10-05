@@ -1108,3 +1108,134 @@ card's tree, built in the eager call sequence and INSIDE the jitted program.
 * The build takes ~55 bytes per seed from the call's pool in 2D ( 0.55 GB at 1e7 ); a refusal of the pool leaves the outputs
   unwritten ( reported by loom's allocator, as for the other card calls ).
 * `SDOT_CARD_TREE=0` restores the previous behaviour exactly ( host build, evaluated while tracing ).
+
+# GPU step 8: densities and continuation ( 2026-10-05 )
+
+The card's `SdotPlanNd` ( one ffi call, eager and under `jax.jit` ) now takes, besides a constant density, an `Image` on a
+regular grid ( a diagonal frame, uniform knots, covering the box ) and isotropic `SumOfGaussians` in 2D, with the CPU's WIDTH
+CONTINUATION ( `sdotplan/Continuation.h` semantics: the same options, stages, triggers and targets, so one `Tuning` gives the
+same stages on both ). Refused on the card ( `NotImplementedError`, the CPU solves them ): 3D, a domain that is not a box ( an
+image on a rotated grid ), irregular knots, anisotropic gaussians.
+
+## How
+
+* `gpu/Density2D.cuh`: the density is integrated on the EDGES of the finished cell ( `Cell2D.cuh::finish_cell`, a template
+  parameter of the cells: `DensConst` compiles the code of before, so the constant path is unchanged ), never by cutting it:
+  * image: Green on the rows ( `mass = circ F0 dy`, `F0` the prefix sum of the row, exact at the middle of a piece of edge in a
+    pixel; an Amanatides-Woo walk; the reference of the first vertex subtracted ), the same walk gives `int rho ds` ( the
+    laplacian's `c_ij` ) and, with the prefix sums of `x` and `x^2` and two Gauss points, the moments -- the old campaigns'
+    method ( `solvers_des_familles` § 12, `gpu_des_familles` doc/08 );
+  * gaussians: the CPU's polar corner ( `SumOfGaussians::wedge_measure` ) summed per gaussian over the polygon then `| . |`
+    ( never negative: the CPU's `| sum |` per fan triangle -- a cell far from a narrow bump weighs 1e-22, and a negative noise
+    there flipped the start's similarity test against the CPU ), the facet's `erf` ( `facet_mass` ), and the moments as
+    CLOSED-FORM boundary fluxes ( `int ( x - c ) phi = -s^2 circ phi n`, `int |x - c|^2 phi = 2 s^2 m - s^2 circ ( x - c ).n phi` ).
+    The corner's Gauss-Legendre takes panels of at most half a unit ( the CPU's 4 panels on long edges, ONE on the short edges of
+    a fine diagram: -20 % of the cells' time; one panel of up to 4 units was tried and lost 1e-8 of a cell's mass ); an `erf`
+    pair saturated on both ends is skipped ( `J = 0` to the bit ).
+* `gpu/DensityHost2D.cuh`: the density of a stage, made on the card -- the image blurred by the CPU's filter ( separable gaussian of
+  `s / step` pixels, truncated at 4 sigma, renormalized at the edge, axis 0 then 1, the same sums in the same order; the taps and
+  the edge norms computed once per axis ), then the row prefix sums; the gaussians widened ( `sqrt( sigma^2 + s^2 )` ).
+* `gpu/Newton2D.cuh::solve`: the stage loop of `Solve.h` ( `s0` = half the box's diagonal or `conv_start`, `/ ratio` down to the
+  distribution's `min_scale` -- the image's step / 4, the smallest sigma / 4 -- then 0; `always`, or `auto` when the best start leaves
+  a cell under `threshold` times the smallest target; per stage the target rescaled to the domain's mass, a Newton from the previous
+  weights, `history.s`; the moments on the true density at the end ).
+* The step `limits` with a density: the mass along `w + t d` is no polynomial, but the cell with its edges FROZEN is known at every `t`;
+  the forward pass bisects the frozen mass of each cell ( looked for at `t = 1` and at the bottom of its area's parabola ), the
+  backward pass that of the trial's cells under the floor ( `AlphaForwardDens`, `AlphaBackwardDens`; the CPU bisects exact cells ).
+* Python: `PowerDiagram_Bsp._card_solve_density` ( the kind and its data; the geometry read on the host, the values not: traced
+  values work ), `SdotPlanNd._build_card` ( three ffi names, one per kind ), `SumOfGaussians( support_box = ... )` ( the domain of
+  § 9: the unit square ).
+
+## Accuracy and parity with the CPU ( tests, n = 1500-2000 )
+
+| case | step | card it / diag | CPU it / diag | weights gap ( / max |w| ) | cost gap | generic measures of the card's plan |
+|---|---|---|---|---|---|---|
+| soft image 24 x 17 | trials | 8 / 12 | 8 / 12 | 1.3e-13 | 3e-14 | < 1e-8 / n |
+| image with a hole 32 x 32, continuation always ( 15 stages ) | trials | 78 / 102 | 78 / 102 | 8e-15 | 3e-15 | < 1e-8 / n |
+| the same, continuation auto | limits | 77 / 99 | 78 / 106 | 1e-14 | 2e-14 | < 1e-8 / n |
+| overlapping gaussians | trials | 8 / 11 | 8 / 11 | 9e-15 | 6e-5 ( CPU quadrature ) | < 1e-8 / n |
+| narrow gaussians sigma 0.04, auto ( 15 stages ) | trials | 77 / 105 | 77 / 105 | 8e-15 | 2.6e-4 ( idem ) | < 1e-8 / n |
+| the same, always | limits | 77 / 93 | 79 / 102 | 7e-15 | 2.6e-4 | < 1e-8 / n |
+
+* With `trials` the card's Newton takes the CPU's decisions: the same iterations, diagrams, stages and widths ( `history.s` ).
+* The gaussian MOMENTS differ from the CPU's by up to 2.6e-4 ( cost ) and 0.11 of a cell ( barycentres ): the CPU's are an adaptive
+  quadrature capped at 8 bisections ( `PointwiseDensity` ), wrong on the huge tail cells and on the needles that reach a bump; the
+  card's closed forms agree with a brute-force quadrature of the same polygons to its own accuracy ( 2e-7 relative, a 3000^2 grid
+  and a 6000^2 one on a tail cell ). The image moments are exact on both sides ( 3e-15 ).
+* jit == eager to the bit ( weights, cost, diagram counts ), image and gaussians with the continuation.
+
+## The cases ( `bench_newton`, errand queue; n = 1e5 gaussians, 2e4 / 1e5 image; seconds; card: min of 3, CPU: lmo-numpy 8 pinned threads )
+
+The continuation from `s = 0.5`, ratio sqrt( 2 ) ( `--continuation=always`, the bench's default on a density ); rtol 1e-6.
+Card = jitted wall ( eager in brackets ); old = `reference_lmo.DENSITY` ( the old CPU, its own path: § 9 is the same width
+continuation, § 12 a box-blur continuation with an adaptive / hand-tuned scale ).
+
+| case | step | card it / diag | card float | card mixed | card double | CPU it / diag | CPU ( new ) | old CPU | card / CPU |
+|---|---|---|---|---|---|---|---|---|---|
+| gauss4 sigma 0.05 ( 13 stages ) | trials | 78 / 121 | 2.97 ( 3.37 ) | **2.96** ( 3.48 ) | 3.83 ( 4.26 ) | 78 / 121 | 36.3 | 39 ( 72 it, 123 diag ) | 12x |
+| gauss4 sigma 0.05 | limits | 76 / 91 | 3.31 ( 3.72 ) | 3.29 ( 3.71 ) | 3.94 ( 4.35 ) | 77 / 107 | 33.3 | - ( 97 diag ) | 10x |
+| gauss4 sigma 0.02 ( 16 stages ) | trials | 146 / 292 | 7.36 ( 7.82 ) | 7.37 ( 7.78 ) | 10.69 ( 11.16 ) | 146 / 292 | 69.4 | 124 ( 139 it, 400 diag ) | 9.4x |
+| gauss4 sigma 0.02 | limits | 142 / 160 | 7.25 ( 8.00 ) | **7.23** ( 7.71 ) | 8.88 ( 9.62 ) | 133 / 208 | 62.7 | 108 ( 130 it, 204 diag ) | 8.7x |
+| image 512^2, n 2e4 ( 22 stages ) | trials | 94 / 116 | **0.83** ( 1.33 ) | 0.83 ( 1.37 ) | 1.19 ( 1.97 ) | 94 / 116 | 10.1 | 3.7 ( 95 diag, adaptive box-blur ) | 12x |
+| image 512^2, n 2e4 | limits | 94 / 116 | 0.86 ( 1.37 ) | 0.87 ( 1.38 ) | 1.23 ( 1.85 ) | 95 / 117 | 9.93 | 3.6 ( 90 diag, hand-tuned ) | 11x |
+| image_hole 512^2, n 2e4 | trials | 95 / 121 | 0.85 ( 1.38 ) | 0.86 ( 1.41 ) | 1.24 ( 1.83 ) | 95 / 121 | 10.2 | 4.9 ( 124 diag, adaptive ) | 12x |
+| image_hole 512^2, n 2e4 | limits | 95 / 117 | 0.90 ( 1.42 ) | 0.89 ( 1.42 ) | 1.24 ( 2.06 ) | 96 / 122 | 10.4 | 3.9 ( 100 diag, hand-tuned ) | 12x |
+| image 512^2, n 1e5 | trials | 103 / 134 | - | 1.88 ( 2.43 ) | 2.89 ( 3.44 ) | 103 / 134 | 29.2 | 188 / 90.7 ( floor path, 792 / 796 diag ) | 16x |
+| image 512^2, n 1e5 | limits | 102 / 131 | - | 2.00 ( 2.55 ) | 2.99 ( 3.54 ) | 103 / 133 | 29.3 | idem | 15x |
+| image_hole 512^2, n 1e5 | trials | 112 / 160 | - | 2.10 ( 2.69 ) | 3.30 ( 3.84 ) | 112 / 160 | 32.8 | - | 16x |
+| image_hole 512^2, n 1e5 | limits | 108 / 133 | - | 2.12 ( 2.67 ) | 3.13 ( 3.67 ) | 110 / 144 | 30.6 | - | 14x |
+
+( card / CPU: the CPU's wall over the card's jitted mixed one, same step. ) The old GPU campaign has no number at these n: its
+image Newton ( doc/08, n = 2e5, the 90:1 image without hole, a CONTRAST continuation in 8 steps ) took 164 s; its cells under a
+512^2 image cost +7 % at 1e6 ( 96.6 -> 103.9 ns/seed, `reference_lmo_gpu.GPU_DENSITY` ).
+
+Where the card's time goes ( mixed, jitted ): gaussians sigma 0.02 trials: cells 3.6 s ( 292 diagrams, 12 ms each: the corners in
+FP64 on Turing, 1/32 rate ), linear solves 3.5 s ( 10634 multigrid iterations: these laplacians are harder than Lebesgue's, 73 per
+solve ), the frozen-mass passes 1.8 s with `limits`. Image 2e4: linear solves 0.62 s of 0.83 ( 94 solves, the per-iteration
+host round trips at this n ), the 22 blurred images a few ms each. The double kernel costs 1.5-2x the float one on densities
+( its finish runs inside the walk kernel; the float kernel's in its own pass ).
+
+## Findings on the way
+
+* A PRE-EXISTING BUG of the card's multigrid ( `Linear2D.cuh::sa_galerkin_dense` ), exposed by the density laplacians: the COUNT pass
+  of the dense Galerkin product marked every coarse column touched, the FILL pass emitted only those whose fixed-point sum was not
+  zero -- with coefficients from 1e-30 to 1e3 in a row, tiny contributions round to exactly zero at the row's scale, fewer entries
+  are written than counted, and the coarse CSR keeps UNINITIALIZED column indices: a NaN residual ( "linear solver failure" at
+  n = 1e4 ) or an illegal address ( the gaussian bench at 1e5, after another solve had left garbage in the pool ). Fixed ( the fill
+  marks the columns it touches; a zero entry stays a zero ); found with a new debugging aid, `SDOT_CARD_POISON=1` ( every `take`
+  of the card's pool filled with 0xff: NaN doubles ) and `compute-sanitizer --tool initcheck`, now clean on the solve ( two benign
+  over-reads silenced: the float copy of the fine level stops at `nnz`, the counts' scan reads a zeroed slot ).
+* The CPU's moments of a gaussian density ( adaptive quadrature, depth 8 ) are off by up to 2.6e-4 on the cost; its masses are
+  exact. Not fixed ( CPU side ): the closed forms of `Density2D.cuh::gauss_lines` / `gauss_cell` would port as they are.
+* The CPU's image path is slow at 2e4 ( 10 s, 45 ms per diagram: the cells CUT by the pixels; plus the blur of 22 stages,
+  single-threaded ): 2.7x the old bench's 3.7 s, which integrated on the boundary. Not in scope ( CPU ).
+* `limits` on a density: fewer diagrams than `trials` on the gaussians ( 160 against 292 ) but each iteration pays the frozen-mass
+  passes ( 1.8 s ): about even in time at 1e5; on the images the forward pass never limits and the two are the same.
+
+## Tests ( lmo-jax: `test_SdotPlanNd`, `test_CardCells`; lmo-numpy: `test_SdotPlanNd`; local jax / numpy / torch: `test_SdotPlanNd` )
+
+* `the_card_solves_an_image_as_the_cpu`, `the_card_solves_gaussians_as_the_cpu`: the card against the CPU in a subprocess
+  ( `LOOM_DEVICE=cpu` ), the table above; the cells of the card's weights measured by the GENERIC path are the targets.
+* `the_card_density_solves_run_under_jit`: image and gaussians, continuation auto: jit == eager to the bit.
+* `the_card_refuses_what_it_does_not_solve`: now an image on a rotated grid ( not a box ).
+
+## What remains
+
+* 3D on the card ( cells, tree majorants, the facet circulation becomes a surface one ), domains other than a box, rotated or
+  irregular images, anisotropic gaussians.
+* The LIFTING of the old campaign ( § 13-16, § 15.17: -28 % of diagrams at 1e5 on the image ) and its adaptive continuation scale
+  ( § 12.6 ): neither is in the CPU solver either.
+* Speed: the gaussian corners in FP64 ( a far-cell skip would need the CPU's noise semantics, see above ); the double kernel's finish
+  in a pass of its own as the float one; the multigrid's iterations on density laplacians ( 73 per solve ); the frozen-mass passes
+  of `limits` on all cells ( a pre-filter on the area polynomial ).
+* A host fallback of the direction when the card's solver fails ( none seen since the Galerkin fix ).
+
+## Risks
+
+* `limits` on a density is the card's own step ( frozen cells bisected ), not the CPU's ( exact cells ): other counts, the same plans
+  ( 1e-14 ). A frozen cell past an edge's vanishing is extrapolated; the trial diagram is the check.
+* The gaussian moments differ from the CPU's ( closed forms against a quadrature ): a comparison of costs between the two at 1e-4.
+* Parity of counts relies on noise-level agreement of masses in density deserts ( `| sum |` per gaussian ); a case where all the
+  gaussians are far from a cell gives masses at the 1e-17 noise on both sides, not the same noise.
+* The image's tables are 5 doubles per pixel in the call's pool ( 10 MB at 512^2, 2.7 GB at 16384^2 ); past the pool, the outputs
+  are left unwritten as for any card call.

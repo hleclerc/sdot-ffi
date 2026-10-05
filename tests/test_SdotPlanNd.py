@@ -778,16 +778,192 @@ if test( "the_card_refuses_what_it_does_not_solve" ):
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
+    # an image on a ROTATED grid: its support is not a box ( and its rows are not the card's rows )
     rng = numpy.random.default_rng( 105 )
     pos = rng.uniform( 0.2, 0.8, size = ( 50, 2 ) )
-    for dst in ( _overlapping_target( 2, 2, seed = 3 ),
-                 Image( values = 1 + rng.random( ( 4, 4 ) ), origin = [ 0.0, 0.0 ], frame = [ [ 0.25, 0 ], [ 0, 0.25 ] ] ) ):
+    c, s = numpy.cos( 0.3 ), numpy.sin( 0.3 )
+    for dst in ( Image( values = 1 + rng.random( ( 4, 4 ) ), origin = [ 0.0, 0.0 ], frame = [ [ 0.25 * c, 0.25 * s ], [ -0.25 * s, 0.25 * c ] ] ), ):
         try:
             OtProblem( SumOfDiracs( pos ), dst ).solve()
         except NotImplementedError as e:
-            assert "constant" in str( e ) or "density" in str( e ), str( e )
+            assert "box" in str( e ) or "distribution" in str( e ), str( e )
         else:
-            raise AssertionError( "a density that is not a constant must be refused on the card" )
+            raise AssertionError( "a domain that is not a box must be refused on the card" )
+
+
+# -- ON THE CARD, A DENSITY ( `gpu/Density2D.cuh`, `gpu/DensityHost2D.cuh` ) -------------------------------------------------
+#
+# The card's plan against THE CPU's: the same problem solved by `sdotplan/Solve.h` in a subprocess on the CPU device
+# ( `LOOM_DEVICE=cpu`: one process has one device ). With `step = "trials"` the two Newtons take the same decisions, so the
+# same iterations and diagrams; the plans agree to the solve's tolerance, and the cells of the card's weights, measured by
+# the GENERIC path ( `use_card_cells = False`, cutting the cells ), are the targets.
+
+_CPU_SOLVE = """
+import pickle, sys, numpy
+from sdot import Image, Iterative, OtProblem, SumOfDiracs, SumOfGaussians, Tuning
+d = pickle.load( open( sys.argv[ 1 ], "rb" ) )
+kind, spec = d[ "target" ]
+dst = Image( **spec ) if kind == "image" else SumOfGaussians( **spec )
+plan = OtProblem( SumOfDiracs( d[ "pos" ], d[ "nu" ] ), dst ).solve( Iterative( **d[ "it" ], tuning = Tuning( **d[ "tun" ] ) ) )
+out = dict( weights = numpy.asarray( plan.weights ).reshape( -1 ), stats = plan.stats, cost = float( plan.cost ),
+            bary = numpy.asarray( plan.barycenters ), masses = numpy.asarray( plan.cell_masses ).reshape( -1 ),
+            s = [ h[ "s" ] for h in plan.history ] )
+pickle.dump( out, open( sys.argv[ 2 ], "wb" ) )
+"""
+
+
+def _cpu_solve( pos, nu, target, it, tun ):
+    """the same solve on the CPU device, in a subprocess: a dict ( `weights`, `stats`, `cost`, `bary`, `masses`, `s` )"""
+    import os, pickle, subprocess, sys, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        fi, fo = os.path.join( tmp, "in.pkl" ), os.path.join( tmp, "out.pkl" )
+        pickle.dump( dict( pos = pos, nu = nu, target = target, it = it, tun = tun ), open( fi, "wb" ) )
+        env = dict( os.environ, LOOM_DEVICE = "cpu" )
+        r = subprocess.run( [ sys.executable, "-c", _CPU_SOLVE, fi, fo ], env = env, capture_output = True, text = True )
+        assert r.returncode == 0, r.stdout[ -3000: ] + r.stderr[ -3000: ]
+        return pickle.load( open( fo, "rb" ) )
+
+
+def _make_target( target ):
+    kind, spec = target
+    return Image( **spec ) if kind == "image" else SumOfGaussians( **spec )
+
+
+def _generic_density_measures( pos, w, target ):
+    """the measures of the cells of `( pos, w )` against the density, through the GENERIC path ( the cells cut by the
+    pixels, the gaussians' exact corners ), in the domain of the target"""
+    from sdot import OtProblem
+    dst = _make_target( target )
+    prob = OtProblem( SumOfDiracs( pos ), dst )
+    dirs, offs = prob.domain
+    pd = PowerDiagram( pos, numpy.asarray( w, dtype = float ).reshape( -1 ), boundaries = ( dirs, offs ), distribution = prob.target,
+                       kernel_dtype = "FP64" )
+    pd.use_card_cells = False
+    return numpy.asarray( pd.measures.value ).reshape( -1 )
+
+
+def _card_vs_cpu( name, pos, nu, target, it, tun, counts = True, wtol = 1e-7, mtol = 1e-8 ):
+    """the card's solve and the CPU's of the same problem: converged both, the same counts ( `counts` ), the same plan. The
+    moments: exact on both sides for an image; for gaussians the card's are closed forms and the CPU's an adaptive
+    quadrature ( `PointwiseDensity`, ~1e-4 relative: checked against a brute-force quadrature, the card's are right )"""
+    n = len( pos )
+    plan = OtProblem( SumOfDiracs( pos, nu ), _make_target( target ) ).solve( Iterative( **it, tuning = Tuning( **tun ) ) )
+    cpu = _cpu_solve( pos, nu, target, it, tun )
+    st, cs = plan.stats, cpu[ "stats" ]
+    w, wc = numpy.asarray( plan.weights ).reshape( -1 ), cpu[ "weights" ]
+    gap = numpy.abs( w - wc ).max() / max( numpy.abs( wc ).max(), 1e-300 )
+    print( f"  { name }: card { st[ 'status' ] } { st[ 'nb_iter' ] } it / { st[ 'nb_diag' ] } diag / { st[ 'nb_continuation_steps' ] } stages, "
+           f"cpu { cs[ 'status' ] } { cs[ 'nb_iter' ] } it / { cs[ 'nb_diag' ] } diag / { cs[ 'nb_continuation_steps' ] } stages; "
+           f"weights gap { gap :.1e} ( relative to max |w| ), cost { float( plan.cost ) :.10e} vs { cpu[ 'cost' ] :.10e}, "
+           f"domain mass { st[ 'domain_mass' ] :.12f} vs { cs[ 'domain_mass' ] :.12f}" )
+    assert st[ "status" ] == "converged" and cs[ "status" ] == "converged", ( name, st, cs )
+    assert st[ "nb_continuation_steps" ] == cs[ "nb_continuation_steps" ], name
+    assert st[ "start" ] == cs[ "start" ], ( name, st[ "start" ], cs[ "start" ] )
+    assert abs( st[ "domain_mass" ] - cs[ "domain_mass" ] ) < 1e-10, name
+    if counts:
+        assert ( st[ "nb_iter" ], st[ "nb_diag" ] ) == ( cs[ "nb_iter" ], cs[ "nb_diag" ] ), ( name, st[ "nb_iter" ], st[ "nb_diag" ], cs[ "nb_iter" ], cs[ "nb_diag" ] )
+        hs = [ h[ "s" ] for h in plan.history ]
+        assert numpy.allclose( hs, cpu[ "s" ], rtol = 1e-14, atol = 0 ), name
+    assert gap < wtol, ( name, gap )
+    exact = target[ 0 ] == "image"
+    bgap = numpy.abs( numpy.asarray( plan.barycenters ) - cpu[ "bary" ] ).max() * n ** 0.5      # relative to the size of a cell
+    print( f"    cost gap { abs( float( plan.cost ) / cpu[ 'cost' ] - 1 ) :.1e} ( relative ), barycentres gap { bgap :.1e} ( relative to a cell )" )
+    assert abs( float( plan.cost ) / cpu[ "cost" ] - 1 ) < ( 1e-9 if exact else 1e-3 ), name
+    # ( the CPU's quadrature, capped at 8 bisections, on the huge cells of the tails and on the needles that reach a narrow
+    # bump: the card's closed forms were checked against a brute-force quadrature of the same polygons to 1e-7 )
+    assert bgap < ( 1e-8 if exact else 0.25 ), name
+    # the cells of the card's weights, measured by the generic path: the targets
+    g = _generic_density_measures( pos, w, target )
+    tm = numpy.asarray( plan.target_masses ).reshape( -1 )
+    assert numpy.abs( g - tm ).max() < mtol / n, ( name, numpy.abs( g - tm ).max() * n )
+    return plan, cpu
+
+
+def _image_target( nx, ny, values ):
+    return ( "image", dict( values = values, origin = [ 0.0, 0.0 ], frame = [ [ 1 / nx, 0 ], [ 0, 1 / ny ] ] ) )
+
+
+if test( "the_card_solves_an_image_as_the_cpu" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    rng = numpy.random.default_rng( 201 )
+    n = 1500
+    pos = rng.uniform( 0.001, 0.999, size = ( n, 2 ) )
+    nu = rng.uniform( 0.5, 1.5, n )
+    nu /= nu.sum()
+    # a soft image ( 3:1 ), on a grid that is not square, directly
+    soft = _image_target( 24, 17, 1 + 2 * rng.random( ( 24, 17 ) ) )
+    it = dict( tol = 1e-10 / n, max_iter = 80, continuation = "never" )
+    plan, _ =_card_vs_cpu( "soft image, trials", pos, nu, soft, dict( it, precision = "fp64" ), dict( step = "trials" ) )
+    # the float kernel ( its vertices re-solved in double ) and the limits step: the same plan, other counts
+    for prec, step in ( ( "fp32", "trials" ), ( "fp64", "limits" ), ( "auto", "limits" ) ):
+        p2 = OtProblem( SumOfDiracs( pos, nu ), _make_target( soft ) ).solve( Iterative( **dict( it, precision = prec ), tuning = Tuning( step = step ) ) )
+        assert p2.converged, ( prec, step, p2.stats )
+        gap = numpy.abs( numpy.asarray( p2.weights ) - numpy.asarray( plan.weights ) ).max() / numpy.abs( numpy.asarray( plan.weights ) ).max()
+        print( f"  soft image, { step }, { prec }: { p2.stats[ 'nb_iter' ] } it / { p2.stats[ 'nb_diag' ] } diag, gap { gap :.1e}" )
+        assert gap < 1e-7, ( prec, step, gap )
+    # a contrasted image with a HOLE ( zeros ): the width continuation, forced and automatic
+    vals = 0.1 + 0.9 * rng.random( ( 32, 32 ) )
+    vals[ 4:12, 18:28 ] = 0
+    vals[ 20:23, : ] += 4
+    hard = _image_target( 32, 32, vals )
+    _card_vs_cpu( "image with a hole, continuation always, trials", pos, nu, hard, dict( it, continuation = "always", precision = "fp64" ),
+                  dict( step = "trials" ) )
+    _card_vs_cpu( "image with a hole, continuation auto, limits", pos, nu, hard, dict( it, continuation = "auto", precision = "fp64" ),
+                  dict( step = "limits" ), counts = False )
+
+
+if test( "the_card_solves_gaussians_as_the_cpu" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    rng = numpy.random.default_rng( 202 )
+    n = 1500
+    nu = rng.uniform( 0.5, 1.5, n )
+    nu /= nu.sum()
+    it = dict( tol = 1e-10 / n, max_iter = 100, precision = "fp64" )
+    # overlapping gaussians: no continuation needed
+    soft = ( "gauss", dict( positions = 0.5 + rng.uniform( -0.12, 0.12, size = ( 3, 2 ) ), sigmas = rng.uniform( 0.18, 0.24, 3 ),
+                            weights = rng.uniform( 0.6, 1.4, 3 ) ) )
+    pos = rng.uniform( 0.3, 0.7, size = ( n, 2 ) )
+    _card_vs_cpu( "overlapping gaussians, trials", pos, nu, soft, dict( it, continuation = "never" ), dict( step = "trials" ) )
+    # narrow separate bumps ( § 9 of the old campaign, sigma = 0.04 ): the width continuation, automatic
+    hard = ( "gauss", dict( positions = numpy.array( [ [ 0.26, 0.30 ], [ 0.72, 0.26 ], [ 0.34, 0.74 ], [ 0.76, 0.70 ] ] ),
+                            sigmas = 0.04 * numpy.array( [ 1, 0.7, 1.3, 1 ] ), weights = numpy.array( [ 0.35, 0.25, 0.25, 0.15 ] ) ) )
+    pos = rng.uniform( 0.05, 0.95, size = ( n, 2 ) )
+    _card_vs_cpu( "narrow gaussians, continuation auto, trials", pos, nu, hard, dict( it, continuation = "auto", tol = 1e-9 / n ),
+                  dict( step = "trials", mass_rtol = 0 ), wtol = 1e-6 )
+    plan, cpu = _card_vs_cpu( "narrow gaussians, continuation always, limits", pos, nu, hard, dict( it, continuation = "always", tol = 1e-9 / n ),
+                              dict( step = "limits" ), counts = False, wtol = 1e-6 )
+    ss = [ h[ "s" ] for h in plan.history ]
+    assert ss[ 0 ] > 0 and ss[ -1 ] == 0 and all( b <= a for a, b in zip( ss, ss[ 1: ] ) )
+
+
+if test( "the_card_density_solves_run_under_jit" ):
+    from errand import skip
+    if not _card():
+        skip( "the card's solver needs a CUDA device" )
+    import jax
+    rng = numpy.random.default_rng( 203 )
+    n = 2000
+    pos = rng.uniform( 0.001, 0.999, size = ( n, 2 ) )
+    nu = rng.uniform( 0.5, 1.5, n )
+    vals = 0.1 + rng.random( ( 20, 30 ) )
+    vals[ 3:8, 10:20 ] = 0
+    targets = { "image": _image_target( 20, 30, vals ),
+                "gaussians": ( "gauss", dict( positions = numpy.array( [ [ 0.3, 0.3 ], [ 0.7, 0.6 ] ] ), sigmas = numpy.array( [ 0.05, 0.08 ] ),
+                                              weights = numpy.array( [ 0.6, 0.4 ] ) ) ) }
+    for name, target in targets.items():
+        def solve( masses ):
+            plan = OtProblem( SumOfDiracs( pos, masses ), _make_target( target ) ).solve( Iterative( tol = 1e-9 / n, max_iter = 100, continuation = "auto" ) )
+            return plan.weights.raw, plan.cost.raw, plan.stats[ "nb_diag" ], plan.stats[ "status" ], plan.stats[ "nb_continuation_steps" ]
+        we, ce, de, se, ke = solve( nu )
+        assert se == "converged" and ke > 1, ( name, se, ke )
+        wj, cj, dj, _, _ = jax.jit( solve )( nu )
+        assert numpy.array_equal( numpy.asarray( wj ), numpy.asarray( we ) ), ( name, numpy.abs( numpy.asarray( wj ) - numpy.asarray( we ) ).max() )
+        assert float( cj ) == float( ce ) and float( dj ) == float( de ), name
+        print( f"  { name }: { de } diagrams, { ke } stages, jit == eager" )
 
 
 # -- what we LOOK AT -------------------------------------------------------------------------
