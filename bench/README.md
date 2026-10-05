@@ -124,8 +124,10 @@ errand -k bench --env lmo-jax bench_diagram --case=uniform --dim=3 --kernel=floa
 errand -k bench --env lmo-jax bench_diagram --case=planes_voronoi,planes_equal --kernel=float,double
 ```
 
-On the 2D card kernel, `--output=facets` times the measures AND the laplacian's CSR (Newton's iteration), `--output=vjp`
-the adjoint alone (the pullback), `--output=moments` measures + barycentres + costs.
+On the card kernels ( 2D and 3D ), `--output=facets` times the measures AND the laplacian's CSR (Newton's iteration),
+`--output=vjp` the adjoint alone (the pullback), `--output=moments` measures + barycentres + costs. `--witness=generic` takes
+the generic double path ( `use_card_cells = False` ) as the accuracy reference instead of the card's double kernel ( and
+compares the double kernel too ). The 3D numbers on n22: `calibration_n22.md`.
 
 The first run compiles every kernel with `nvcc` (minutes each). Results: `bench/calibration_lmo_today.md`, section GPU.
 

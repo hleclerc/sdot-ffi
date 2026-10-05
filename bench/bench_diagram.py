@@ -63,6 +63,10 @@ if p := bench( "diagram",
                warmup    = Param( 0.3, help = "GPU: seconds of `measures` in a loop before the timed runs ( the old GPU bench: 0.3 )" ),
                accuracy  = Param( "auto", choices = [ "auto", "yes", "no" ], help = "compare with a `double` kernel run of the same diagram ( auto: on a GPU, for --kernel=float )" ),
                seed      = Param( 0, help = "seed of the uniform draw" ),
+               witness   = Param( "card", choices = [ "card", "generic" ],
+                                  help = "the reference of --accuracy: `card` the card's double kernel, `generic` the generic double path "
+                                         "( `use_card_cells = False`: the CPU's cell code, compiled for the card; slow in 3D ) -- with `generic` "
+                                         "the double kernel is compared too" ),
                output    = Param( "measures", choices = [ "measures", "facets", "vjp", "moments" ],
                                   help = "GPU, 2D card kernel: what one call computes -- `measures`; `facets`: the measures AND the laplacian's CSR "
                                          "( Newton's turn: `_card_cells`, cells + COO + assembly ); `vjp`: the adjoint of the measures alone "
@@ -99,8 +103,8 @@ if p := bench( "diagram",
     print( f"  positions as { benchlib.dtype_of( pd.sorted_positions ) } ( TF ), kernel { kernel }" )
 
     timing = benchlib.KernelTiming() if on_gpu else None
-    if p.output != "measures" and not ( on_gpu and d == 2 and pd._card_variant() is not None ):
-        raise ValueError( f"--output={ p.output }: the 2D card kernel only ( a CUDA device, 2D )" )
+    if p.output != "measures" and not ( on_gpu and pd._card_variant() is not None ):
+        raise ValueError( f"--output={ p.output }: the card kernel only ( a CUDA device, 2D or 3D )" )
     pullback = None
     if p.output == "vjp":                             # the forward once: what is timed is the pullback
         import jax
@@ -162,12 +166,15 @@ if p := bench( "diagram",
 
     # -- the accuracy, against a double kernel on the same tree
     acc = None
-    if p.output == "measures" and ( p.accuracy == "yes" or ( p.accuracy == "auto" and on_gpu and p.kernel == "float" ) ):
-        if p.kernel == "double":
+    if p.output == "measures" and ( p.accuracy == "yes" or ( p.accuracy == "auto" and on_gpu and ( p.kernel == "float" or p.witness == "generic" ) ) ):
+        if p.kernel == "double" and p.witness == "card":
             print( "  accuracy: the kernel is already double ( it is the reference )" )
         else:
             pd64 = PowerDiagram( pos, weights = w_arg, boundaries = box_half_spaces( [ 0 ] * d, [ 1 ] * d ), accelerator = bsp,
                                  kernel_dtype = "FP64", memory = memory )
+            if p.witness == "generic":
+                pd64.use_card_cells = False
+                print( "  accuracy witness: the generic double path ( `use_card_cells = False` )" )
             pd64.measures                             # the memory, as for the timed one
             m64 = numpy.asarray( pd64.measures.value ).reshape( -1 )
             acc = benchlib.accuracy( m, m64 )
@@ -259,7 +266,7 @@ if p := bench( "diagram",
                f"copy to numpy { t_convert * 1e3 :.2f} ms; tree built in { t_build * 1e3 :.0f} ms, diagram built in { t_ctor * 1e3 :.0f} ms, "
                f"sum of the measures { m.sum() :.9f}" + ( "" if ref else "  ( no old GPU number for this case )" ) )
         if acc:
-            line = "  accuracy against a double kernel ( same tree ): " + benchlib.accuracy_line( acc )
+            line = f"  accuracy against the { 'generic double path' if p.witness == 'generic' else 'double card kernel' } ( same tree ): " + benchlib.accuracy_line( acc )
             if acc_ref and acc_ref.get( "accuracy" ):
                 a = acc_ref[ "accuracy" ]
                 line += f"; old { acc_ref[ 'variant' ] }: " + ", ".join( f"{ key } { v :.1e}" for key, v in a.items() )

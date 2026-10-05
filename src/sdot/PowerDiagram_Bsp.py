@@ -9,8 +9,8 @@ in the user's order, measures and cells leave the kernel already at their index
 ( `user_id( k )` ), and the gathering `sorted = positions[ seed_indices ]` is an operation of the
 backend, DIFFERENTIABLE: a derivative with respect to `sorted_positions` comes back to `positions` on its own.
 
-On a CUDA card, in 2D, the tree is built by the card ( `AaBsp._init_on_card` ): the order and its inverse are then the
-card's arrays ( tracers under a `jit`, positions traced or not ), and the gathers run there.
+On a CUDA card, in 2D and 3D, the tree is built by the card ( `AaBsp._init_on_card` ): the order and its inverse are then
+the card's arrays ( tracers under a `jit`, positions traced or not ), and the gathers run there.
 
 Changing the WEIGHTS does not change the tree, only the affine majorant each node carries
 ( `refresh_weight_majorants` ): this is what makes a diagram reusable from one step to the next
@@ -47,6 +47,12 @@ class PowerDiagram_Bsp( PowerDiagram ):
     memo_counts      : IntTensor[ "num_point", dict( size = 32 ) ]
     num_memo         : Axis[ "nb_memo" ]
     nb_memo          : ShapeVar
+
+    def _default_memory( self, d ):
+        """no neighbour memory by default where the card's 3D cells take the calls: they neither read nor write it"""
+        if d == 3 and card_cells_enabled( self.use_card_cells ):
+            return 0
+        return super()._default_memory( d )
 
     def _init_seeds( self, positions, weights, accelerator ):
         tree = accelerator if isinstance( accelerator, AaBsp ) else AaBsp( positions, weights )
@@ -94,11 +100,12 @@ class PowerDiagram_Bsp( PowerDiagram ):
         self.memo_nbrs = nbrs.raw
         self.memo_counts = counts.raw
 
-    # ---- the 2D cells of the card ( `include/sdot/gpu/Cell2D.cuh`, `Laplacian2D.cuh` ) ------------------------
+    # ---- the cells of the card ( 2D: `include/sdot/gpu/Cell2D.cuh`, `Laplacian2D.cuh`; 3D: `Cell3D.cuh` ) ----------
     #
     # `measures` on a CUDA device, in 2D: one thread per cell, the cell in registers, the overflow redone by later
     # passes ( a warp per cell in shared, then in global memory ), the tree as aligned records in the kernel's float,
-    # the float accuracy fixes of the old GPU campaign. It takes the call only where it computes the SAME thing: a
+    # the float accuracy fixes of the old GPU campaign. In 3D: a warp per cell, its vertices on the lanes' registers
+    # ( 64, then 128 ), the overflow in a global-memory pass; the same outputs, the same fixes, the same scheme below. It takes the call only where it computes the SAME thing: a
     # constant density ( none, or an `Image` whose values are all equal on exactly the box ), a box domain, no
     # neighbour memory -- and it is an ffi call like the others, with its own ADJOINT ( `measures_vjp`: the facets of
     # each cell, gathered ), so a traced or differentiated call takes it too. `use_card_cells = False` on a diagram,
@@ -124,9 +131,11 @@ class PowerDiagram_Bsp( PowerDiagram ):
                                         int( self.card_overflow_warps ), int( self.card_overflow_bytes ) )
 
     def _card_failures( self ):
-        """what the kernel's failure codes mean ( `Cell2D.cuh::Failure` )"""
+        """what the kernel's failure codes mean ( `Cell2D.cuh::Failure`, `Cell3D.cuh::Failure` )"""
         return { 1: ( "a cell of the power diagram has more than " + str( self.card_max_vertices ) + " vertices ( seed {value} ): "
-                      "raise `card_max_vertices` on the diagram, or look at the input ( coincident seeds? )" ) }
+                      "raise `card_max_vertices` on the diagram, or look at the input ( coincident seeds? )" ),
+                 2: ( "the cell of seed {value} could not be cut consistently in the kernel's float ( a degenerate input: "
+                      "coincident or cospherical seeds at the rounding? ); the double kernel ( kernel_dtype = 'FP64' ) may take it" ) }
 
     def _card_density( self ):
         """the constant density the card integrates, or `None` when the distribution is not a constant on the box"""
@@ -156,12 +165,11 @@ class PowerDiagram_Bsp( PowerDiagram ):
         return float( vals[ 0 ] )
 
     def _card_takes( self ):
-        """whether the card's cells take this diagram, its density apart: 2D, a box domain, the BSP tree, no neighbour memory,
-        a CUDA device ( and neither `use_card_cells = False` nor `SDOT_CARD_CELLS=0` )"""
-        import os
-        if not self.use_card_cells or os.environ.get( "SDOT_CARD_CELLS", "1" ).lower() in ( "0", "no", "false", "off" ):
+        """whether the card's cells take this diagram, its density apart: 2D or 3D, a box domain, the BSP tree, no neighbour
+        memory, a CUDA device ( and neither `use_card_cells = False` nor `SDOT_CARD_CELLS=0` )"""
+        if not card_cells_enabled( self.use_card_cells ):
             return False
-        if self.dim_count != 2 or self.memo_counts.is_defined:
+        if self.dim_count not in ( 2, 3 ) or self.memo_counts.is_defined:
             return False
         if not getattr( driver.device, "is_cuda_gpu", False ):
             return False
@@ -177,7 +185,7 @@ class PowerDiagram_Bsp( PowerDiagram ):
             return None
         from .CellScratch import fp_size
         variant = card_variant_for( fp_size( self._domain_cell().kernel_dtype ), int( self.nb_points.value ),
-                                    int( self.tree.nb_bsp_nodes.value ) )
+                                    int( self.tree.nb_bsp_nodes.value ), self.dim_count )
         return variant, rho
 
     def _card_solve_density( self ):
@@ -241,30 +249,34 @@ class PowerDiagram_Bsp( PowerDiagram ):
 
     def _card_call( self, name, variant, rho, facets = False, moments = False, with_vjp = True ):
         """the measures ( and per `facets` / `moments` the laplacian's CSR, the barycentres and costs ) on the card"""
-        n = int( self.nb_points.value )
+        n, d = int( self.nb_points.value ), self.dim_count
+        ns = "sdot::gpu2d" if d == 2 else "sdot::gpu3d"
         res = RealTensor[ self.num_point ]()
         kwargs = dict( power_diagram = self, density = RealTensor( np.float64( rho ) ), res = loom.out( res ) )
         lap = mom = None
         if facets:
             lap = _CardLaplacian( nb_rows = n + 1, nb_points = n )
-            kwargs[ "lap" ] = loom.out( lap, capacities = { "nb_nnz": card_nnz_capacity( n ) } )
+            kwargs[ "lap" ] = loom.out( lap, capacities = { "nb_nnz": card_nnz_capacity( n, d ) } )
         if moments:
-            mom = _CardMoments( nb_points = n, nb_dims = 2 )
+            mom = _CardMoments( nb_points = n, nb_dims = d )
             kwargs[ "mom" ] = loom.out( mom )
         limits = f"{ int( self.card_max_vertices ) }, { self._card_overflow_warps( variant ) }"
-        includes = [ "sdot/gpu/Laplacian2D.cuh" if ( facets or moments ) else "sdot/gpu/Cell2D.cuh" ]
+        if d == 3:
+            includes = [ "sdot/gpu/Cell3D.cuh" ]
+        else:
+            includes = [ "sdot/gpu/Laplacian2D.cuh" if ( facets or moments ) else "sdot/gpu/Cell2D.cuh" ]
         if facets or moments:
-            out = " | ".join( [ "sdot::gpu2d::MEASURES" ] + [ "sdot::gpu2d::FACETS" ] * facets + [ "sdot::gpu2d::MOMENTS" ] * moments )
-            fwd = ( f"sdot::gpu2d::cells<{ variant }, { out }>( queue, args.inputs.power_diagram, args.outputs.res, "
+            out = " | ".join( [ f"{ ns }::MEASURES" ] + [ f"{ ns }::FACETS" ] * facets + [ f"{ ns }::MOMENTS" ] * moments )
+            fwd = ( f"{ ns }::cells<{ variant }, { out }>( queue, args.inputs.power_diagram, args.outputs.res, "
                     f"{ 'args.outputs.lap' if facets else '0' }, { 'args.outputs.mom' if moments else '0' }, args.errors, args.allocator, "
                     f"args.inputs.density, { limits } );" )
         else:
-            fwd = ( f"sdot::gpu2d::measures<{ variant }>( queue, args.inputs.power_diagram, args.outputs.res, "
+            fwd = ( f"{ ns }::measures<{ variant }>( queue, args.inputs.power_diagram, args.outputs.res, "
                     f"args.errors, args.allocator, args.inputs.density, { limits } );" )
         kernels = [ FfiCode.inline( fwd, includes = includes, allocator = True ) ]
         if with_vjp:
             kernels.append( FfiCode.inline(
-                f"sdot::gpu2d::measures_vjp<{ variant }>( queue, args.inputs.power_diagram, args.grad_of_outputs.res, "
+                f"{ ns }::measures_vjp<{ variant }>( queue, args.inputs.power_diagram, args.grad_of_outputs.res, "
                 "args.grad_of_inputs.power_diagram.sorted_positions, args.grad_of_inputs.power_diagram.sorted_weights, "
                 f"args.errors, args.allocator, args.inputs.density, { limits } );",
                 includes = includes, allocator = True ) )
@@ -275,7 +287,7 @@ class PowerDiagram_Bsp( PowerDiagram ):
         v = self._card_variant()
         if v is None:
             return None
-        return self._card_call( "power_diagram_measures_card_2d", *v )[ 0 ]
+        return self._card_call( f"power_diagram_measures_card_{ self.dim_count }d", *v )[ 0 ]
 
     def _card_cells( self, facets = True, moments = False ):
         """THE CELLS ON THE CARD, and what Newton makes of them ( a test and bench hook; `SdotPlanNd` calls the C++ of
@@ -286,7 +298,7 @@ class PowerDiagram_Bsp( PowerDiagram ):
         v = self._card_variant()
         if v is None:
             return None
-        res, lap, mom = self._card_call( "power_diagram_cells_card_2d", *v, facets = facets, moments = moments, with_vjp = False )
+        res, lap, mom = self._card_call( f"power_diagram_cells_card_{ self.dim_count }d", *v, facets = facets, moments = moments, with_vjp = False )
         out = dict( measures = res )
         if lap is not None:
             nnz = int( np.asarray( lap.nb_nnz.value ).reshape( -1 )[ 0 ] )
@@ -377,8 +389,17 @@ class PowerDiagram_Bsp( PowerDiagram ):
 
 # ---- the card's variants and work buffers ( see `PowerDiagram_Bsp._card_variant` ) ---------------------------------
 
-def card_variant_for( kernel_fp_size, nb_seeds, nb_nodes ):
-    """THE C++ VARIANT of the 2D card kernel, chosen from the inputs ( `sdot::gpu2d::Variant< TK, TR, TN, MAX_HEIGHT >` ):
+def card_cells_enabled( flag = True ):
+    """whether the card's dedicated cells may take a call: `flag` ( `use_card_cells` ), `SDOT_CARD_CELLS` not `0`, a CUDA device"""
+    import os
+    if not flag or os.environ.get( "SDOT_CARD_CELLS", "1" ).lower() in ( "0", "no", "false", "off" ):
+        return False
+    return bool( getattr( driver.device, "is_cuda_gpu", False ) )
+
+
+def card_variant_for( kernel_fp_size, nb_seeds, nb_nodes, dim = 2 ):
+    """THE C++ VARIANT of the card kernel, chosen from the inputs ( `sdot::gpu2d::Variant< TK, TR, TN, MAX_HEIGHT >`, or
+    `sdot::gpu3d::Variant` with the same parameters for the 3D cells ):
 
       * `TK` the kernel's float ( `kernel_dtype` );
       * `TR` a rank / cut identifier: `int` while the seeds and the four box sides fit in it, `long long` beyond;
@@ -394,26 +415,37 @@ def card_variant_for( kernel_fp_size, nb_seeds, nb_nodes ):
     tr = "int" if int( nb_seeds ) <= 2 ** 31 - 9 else "long long"
     tn = "int" if int( nb_nodes ) <= 2 ** 31 - 1 else "long long"
     height = 32 if depth <= 32 else 64
-    return f"sdot::gpu2d::Variant<{ tk }, { tr }, { tn }, { height }>"
+    if int( dim ) not in ( 2, 3 ):
+        raise ValueError( f"the card's cells are 2D or 3D ( not { dim }D )" )
+    return f"sdot::gpu{ int( dim ) }d::Variant<{ tk }, { tr }, { tn }, { height }>"
 
 
 def card_overflow_warps_for( variant, nb_seeds, max_vertices, warps = 64, max_bytes = 256 << 20 ):
-    """THE SLOTS OF THE FOURTH PASS ( `Cell2D.cuh::Overflow` ): `warps` cells at once, fewer when `warps` slots of the
-    per-cell limit would take more than `max_bytes` of the call's pool, at least one block of four. A slot holds
-    `min( max_vertices, n + 4 )` vertices ( a cell of `n` seeds in a box has at most `n + 3` ), each five reals of the
-    kernel and two cut identifiers ( `WarpCell::bytes_for` ); the cells past the slots wait for one to be free, so the
-    number of slots is a matter of speed on the rare cells that get there, never of correctness."""
+    """THE SLOTS OF THE LAST PASS ( `Cell2D.cuh::Overflow`, `Cell3D.cuh::Slots` ): `warps` cells at once, fewer when `warps`
+    slots of the per-cell limit would take more than `max_bytes` of the call's pool, at least one block of four. In 2D a
+    slot holds `min( max_vertices, n + 4 )` vertices ( a cell of `n` seeds in a box has at most `n + 3` ), each five reals
+    of the kernel and two cut identifiers ( `WarpCell::bytes_for` ); in 3D `min( max_vertices, 2 n + 8 )` vertices of
+    seven reals of the kernel, three doubles and thirteen `int`, and half as many cuts ( `MemCell::bytes_for` ). The cells
+    past the slots wait for one to be free, so the number of slots is a matter of speed on the rare cells that get there,
+    never of correctness."""
     tk, tr = variant.split( "<" )[ 1 ].split( "," )[ :2 ]
-    per_vertex = 5 * ( 4 if tk.strip() == "float" else 8 ) + 2 * ( 4 if tr.strip() == "int" else 8 )
+    fk, fr = ( 4 if tk.strip() == "float" else 8 ), ( 4 if tr.strip() == "int" else 8 )
+    if "gpu3d" in variant:
+        per_vertex = 7 * fk + 24 + 52 + ( fr + 36 ) // 2 + 1
+        cap = max( 64, min( int( max_vertices ), 2 * int( nb_seeds ) + 8 ) )
+        fit = int( max_bytes ) // ( cap * per_vertex )
+        return int( max( 4, min( int( warps ), fit ) ) )
+    per_vertex = 5 * fk + 2 * fr
     cap = max( 4, min( int( max_vertices ), int( nb_seeds ) + 4 ) )
     fit = int( max_bytes ) // ( cap * per_vertex )
     return int( max( 4, min( int( warps ), fit ) ) )
 
 
-def card_nnz_capacity( nb_seeds ):
+def card_nnz_capacity( nb_seeds, dim = 2 ):
     """the first guess of the laplacian's entries: a planar graph has at most `3 n - 6` edges, each in two rows ( a
-    float topology may add a few slivers: the margin, and loom grows it if it was not enough )"""
-    return 6 * int( nb_seeds ) + 1024
+    float topology may add a few slivers: the margin, and loom grows it if it was not enough ); a 3D Laguerre graph has
+    15.5 neighbours per seed on average for a uniform cloud ( no bound: loom grows it past the guess )"""
+    return ( 6 if int( dim ) == 2 else 18 ) * int( nb_seeds ) + 1024
 
 
 class _CardLaplacian( Aggregate ):

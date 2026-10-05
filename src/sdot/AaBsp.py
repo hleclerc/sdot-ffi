@@ -76,7 +76,7 @@ class AaBsp( SpatialAccelerator ):
     this construction from going under a `jit` -- but an `AaBsp` is a CONSTANT of the trace (see
     below), so that is not what is asked of it.
 
-    ON A CUDA CARD, IN 2D, the whole tree is ONE ffi call instead ( `gpu/Bsp2D.cuh`, `_init_on_card` ): the seeds
+    ON A CUDA CARD, IN 2D AND 3D, the whole tree is ONE ffi call instead ( `gpu/Bsp2D.cuh`, `_init_on_card` ): the seeds
     sorted once per axis, then per level the boxes read off the sorted lists and a stable partition of the lists by
     a scan -- nothing read back, so it runs under a `jit` on TRACED positions too, and a solve on the card builds its
     tree inside its jitted program ( `SdotPlanNd` ). The same tree, but for which half of the seeds TIED at a median
@@ -152,7 +152,7 @@ class AaBsp( SpatialAccelerator ):
         Only a SHAPE is read here, and a shape is not data.
         """
         pos = positions if hasattr( positions, "shape" ) else np.asarray( positions, dtype = float )
-        # ON A CUDA CARD, in 2D: the whole tree in ONE ffi call ( `gpu/Bsp2D.cuh` ), nothing read back -- traced positions
+        # ON A CUDA CARD, in 2D and 3D: the whole tree in ONE ffi call ( `gpu/Bsp2D.cuh` ), nothing read back -- traced positions
         # included ( under a `jit` the tree is then built in the jitted program )
         if builds_on_card( pos ):
             self._init_on_card( pos, weights, max_seeds_per_leaf )
@@ -327,7 +327,7 @@ class AaBsp( SpatialAccelerator ):
         nb_nodes = int( self.nb_bsp_nodes.value )
         self._majorant_weights = None
         if builds_on_card( self.node_box ):
-            # ON THE CARD: `Majorant2D.cuh`'s launches over the seeds and the levels ( the per-node kernel below gives the
+            # ON THE CARD: `Majorant2D.cuh`'s ( 3D: `Majorant3D.cuh`'s ) launches over the seeds and the levels ( the per-node kernel below gives the
             # root's million seeds to one thread ); the tree's tensors are read where they are, traced or not
             num_seed = self.num_bsp_seed
             sp = RealTensor[ num_seed, self.dim ]( driver.stop_gradient( getattr( sorted_positions, "raw", sorted_positions ) ) )
@@ -335,12 +335,15 @@ class AaBsp( SpatialAccelerator ):
             wa = RealTensor[ self.num_bsp_node, self.dim ]()
             wb = RealTensor[ self.num_bsp_node ]()
             tn = "int" if nb_nodes <= 2 ** 31 - 1 else "long long"
+            d = int( self.nb_dims.value )
+            fn, inc = ( f"sdot::gpu2d::refresh_majorants<{ tn }>", "sdot/gpu/Bsp2D.cuh" ) if d == 2 else \
+                      ( f"sdot::gpu3d::refresh_majorants<{ d }, { tn }>", "sdot/gpu/Majorant3D.cuh" )
             loom.ffi_call(
-                "bsp_refresh_majorants_card",
-                FfiCode.inline( f"sdot::gpu2d::refresh_majorants<{ tn }>( queue, args.inputs.node_box, args.inputs.node_begin, "
+                f"bsp_refresh_majorants_card_{ d }d",
+                FfiCode.inline( f"{ fn }( queue, args.inputs.node_box, args.inputs.node_begin, "
                                 "args.inputs.node_end, args.inputs.sorted_positions, args.inputs.sorted_weights, args.outputs.node_wa, "
                                 "args.outputs.node_wb, args.allocator );",
-                                includes = [ "sdot/gpu/Bsp2D.cuh" ], allocator = True ),
+                                includes = [ inc ], allocator = True ),
                 node_box = self.node_box, node_begin = self.node_begin, node_end = self.node_end,
                 sorted_positions = sp, sorted_weights = sw,
                 node_wa = loom.out( wa ), node_wb = loom.out( wb ),
@@ -735,13 +738,13 @@ def _build_in_kernel( pos, w, leaf_size ):
 
 def builds_on_card( x ):
     """whether a tree on `x` ( positions `[ n, d ]`, or any `[ ..., d ]` tensor of the tree ) is built and refreshed by the
-    card's kernels: a CUDA device and 2D -- the card's cells' scope ( `PowerDiagram_Bsp._card_variant` ). `SDOT_CARD_TREE=0`
+    card's kernels: a CUDA device, 2D or 3D -- the card's cells' scope ( `PowerDiagram_Bsp._card_variant` ). `SDOT_CARD_TREE=0`
     sends every tree to the host-driven build ( `_build_in_kernel`: under a trace, a constant evaluated while tracing ) -- the
     comparison point of the benches"""
     import os
     if os.environ.get( "SDOT_CARD_TREE", "1" ).lower() in ( "0", "no", "false", "off" ):
         return False
-    return bool( getattr( driver.device, "is_cuda_gpu", False ) ) and len( x.shape ) >= 2 and int( x.shape[ -1 ] ) == 2
+    return bool( getattr( driver.device, "is_cuda_gpu", False ) ) and len( x.shape ) >= 2 and int( x.shape[ -1 ] ) in ( 2, 3 )
 
 
 def take_rows( a, idx ):

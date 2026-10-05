@@ -15,6 +15,9 @@ past the vertex limit is an ERROR ( `KernelFailure`, eager and traced ), never a
 
 Every test skips itself without a CUDA device ( the path does not exist on a CPU ) -- but the one on the choice of the
 variant, which is pure Python.
+
+THE 3D CELLS ( `include/sdot/gpu/Cell3D.cuh`, the last section ): a warp per cell, the same outputs, the same four
+properties, checked the same way against the generic double path ( or the plain storage where the cell is large ).
 """
 import numpy
 
@@ -25,7 +28,7 @@ from sdot import AaBsp, PowerDiagram, box_half_spaces
 from sdot.PowerDiagram_Bsp import card_variant_for
 
 _GPU = bool( getattr( driver.device, "is_cuda_gpu", False ) )
-_NO_GPU = "the dedicated 2D cell kernel only exists on a CUDA device"
+_NO_GPU = "the dedicated cell kernels only exist on a CUDA device"
 
 
 def _pd( pos, w = None, kernel = "FP32", card = True, mi = ( 0, 0 ), ma = ( 1, 1 ), tree = None, **kw ):
@@ -49,9 +52,8 @@ def _rel( m, ref ):
 
 def _check( pos, w = None, mi = ( 0, 0 ), ma = ( 1, 1 ), tol64 = 1e-9, tol32_med = 1e-11, tol32_max = 1e-6, label = "", plain = False ):
     """the card ( float and double kernels ) against the generic double path, on the same tree -- or, `plain`, on the plain
-    storage ( every seed cuts every cell: exact, and blind to the tree; the generic BSP path gets a few cells of the rings
-    wrong on the card, NaN or a wrong area depending on how the tree orders its halves -- a defect of that path, not
-    fixed here )"""
+    storage ( every seed cuts every cell: exact, and blind to the tree; in 3D the generic BSP path still gets a few cells
+    of the spheres wrong -- in 2D its rings are right since its cut takes the run of the farthest vertex )"""
     tree = AaBsp( pos, w )
     ref = _m( _pd( pos, w, "FP64", False, mi, ma, "plain" if plain else tree ) )
     for kernel in ( "FP64", "FP32" ):
@@ -144,12 +146,12 @@ if test( "the_card_cells_overflow_into_the_later_passes" ):
         rng = numpy.random.default_rng( 2 )
         for k in ( 12, 40, 100, 300 ):
             pos = _ring( k, rng )
-            ref = _check( pos, label = f"ring of { k }", plain = True )
+            ref = _check( pos, label = f"ring of { k }" )
             assert abs( ref[ 0 ] - k * 0.1 ** 2 * numpy.tan( numpy.pi / k ) ) < 0.2 * ref[ 0 ]   # ~ the k-gon of apothem 0.1
         # and weighted: the central seed heavier, its k-gon wider
         w = numpy.zeros( len( pos ) )
         w[ 0 ] = 0.03
-        _check( pos, w, label = "heavy centre", plain = True )
+        _check( pos, w, label = "heavy centre" )
 
 if test( "the_card_cells_small_and_degenerate_clouds" ):
     if not _GPU:
@@ -588,7 +590,7 @@ if test( "the_card_fourth_pass_works_in_batches" ):
             for warps in ( 4, 64 ):
                 bsp.PowerDiagram_Bsp.card_overflow_warps = warps
                 if warps == 4:
-                    ref = _check( pos, w, label = "24 rings of 400, 4 slots", plain = True )
+                    ref = _check( pos, w, label = "24 rings of 400, 4 slots" )
                     apothem = 0.5 * r                    # ( the centres' weights are zero, the ring's tiny )
                     assert numpy.abs( ref[ :len( centres ) ] / ( k * apothem ** 2 * numpy.tan( numpy.pi / k ) ) - 1 ).max() < 0.05
                 for kernel in ( "FP64", "FP32" ):
@@ -647,6 +649,8 @@ if test( "the_card_raises_past_the_vertex_limit" ):
 if test( "the_card_variant_follows_the_inputs" ):
     # pure Python: the variant chosen from the seeds and the tree, synthetic sizes past 32-bit indices and depth 32
     assert card_variant_for( 32, 10 ** 6, 2 ** 18 - 1 ) == "sdot::gpu2d::Variant<float, int, int, 32>"
+    assert card_variant_for( 32, 10 ** 6, 2 ** 18 - 1, 3 ) == "sdot::gpu3d::Variant<float, int, int, 32>"
+    assert card_variant_for( 64, 10 ** 11, 2 ** 40 - 1, 3 ) == "sdot::gpu3d::Variant<double, long long, long long, 64>"
     assert card_variant_for( 64, 10 ** 6, 2 ** 18 - 1 ) == "sdot::gpu2d::Variant<double, int, int, 32>"
     assert card_variant_for( 32, 2 ** 31 - 9, 2 ** 31 - 1 ) == "sdot::gpu2d::Variant<float, int, int, 32>"     # depth 31
     assert card_variant_for( 32, 2 ** 31, 2 ** 31 - 1 ) == "sdot::gpu2d::Variant<float, long long, int, 32>"   # ranks past int
@@ -678,7 +682,7 @@ if test( "the_wide_card_variant_computes_the_same_cells" ):
         gn = numpy.asarray( pb( g )[ 0 ] )
         original = bsp.card_variant_for
         try:
-            bsp.card_variant_for = lambda fp, n, nodes: f"sdot::gpu2d::Variant<{ 'float' if fp == 32 else 'double' }, long long, long long, 64>"
+            bsp.card_variant_for = lambda fp, n, nodes, dim = 2: f"sdot::gpu2d::Variant<{ 'float' if fp == 32 else 'double' }, long long, long long, 64>"
             wide = _pd( pos, w, "FP32", True, tree = tree )._card_cells( facets = True )
             _, pb = driver.vjp( _measures_fn( pos, w, tree, "FP32", True, "weights" ), w )
             gw = numpy.asarray( pb( g )[ 0 ] )
@@ -691,3 +695,415 @@ if test( "the_wide_card_variant_computes_the_same_cells" ):
         for key in ( "col", "val" ):
             assert numpy.array_equal( numpy.asarray( narrow[ key ].raw )[ :nnz ], numpy.asarray( wide[ key ].raw )[ :nnz ] ), key
         assert numpy.array_equal( gn, gw )
+
+
+# ---- THE 3D CELLS ( `include/sdot/gpu/Cell3D.cuh` ) ----------------------------------------------------------------------
+#
+# A warp per cell ( 64 vertices on the lanes' registers, then 128, then a slot of global memory ), the tree built on the card
+# ( `Bsp2D.cuh::build_tree< 3 >`, `Majorant3D.cuh` ). The reference is the generic double path on the same tree, or the plain
+# storage ( exact, every seed cuts every cell ) where a cell is large.
+
+_BOX3 = ( ( 0, 0, 0 ), ( 1, 1, 1 ) )
+
+
+def _check3( pos, w = None, mi = ( 0, 0, 0 ), ma = ( 1, 1, 1 ), tol64 = 1e-9, tol32_med = 1e-9, tol32_max = 1e-5, label = "", plain = False ):
+    """`_check` in 3D: the card ( float and double kernels ) against the generic double path"""
+    return _check( pos, w, mi, ma, tol64, tol32_med, tol32_max, label, plain )
+
+
+def _planes3( n, rng, sigma = 0.02 ):
+    """the campaign's `planes` cloud ( `bench/cases.py::planes_cloud` ): four planes through the cube, a normal spread"""
+    out = []
+    while len( out ) < 4:
+        u = rng.normal( size = 3 )
+        u /= numpy.linalg.norm( u )
+        out.append( ( u, u @ numpy.full( 3, 0.5 ) + rng.uniform( -0.25, 0.25 ) ) )
+    pts = []
+    for u, c in out:
+        a = numpy.array( [ 0.0, 1.0, 0.0 ] ) if abs( u[ 0 ] ) > 0.9 else numpy.array( [ 1.0, 0.0, 0.0 ] )
+        v1 = numpy.cross( u, a )
+        v1 /= numpy.linalg.norm( v1 )
+        v2 = numpy.cross( u, v1 )
+        st = rng.uniform( -1.2, 1.2, size = ( 8 * n, 2 ) )
+        P = c * u + st[ :, :1 ] * v1 + st[ :, 1: ] * v2
+        P = P[ numpy.all( ( P > 0 ) & ( P < 1 ), axis = 1 ) ][ :n // 4 + 1 ]
+        pts.append( P + rng.normal( 0, sigma, size = ( len( P ), 1 ) ) * u )
+    P = numpy.concatenate( pts )[ :n ]
+    rng.shuffle( P )
+    return numpy.clip( P, 0.001, 0.999 )
+
+
+def _clouds3( rng, n = 8000 ):
+    """`( label, positions, weights )`: uniform, clustered ( planes ), weighted ( planes with weights of the order of their
+    cells and a smooth potential: the `planes_equal` regime )"""
+    uni = rng.uniform( 0.001, 0.999, size = ( n, 3 ) )
+    pla = _planes3( n, rng )
+    h2 = n ** ( -2 / 3 )
+    return [ ( "uniform 3d", uni, None ),
+             ( "planes", pla, None ),
+             ( "planes weighted", pla, rng.uniform( -0.3, 0.3, n ) * h2 + 0.05 * numpy.sin( 4 * pla[ :, 0 ] ) ) ]
+
+
+def _sphere3( k, rng, n_back = 1500, r = 0.2 ):
+    """a seed in the middle of a sphere of `k` seeds ( its cell has `k` faces, `2 k - 4` vertices ), plus a uniform background"""
+    i = numpy.arange( k ) + 0.5
+    phi = numpy.arccos( 1 - 2 * i / k )
+    th = numpy.pi * ( 1 + 5 ** 0.5 ) * i + rng.uniform( -0.05, 0.05, k )
+    sph = 0.5 + r * numpy.stack( [ numpy.cos( th ) * numpy.sin( phi ), numpy.sin( th ) * numpy.sin( phi ), numpy.cos( phi ) ], axis = 1 )
+    back = rng.uniform( 0.001, 0.999, size = ( n_back, 3 ) )
+    back = back[ numpy.linalg.norm( back - 0.5, axis = 1 ) > r + 0.1 ]
+    return numpy.concatenate( [ [ [ 0.5, 0.5, 0.5 ] ], sph, back ] )
+
+
+if test( "the_card_cells_3d_are_the_generic_cells_voronoi" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        rng = numpy.random.default_rng( 30 )
+        _check3( rng.uniform( 0.001, 0.999, size = ( 20000, 3 ) ), label = "uniform 3d" )
+        _check3( _planes3( 20000, rng ), label = "planes" )
+        _check3( rng.uniform( [ -3, 2, 0 ], [ 5, 2.5, 1 ], size = ( 3000, 3 ) ), mi = ( -3, 2, 0 ), ma = ( 5, 2.5, 1 ), label = "off-centre box" )
+
+if test( "the_card_cells_3d_are_the_generic_cells_with_weights" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        rng = numpy.random.default_rng( 31 )
+        n = 20000
+        h2 = n ** ( -2 / 3 )
+        pos = rng.uniform( 0.001, 0.999, size = ( n, 3 ) )
+        _check3( pos, rng.uniform( -0.3, 0.3, n ) * h2, label = "w ~ h^2" )
+        _check3( pos, 0.13 * numpy.sin( 3 * pos[ :, 0 ] ) + rng.uniform( -1, 1, n ) * h2, label = "w ~ 0.13" )
+        _check3( pos, rng.uniform( -3, 3, n ) * h2, label = "w ~ 3 h^2 ( empty cells )" )
+        for label, p, w in _clouds3( rng )[ 2: ]:
+            _check3( p, w, label = label )
+
+if test( "the_card_cells_3d_overflow_into_the_later_passes" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        # k faces: 2 k - 4 vertices. k = 20 fits the first pass, 50 the second ( 128 vertices ), 120 and 400 the global one
+        rng = numpy.random.default_rng( 32 )
+        for k in ( 20, 50, 120, 400 ):
+            pos = _sphere3( k, rng )
+            ref = _check3( pos, label = f"sphere of { k }", plain = True )
+            assert 4.1e-3 < ref[ 0 ] < 6.5e-3, ref[ 0 ]   # the polytope around the ball of radius 0.1 ( 4.19e-3 )
+        w = numpy.zeros( len( pos ) )
+        w[ 0 ] = 0.01
+        _check3( pos, w, label = "heavy centre", plain = True )
+
+if test( "the_card_cells_3d_small_and_degenerate_clouds" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        rng = numpy.random.default_rng( 33 )
+        g = numpy.stack( numpy.meshgrid( ( numpy.arange( 12 ) + 0.5 ) / 12, ( numpy.arange( 10 ) + 0.5 ) / 10, ( numpy.arange( 8 ) + 0.5 ) / 8 ),
+                         axis = -1 ).reshape( -1, 3 )
+        for label, pos in ( ( "n = 1", numpy.array( [ [ 0.3, 0.6, 0.2 ] ] ) ), ( "n = 7", rng.uniform( 0, 1, size = ( 7, 3 ) ) ) ):
+            _check3( pos, label = label )
+        # GRIDS: eight cells at every vertex, cuts through vertices that are on them ( the ties of `Cell3D.cuh::widen` ). The
+        # reference is the exact box ( the generic path and the plain storage get some of these cells wrong ), and on the
+        # jittered grid the generic cells where the plain storage agrees with them
+        g2 = numpy.stack( numpy.meshgrid( *[ ( numpy.arange( 20 ) + 0.5 ) / 20 ] * 3 ), axis = -1 ).reshape( -1, 3 )
+        gj = g + 1e-3 * rng.uniform( 0, 1, size = g.shape ) * ( rng.uniform( size = ( len( g ), 1 ) ) < 0.5 )
+        gen = _m( _pd( gj, None, "FP64", False, *_BOX3, tree = AaBsp( gj ) ) )
+        plain = _m( _pd( gj, None, "FP64", False, *_BOX3, tree = "plain" ) )
+        trusted = numpy.abs( gen - plain ) <= 1e-9 * plain
+        assert trusted.mean() > 0.99
+        for label, pos, ref, ok in ( ( "grid", g, numpy.full( len( g ), 1 / len( g ) ), None ), ( "grid 20^3", g2, numpy.full( len( g2 ), 1 / len( g2 ) ), None ),
+                                     ( "grid, half jittered", gj, gen, trusted ) ):
+            for leaf in ( 10, 2000 ):                    # ( with and without the pruning )
+                tree = AaBsp( pos, max_seeds_per_leaf = leaf )
+                for kernel in ( "FP64", "FP32" ):
+                    m = _m( _pd( pos, None, kernel, True, *_BOX3, tree = tree ) )
+                    r = numpy.abs( m - ref ) / ref
+                    r = r if ok is None else r[ ok ]
+                    # ( a jittered vertex near a tie is decided in float in the float kernel: a sliver, at its rounding )
+                    tol = 1e-6 if ( kernel == "FP32" and ok is not None ) else 1e-10
+                    assert r.max() < tol and abs( m.sum() - 1 ) < 1e-9, ( label, leaf, kernel, r.max(), m.sum() )
+                    print( f"  { label } ( leaf { leaf } ) { kernel }: max rel. gap { r.max() :.1e}" )
+        pos = rng.uniform( 0.1, 0.9, size = ( 500, 3 ) )
+        pos[ 0 ] = [ 1.5, 0.5, 0.5 ]
+        pos = numpy.concatenate( [ pos, pos[ 1:20 ] ] )
+        w = numpy.zeros( len( pos ) )
+        w[ 500: ] = -1e-4
+        _check3( pos, w, label = "outside + duplicates" )
+
+if test( "the_card_cells_3d_follow_the_weights" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        rng = numpy.random.default_rng( 34 )
+        n = 5000
+        h2 = n ** ( -2 / 3 )
+        pos = rng.uniform( 0, 1, size = ( n, 3 ) )
+        pd = _pd( pos, numpy.zeros( n ), "FP32", True, *_BOX3 )
+        gen = _pd( pos, numpy.zeros( n ), "FP64", False, *_BOX3 )
+        for s in range( 3 ):
+            w = rng.uniform( -1, 1, n ) * ( s + 1 ) * h2
+            pd.weights = w
+            gen.weights = w
+            r = _rel( _m( pd ), _m( gen ) )
+            assert numpy.median( r ) < 1e-9 and r.max() < 1e-4, ( s, numpy.median( r ), r.max() )
+
+if test( "the_card_laplacian_3d_is_the_generic_one" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        rng = numpy.random.default_rng( 35 )
+        for label, pos, w in _clouds3( rng, 4000 ) + [ ( "sphere of 120", _sphere3( 120, rng ), None ) ]:
+            n = len( pos )
+            tree = AaBsp( pos, w )
+            gen = _pd( pos, w, "FP64", False, *_BOX3, tree = tree )
+            ref = _generic_laplacian( gen, tree, n )
+            ref_m = _m( gen )
+            # the generic path gets a few cells of the spheres wrong ( as of the rings in 2D ): their rows are not a reference
+            plain = _m( _pd( pos, w, "FP64", False, *_BOX3, tree = "plain" ) ) if label.startswith( "sphere" ) else ref_m
+            wrong = numpy.isnan( ref_m ) | ( numpy.abs( ref_m - plain ) > 1e-9 * numpy.abs( plain ) )
+            broken = set( int( r ) for r in numpy.asarray( tree.rank_of_seeds() )[ wrong ] )
+            ref = { k: v for k, v in ref.items() if numpy.isfinite( v ) and not ( set( k ) & broken ) }
+            for kernel in ( "FP64", "FP32" ):
+                out = _pd( pos, w, kernel, True, *_BOX3, tree = tree )._card_cells( facets = True, moments = False )
+                assert out is not None, label
+                assert _rel( numpy.asarray( out[ "measures" ].raw ).reshape( -1 ), plain ).max() < 1e-9
+                row, col, val, dia = _card_laplacian( out, n )
+                for i in range( n ):
+                    c = col[ row[ i ]:row[ i + 1 ] ]
+                    assert ( numpy.diff( c ) > 0 ).all() and not ( c == i ).any(), ( label, kernel, "row", i, c )
+                got = { ( i, int( col[ p ] ) ): float( val[ p ] ) for i in range( n ) for p in range( row[ i ], row[ i + 1 ] ) }
+                cmp = { k: v for k, v in got.items() if not ( set( k ) & broken ) }
+                assert all( got[ ( j, i ) ] == v for ( i, j ), v in got.items() ), ( label, kernel, "not symmetric" )
+                sums = numpy.zeros( n )
+                for i in range( n ):
+                    for p in range( row[ i ], row[ i + 1 ] ):
+                        sums[ i ] += val[ p ]
+                bad = numpy.where( ~ ( ( sums == dia ) | ( ( sums == 0 ) & ( dia == 1 ) ) ) )[ 0 ]
+                assert not len( bad ), ( label, kernel, "L 1 != 0", bad[ :5 ] )
+                # the same graph ( but slivers: a facet of a vanishing area may be seen or not at the rounding ), the same values
+                scale = numpy.median( list( ref.values() ) )
+                missing, extra = set( ref ) - set( cmp ), set( cmp ) - set( ref )
+                small = [ max( ref.get( k, 0 ), got.get( k, 0 ) ) / scale for k in missing | extra ]
+                tiny = 1e-9 if kernel == "FP64" else 1e-3
+                assert all( s < tiny for s in small ), ( label, kernel, len( missing ), len( extra ), sorted( small )[ -5: ] )
+                assert len( missing | extra ) <= 1e-3 * len( ref ), ( label, kernel, len( missing ), len( extra ) )
+                common = set( ref ) & set( cmp )
+                err = numpy.array( [ abs( got[ k ] - ref[ k ] ) / max( ref[ k ], 1e-3 * scale ) for k in common ] )
+                assert err.max() < ( 1e-8 if kernel == "FP64" else 1e-4 ) and numpy.median( err ) < ( 1e-11 if kernel == "FP64" else 1e-8 ), \
+                    ( label, kernel, "values", err.max(), numpy.median( err ) )
+                print( f"  { label } { kernel }: { len( got ) } entries ( generic { len( ref ) } compared, { len( missing ) } missing, "
+                       f"{ len( extra ) } extra ), rel. gap median { numpy.median( err ) :.1e} max { err.max() :.1e}" )
+
+if test( "the_card_moments_3d_are_the_generic_ones" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        rng = numpy.random.default_rng( 36 )
+        for label, pos, w in _clouds3( rng, 4000 ):
+            tree = AaBsp( pos, w )
+            gen = _pd( pos, w, "FP64", False, *_BOX3, tree = tree )
+            mg, fg, sg = ( numpy.asarray( t ) for t in gen.moments )
+            mg = mg.reshape( -1 )
+            full = mg > 0
+            bary_ref = numpy.where( full[ :, None ], fg / numpy.where( full, mg, 1 )[ :, None ], pos )
+            cost_ref = sg.reshape( -1 ) - 2 * ( pos * fg ).sum( 1 ) + ( pos * pos ).sum( 1 ) * mg
+            for kernel in ( "FP64", "FP32" ):
+                out = _pd( pos, w, kernel, True, *_BOX3, tree = tree )._card_cells( facets = False, moments = True )
+                bary = numpy.asarray( out[ "bary" ].raw ).reshape( -1, 3 )
+                cost = numpy.asarray( out[ "cost" ].raw ).reshape( -1 )
+                h = len( pos ) ** ( -1 / 3 )
+                # ( the barycentre of a vanishing cell is that of a sliver decided at the rounding: not compared )
+                seen = mg > 1e-9 * mg.mean()
+                eb = numpy.abs( bary - bary_ref )[ seen ].max() / h
+                ec = numpy.abs( cost - cost_ref ).max() / numpy.abs( cost_ref ).max()
+                assert eb < ( 1e-8 if kernel == "FP64" else 1e-5 ) and ec < ( 1e-8 if kernel == "FP64" else 1e-5 ), ( label, kernel, eb, ec )
+                print( f"  { label } { kernel }: barycentres { eb :.1e} h, costs { ec :.1e}" )
+
+
+def _measures_fn3( pos, w, tree, kernel, card, wrt ):
+    def f( x ):
+        p, q = ( x, w ) if wrt == "positions" else ( pos, x )
+        pd = PowerDiagram( p, weights = q, boundaries = box_half_spaces( *_BOX3 ), kernel_dtype = kernel, accelerator = tree,
+                           scratch_capacity = None if card else 1024, memory = 0 )
+        pd.use_card_cells = card
+        if card:
+            assert pd._card_variant() is not None
+        return pd.measures.value
+    return f
+
+
+if test( "the_card_adjoint_3d_is_the_generic_one" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        rng = numpy.random.default_rng( 37 )
+        for label, pos, w in _clouds3( rng, 4000 ):
+            n = len( pos )
+            w = numpy.zeros( n ) if w is None else w
+            tree = AaBsp( pos, w )
+            g = rng.normal( size = n )
+            for wrt, x in ( ( "weights", w ), ( "positions", pos ) ):
+                _, pb = driver.vjp( _measures_fn3( pos, w, tree, "FP64", False, wrt ), x )
+                ref = numpy.asarray( pb( g )[ 0 ] )
+                for kernel in ( "FP64", "FP32" ):
+                    _, pb = driver.vjp( _measures_fn3( pos, w, tree, kernel, True, wrt ), x )
+                    got = numpy.asarray( pb( g )[ 0 ] )
+                    err = numpy.abs( got - ref ).max() / numpy.abs( ref ).max()
+                    assert err < ( 1e-9 if kernel == "FP64" else 1e-5 ), ( label, wrt, kernel, err )
+                    print( f"  { label } d/d{ wrt } { kernel }: max gap { err :.1e} of the largest entry" )
+
+if test( "the_card_adjoint_3d_is_the_finite_difference" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        from loom.testing import check_grad
+        rng = numpy.random.default_rng( 38 )
+        n = 40
+        pos = rng.uniform( 0.1, 0.9, size = ( n, 3 ) )
+        w = rng.uniform( -0.02, 0.02, n )
+        tree = AaBsp( pos, w, max_seeds_per_leaf = 3 )
+
+        def f( p, q ):
+            pd = PowerDiagram( p, weights = q, boundaries = box_half_spaces( *_BOX3 ), kernel_dtype = "FP64", accelerator = tree )
+            assert pd._card_variant() is not None
+            return pd.measures
+        check_grad( f, pos, w, seed = 38 )
+        # the cells of the second and third passes ( a sphere of 80: 156 vertices )
+        pos = _sphere3( 80, rng, n_back = 60 )
+        w = rng.uniform( -1e-3, 1e-3, len( pos ) )
+        tree = AaBsp( pos, w, max_seeds_per_leaf = 3 )
+        check_grad( f, pos, w, seed = 39 )
+
+if test( "the_card_3d_runs_under_jit" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        import jax
+        rng = numpy.random.default_rng( 39 )
+        n = 5000
+        pos = rng.uniform( 0.001, 0.999, size = ( n, 3 ) )
+        w = rng.uniform( -0.3, 0.3, n ) * n ** ( -2 / 3 )
+        tree = AaBsp( pos, w )
+        g = rng.normal( size = n )
+        for kernel in ( "FP64", "FP32" ):
+            f = _measures_fn3( pos, w, tree, kernel, True, "weights" )
+            eager = numpy.asarray( f( w ) )
+            jitted = numpy.asarray( jax.jit( f )( w ) )
+            assert numpy.array_equal( jitted, eager ), ( kernel, numpy.abs( jitted - eager ).max() )
+            loss = lambda x: ( f( x ) * g ).sum()
+            ge = numpy.asarray( jax.grad( loss )( w ) )
+            gj = numpy.asarray( jax.jit( jax.grad( loss ) )( w ) )
+            assert numpy.array_equal( gj, ge ), kernel
+            fp = _measures_fn3( pos, w, tree, kernel, True, "positions" )
+            gp = numpy.asarray( jax.jit( jax.grad( lambda x: ( fp( x ) * g ).sum() ) )( pos ) )
+            assert numpy.isfinite( gp ).all() and numpy.abs( gp ).max() > 0, kernel
+        # the tree of TRACED positions, built in the jitted program, and the cells on it
+        def measures( p ):
+            pd = PowerDiagram( p, weights = w, boundaries = box_half_spaces( *_BOX3 ), kernel_dtype = "FP32", accelerator = AaBsp( p, w ) )
+            assert pd._card_variant() is not None
+            return pd.measures.value
+        me, mj = numpy.asarray( measures( pos ) ), numpy.asarray( jax.jit( measures )( pos ) )
+        assert numpy.array_equal( me, mj )
+
+if test( "the_card_tree_3d_is_the_host_tree" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        rng = numpy.random.default_rng( 40 )
+        clouds = [ ( label, pos ) for label, pos, _ in _clouds3( rng ) ] + [
+            ( f"n = { n }", rng.uniform( 0, 1, size = ( n, 3 ) ) ) for n in ( 1, 2, 9, 10, 11, 64, 1000 ) ]
+        for label, pos in clouds:
+            for leaf in ( 10, 3 ):
+                card = _tree( AaBsp( pos, max_seeds_per_leaf = leaf ) )
+                _check_tree_rule( pos, card, leaf )
+                _same_tree( card, _host_tree( pos, leaf ) )
+            print( f"  { label }: the host's tree" )
+        # the majorants of the card ( `Majorant3D.cuh` ) bound the weights on every node
+        pos = rng.uniform( 0.001, 0.999, size = ( 8000, 3 ) )
+        for label, w in ( ( "smooth", 0.1 * numpy.sin( 5 * pos[ :, 0 ] ) + 0.05 * pos[ :, 1 ] - 0.02 * pos[ :, 2 ] ),
+                          ( "random", rng.uniform( -1, 1, len( pos ) ) / len( pos ) ), ( "constant", numpy.full( len( pos ), 0.25 ) ) ):
+            tree = AaBsp( pos, w )
+            t = _tree( tree )
+            wa, wb = numpy.asarray( tree.node_wa ).reshape( -1, 3 ), numpy.asarray( tree.node_wb ).reshape( -1 )
+            p, q = pos[ t[ "seed" ] ], w[ t[ "seed" ] ]
+            for i in range( len( t[ "beg" ] ) ):
+                sl = slice( t[ "beg" ][ i ], t[ "end" ][ i ] )
+                if sl.stop > sl.start:
+                    assert ( q[ sl ] <= p[ sl ] @ wa[ i ] + wb[ i ] ).all(), ( label, i )
+            print( f"  { label }: { int( ( numpy.abs( wa ).sum( axis = 1 ) > 0 ).sum() ) } affine nodes of { len( wb ) }" )
+
+if test( "the_card_3d_third_pass_works_in_batches" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        # 8 cells past the register passes ( spheres of 150 seeds: 296 vertices ) through FOUR slots: two batches in one
+        # launch. The same bits as with 64 slots, for the measures and the adjoint.
+        import sys
+        bsp = sys.modules[ "sdot.PowerDiagram_Bsp" ]
+        rng = numpy.random.default_rng( 41 )
+        k, r = 150, 0.06
+        centres = numpy.stack( numpy.meshgrid( [ 0.25, 0.75 ], [ 0.25, 0.75 ], [ 0.25, 0.75 ] ), axis = -1 ).reshape( -1, 3 )
+        i = numpy.arange( k ) + 0.5
+        phi, th = numpy.arccos( 1 - 2 * i / k ), numpy.pi * ( 1 + 5 ** 0.5 ) * i
+        unit = numpy.stack( [ numpy.cos( th ) * numpy.sin( phi ), numpy.sin( th ) * numpy.sin( phi ), numpy.cos( phi ) ], axis = 1 )
+        pos = numpy.concatenate( [ centres ] + [ c + r * unit + 1e-3 * rng.normal( size = unit.shape ) for c in centres ] )
+        n = len( pos )
+        w = rng.uniform( -0.1, 0.1, n ) * r * r / k
+        w[ :len( centres ) ] = 0
+        tree = AaBsp( pos, w )
+        g = rng.normal( size = n )
+        original = bsp.PowerDiagram_Bsp.card_overflow_warps
+        try:
+            got = {}
+            for warps in ( 4, 64 ):
+                bsp.PowerDiagram_Bsp.card_overflow_warps = warps
+                if warps == 4:
+                    _check3( pos, w, label = "8 spheres of 150, 4 slots", plain = True )
+                for kernel in ( "FP64", "FP32" ):
+                    m = _m( _pd( pos, w, kernel, True, *_BOX3, tree = tree ) )
+                    _, pb = driver.vjp( _measures_fn3( pos, w, tree, kernel, True, "weights" ), w )
+                    got[ warps, kernel ] = ( m, numpy.asarray( pb( g )[ 0 ] ) )
+        finally:
+            bsp.PowerDiagram_Bsp.card_overflow_warps = original
+        for kernel in ( "FP64", "FP32" ):
+            for a, b in zip( got[ 4, kernel ], got[ 64, kernel ] ):
+                assert numpy.isfinite( a ).all() and numpy.array_equal( a, b ), kernel
+
+if test( "the_card_3d_raises_past_the_vertex_limit" ):
+    if not _GPU:
+        skip( _NO_GPU )
+    else:
+        from loom.drivers.CallArg_Errors import KernelFailure
+        import jax
+        rng = numpy.random.default_rng( 42 )
+        pos = _sphere3( 600, rng )                   # 1196 vertices ( the cells of the sphere's seeds reach ~1000 on the way )
+        tree = AaBsp( pos, None )
+        # ( the reference is the card's own double kernel: the generic path's scratch, grown for a cell of 1196 vertices on
+        # every work item, takes gigabytes -- `the_card_cells_3d_overflow_into_the_later_passes` checks spheres against the
+        # plain storage )
+        ref = _m( _pd( pos, None, "FP64", True, *_BOX3, tree = tree ) )
+        assert abs( ref.sum() - 1 ) < 1e-12 and 4.1e-3 < ref[ 0 ] < 4.4e-3, ( ref.sum(), ref[ 0 ] )
+        for kernel in ( "FP64", "FP32" ):
+            m = _m( _pd( pos, None, kernel, True, *_BOX3, tree = tree ) )
+            r = _rel( m, ref )
+            assert not numpy.isnan( m ).any() and r.max() < ( 1e-14 if kernel == "FP64" else 1e-5 ), ( kernel, r.max() )
+            pd = _pd( pos, None, kernel, True, *_BOX3, tree = tree )
+            pd.card_max_vertices = 1024
+            try:
+                pd.measures.value
+                raise AssertionError( "a cell past the vertex limit went through" )
+            except KernelFailure as e:
+                assert "more than 1024 vertices" in str( e ) and "seed 0" in str( e ), str( e )
+            pd = _pd( pos, numpy.zeros( len( pos ) ), kernel, True, *_BOX3, tree = AaBsp( pos, numpy.zeros( len( pos ) ) ) )
+            pd.card_max_vertices = 1024
+
+            def f( q ):
+                pd.weights = q
+                return pd.measures.value
+            for fn in ( jax.jit( f ), jax.jit( jax.grad( lambda q: ( f( q ) * q ).sum() ) ) ):
+                try:
+                    numpy.asarray( fn( numpy.zeros( len( pos ) ) ) )
+                    raise AssertionError( "a cell past the vertex limit went through under jit" )
+                except AssertionError:
+                    raise
+                except Exception as e:
+                    assert "more than 1024 vertices" in str( e ) and "seed 0" in str( e ), str( e )

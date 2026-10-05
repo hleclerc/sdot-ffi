@@ -112,8 +112,9 @@ class PowerDiagram( Aggregate ):
         at the last `measures` and proposes them first to the next one ( `ProviderBsp`, `MEMO` ) --
         which spares the transient cuts, a quarter to a third of the diagram in 3D, and remains
         exact whatever weights have moved in the meantime. `memory` is the capacity per
-        seed ( 32 by default in 3D and above, 0 in 2D where it yields nothing measurable ); a seed
-        that has more neighbors than that simply has no memory. `0` to turn it off.
+        seed ( 32 by default in 3D and above, 0 in 2D where it yields nothing measurable, and 0 in 3D on a CUDA card
+        whose dedicated cells take the calls: they do not use it ); a seed that has more neighbors than that simply has
+        no memory. `0` to turn it off.
         """
         # the SUPPORT of the distribution bounds the domain, for free and without changing the
         # result: what lies beyond brings no mass. The caller's domain is INTERSECTED
@@ -149,7 +150,7 @@ class PowerDiagram( Aggregate ):
 
         self._kernel_dtype = kernel_dtype
         self._scratch_capacity = int( scratch_capacity or { 2: 64, 3: 128 }.get( d, 256 ) )
-        self._memory = int( ( 0 if d <= 2 else 32 ) if memory is None else memory )
+        self._memory = int( self._default_memory( d ) if memory is None else memory )
         self.__base_init__( nb_dims = d, nb_points = n, **self._init_seeds( pos, weights, accelerator ), **kwargs )
 
         # NOT a field: the distribution is a CALL argument, normalized RIGHT HERE rather than at
@@ -160,6 +161,10 @@ class PowerDiagram( Aggregate ):
             if dd != d:
                 raise ValueError( f"the distribution lives in { dd }D, this diagram in { d }D" )
             self.distribution = distribution.normalized_version()
+
+    def _default_memory( self, d ):
+        """the neighbour memories per seed when `memory` is not given ( see `__init__` )"""
+        return 0 if d <= 2 else 32
 
     @property
     def dim_count( self ):

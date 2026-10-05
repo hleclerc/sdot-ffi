@@ -51,7 +51,7 @@ GPU = [
           source = "doc/03-chiffres.md l.420 ( filnrm8 double: 128 regs, 4 blocks/SM, 50 %, 192 B local )" ),
     dict( case = "lines_equal", n = 100_000, kernel = "double", variant = "filmix6", ns_per_seed = 385,
           source = "doc/03-chiffres.md l.501" ),
-    # -- 3D ( one mapping only: `voies`, a cell on V = 8 lanes, two passes, `__launch_bounds__( 128, 4 )` )
+    # -- 3D ( one mapping only: `voies`, a cell on the whole warp ( doc/02-mappages.md l.70 ), two passes, `__launch_bounds__( 128, 4 )` )
     dict( case = "uniform3d", n = 1_000_000, kernel = "float", variant = "voies", ns_per_seed = 229,
           regs = 128, blocks_per_sm = 4, occupancy = 0.50,
           source = "doc/03-chiffres.md l.16; doc/05-profils.md l.66-68 ( 128 registers, four blocks per SM; 102 regs spill: 251 )" ),
