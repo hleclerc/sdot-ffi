@@ -1083,10 +1083,21 @@ for jit in sys.argv[ 2: ]:
 """
 
 
+def _small_pool_fraction( pool_bytes = 0.5e9 ):
+    """The memory fraction that gives XLA's pool about `pool_bytes`, whatever the card ( 0.05 if it cannot be read )"""
+    import subprocess
+    try:
+        out = subprocess.run( [ "nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits", "-i", "0" ],
+                              capture_output = True, text = True, timeout = 30 ).stdout
+        return f"{ pool_bytes / ( float( out.split()[ 0 ] ) * 2**20 ) :.4f}"
+    except ( OSError, ValueError, IndexError, subprocess.TimeoutExpired ):
+        return "0.05"
+
+
 def _oom_runs( n, modes, **env ):
     import os, subprocess, sys
     r = subprocess.run( [ sys.executable, "-c", _OOM_SOLVE, str( n ), *modes ], capture_output = True, text = True,
-                        env = dict( os.environ, XLA_PYTHON_CLIENT_MEM_FRACTION = "0.05", **env ), timeout = 900 )
+                        env = dict( os.environ, XLA_PYTHON_CLIENT_MEM_FRACTION = _small_pool_fraction(), **env ), timeout = 900 )
     lines = [ ( l.split( " ", 3 ) + [ "" ] )[ 1:4 ] for l in r.stdout.splitlines() if l.startswith( "RESULT " ) ]
     assert len( lines ) == len( modes ), r.stdout[ -3000: ] + r.stderr[ -3000: ]
     return [ ( kind, float( t ), msg ) for kind, t, msg in lines ]
