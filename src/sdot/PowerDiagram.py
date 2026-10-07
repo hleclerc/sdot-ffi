@@ -30,12 +30,14 @@ import numpy as np
 
 import loom
 from loom.compilation.FfiCode import FfiCode
-from loom.drivers.driver import driver
+import loom
 from loom.tensor import Axis, CtShapeVar, IntTensor, RealTensor, ShapeVar, Tensor, new_batch_axis
 from loom.util import Aggregate
 
 from .Cell import BOUNDARY, Cell
 from .CellScratch import CellScratch, fp_size
+from .StartCell import start_cell
+from .viz.Displayable import Displayable
 
 
 def diagram_class_for( positions, weights, accelerator ):
@@ -47,12 +49,12 @@ def diagram_class_for( positions, weights, accelerator ):
     from .PowerDiagram_Plain import PowerDiagram_Plain
     if accelerator == "plain":
         return PowerDiagram_Plain
-    if accelerator is None and any( driver.is_traced( getattr( x, "raw", x ) ) for x in ( positions, weights ) if x is not None ):
+    if accelerator is None and any( loom.is_traced( getattr( x, "raw", x ) ) for x in ( positions, weights ) if x is not None ):
         return PowerDiagram_Plain
     return PowerDiagram_Bsp
 
 
-class PowerDiagram( Aggregate ):
+class PowerDiagram( Aggregate, Displayable ):
     # ---- what a specialization provides -------------------------------------------------------------
     #
     #   _init_seeds( positions, weights, accelerator )   lays out the seeds in its tensors
@@ -73,6 +75,18 @@ class PowerDiagram( Aggregate ):
     # cells that run off to infinity stay there -- and are measured as such ( `TF::max` ).
     bnd_directions : RealTensor[ "num_boundary", "dim" ]
     bnd_offsets    : RealTensor[ "num_boundary" ]
+
+    # THE CELL THE CUTS START FROM, when the domain is a convex polytope rather than a box ( `StartCell.py` ): its vertices
+    # and, in 3D, their topology ( three facets and three neighbours each ). The facets are then `bnd_directions` /
+    # `bnd_offsets`, in the order of the cuts' identifiers, and `box_min` / `box_max` the box of the vertices -- the scale.
+    # Absent, the cells start from the box and `bnd_*` are cuts made on it.
+    start_vertices : RealTensor[ "num_start", "dim" ]
+    start_topo     : IntTensor[ "num_start", "num_topo", dict( size = 32 ) ]     # ( a few hundred vertices: no reason for 64 bits )
+
+    num_start      : Axis[ "nb_starts" ]
+    num_topo       : Axis[ "nb_topo" ]
+    nb_starts      : ShapeVar
+    nb_topo        : ShapeVar
 
     num_point      : Axis[ "nb_points" ]
     num_boundary   : Axis[ "nb_boundaries" ]
@@ -120,6 +134,11 @@ class PowerDiagram( Aggregate ):
         # result: what lies beyond brings no mass. The caller's domain is INTERSECTED
         # with it, not replaced.
         if distribution is not None:
+            # NORMALIZED here once and for all, with the dimension of the diagram: a distribution that does not carry one
+            # ( `Box()` ) makes up its parameters from it
+            pshape = positions.shape if hasattr( positions, "shape" ) else np.asarray( positions ).shape
+            if len( pshape ) == 2:
+                distribution = distribution.normalized_version( nb_dims = int( pshape[ 1 ] ) )
             support = distribution.bounding_half_spaces()
             if support is not None:
                 if boundaries is None:
@@ -135,6 +154,18 @@ class PowerDiagram( Aggregate ):
             # WHERE TO START FROM, read off the half-spaces themselves: those a box already expresses leave
             # the list -- they are `2d` of them and would come back on every cell ( 25 %, measured ).
             start_box = axis_aligned_box( *boundaries )
+            if start_box is None or start_box[ 2 ].any():
+                # not just a box: a polytope. When it is a small simple one, THE POLYTOPE IS THE CELL the cuts start from
+                # ( `StartCell.py` ); a big or degenerate one cuts the box of its vertices
+                cell = start_cell( *boundaries )
+                if cell is not None:
+                    kwargs[ "box_min" ], kwargs[ "box_max" ] = cell[ "bounding_box" ]
+                    if "vertices" in cell:
+                        boundaries = ( cell[ "directions" ], cell[ "offsets" ] )
+                        kwargs[ "start_vertices" ] = cell[ "vertices" ]
+                        if cell[ "topology" ] is not None:
+                            kwargs[ "start_topo" ] = cell[ "topology" ]
+                    start_box = None
             if start_box is not None:
                 mi, ma, kept = start_box
                 kwargs[ "box_min" ], kwargs[ "box_max" ] = mi, ma
@@ -160,7 +191,7 @@ class PowerDiagram( Aggregate ):
             dd = int( distribution.nb_dims.value )
             if dd != d:
                 raise ValueError( f"the distribution lives in { dd }D, this diagram in { d }D" )
-            self.distribution = distribution.normalized_version()
+            self.distribution = distribution
 
     def _default_memory( self, d ):
         """the neighbour memories per seed when `memory` is not given ( see `__init__` )"""
@@ -187,8 +218,8 @@ class PowerDiagram( Aggregate ):
                 # the backend's VALUES, not numpy's: under a `jit` the half-spaces may be
                 # traced. `stop_gradient`: the domain is a constant of the problem ( its cuts
                 # carry `BOUNDARY`, "not a seed", and have nowhere to send a derivative ).
-                dirs = driver.stop_gradient( self.bnd_directions.raw )
-                offs = driver.stop_gradient( self.bnd_offsets.raw )
+                dirs = loom.ops().stop_gradient( self.bnd_directions.raw )
+                offs = loom.ops().stop_gradient( self.bnd_offsets.raw )
                 for b in range( int( self.bnd_directions.shape[ 0 ] ) ):
                     self._dom_cell.cut( dirs[ b ], offs[ b ], BOUNDARY )
         return self._dom_cell
@@ -203,13 +234,18 @@ class PowerDiagram( Aggregate ):
             return Cell.make_hypercube( d, mi, np.diag( ma - mi ), **kw )
         return Cell.make_unbounded( d, **kw )
 
-    def _dist_for( self ):
+    def _dist_for( self, moment = None ):
         """How a call names its distribution: `( C++ expression, expression of its cotangent,
         kwargs of the call )`. Without a distribution, `unit_density()` -- a value that the C++ makes
-        itself -- and a cotangent `0` that `UnitDensity` ignores."""
+        itself -- and a cotangent `0` that `UnitDensity` ignores. `moment`: the density multiplied by a
+        polynomial ( see `moment` ), as a density -- `diagram/Moments.h`."""
         if self.distribution is None:
-            return "inputs.power_diagram.unit_density()", "0", {}
-        return "inputs.distribution", "grad_of_inputs.distribution", { "distribution": self.distribution }
+            expr, grad, kwargs = "inputs.power_diagram.unit_density()", "0", {}
+        else:
+            expr, grad, kwargs = "inputs.distribution", "grad_of_inputs.distribution", { "distribution": self.distribution }
+        if moment is not None:
+            expr = f"sdot::diagram::moment_dist<{ int( moment ) }>( { expr } )"
+        return expr, grad, kwargs
 
     # ---- the memory ( `PowerDiagram_Bsp` only ) -------------------------------------------------------
 
@@ -259,25 +295,43 @@ class PowerDiagram( Aggregate ):
         On a CUDA card, in 2D, a dedicated kernel may take the call instead ( `_measures_on_card`, see
         `PowerDiagram_Bsp` ): same cells, cell in registers.
         """
-        res = self._measures_on_card()
-        if res is not None:
-            return res
+        return self._integral( None )
+
+    def moment( self, k ) -> Tensor:
+        """`int_{cell_i} p( x ) rho( x ) dx`, `[ n ]`, for the polynomial `p` that `k` names: `x_k` for `k < d`, `|x|^2` for `k == d`
+        and `1` for `k == d + 1` ( the mass, by the SAME quadrature as the others -- not by the closed form of `measures` ).
+
+        DIFFERENTIABLE like `measures`, with respect to the seeds, the weights and the parameters of the density -- the
+        moment is a density, and the diagram already knows how to differentiate those ( `diagram/Moments.h` ). The integral
+        is the adaptive quadrature of `PointwiseDensity`, on any density: where a closed form exists ( `moments` ) it agrees
+        with it to a few `1e-6`. What a transport cost and its barycenters are made of ( `SdotPlanNd` )."""
+        d = self.dim_count
+        if not 0 <= int( k ) <= d + 1:
+            raise ValueError( f"moment( { k } ): 0 .. { d - 1 } ( x_k ), { d } ( |x|^2 ) or { d + 1 } ( 1 )" )
+        return self._integral( int( k ) )
+
+    def _integral( self, moment ):
+        """`measures` ( `moment = None` ) and `moment`: one sweep, the cell integrated against the density or against a moment of it"""
+        if moment is None:
+            res = self._measures_on_card()
+            if res is not None:
+                return res
 
         dom = self._domain_cell()
         # the budget that decides parallelism: what ONE work-item holds -- its scratch, sized
         # for the backward from the forward on ( it redoes the sweep on a scratch of the same shape )
         nb_words = self._scratch_words( self._scratch_capacity, self._nb_work_cells(), True )
-        nt = driver.device.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ self.num_point ] )
+        nt = loom.resolved_device().nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ self.num_point ] )
 
         # the work-item axis is a BATCH axis carried by the scratch: `thread_index` /
         # `nb_threads` are the rank of this work-item and their number, the strided loop reads off them
         num_thread = new_batch_axis( nt, prefix = "thread" )
         res = RealTensor[ self.num_point ]()
-        dist_expr, grad_dist_expr, dist_kwargs = self._dist_for()
+        dist_expr, grad_dist_expr, dist_kwargs = self._dist_for( moment )
         memo_expr, memo_args, memo_produced = self._memo_for_call()
 
         loom.ffi_call(
-            "power_diagram_measures",
+            "power_diagram_measures" if moment is None else "power_diagram_moment",
             FfiCode.per_item( code = "inputs.power_diagram.measures( outputs.res, inputs.dom_cell, scratch.pool( batch_index ), "
                            f"{ dist_expr }, { memo_expr }, thread_index, nb_threads );",
                 # the gradients on the seeds are SHARED by all items: each work-item
@@ -297,6 +351,43 @@ class PowerDiagram( Aggregate ):
         self._memo_after_call( memo_produced )
         return res
 
+    def laplacian_solve( self, rhs, linear_solver = "auto" ) -> Tensor:
+        """`x = L^+ rhs`: the solution, with `x[ 0 ] == 0` ( the gauge ), of the system of the LAPLACIAN of the Laguerre graph
+        of this diagram -- the hessian of the dual functional of a transport, `d m_i / d w_j`, with the sum of each row
+        at zero ( `rhs` must therefore sum to zero too ). `[ n ]`, indexed like `positions`.
+
+        It is the one linear solve that the derivative of a transport asks for ( `SdotPlanNd`: the implicit function theorem ),
+        and the reason it is here: DIFFERENTIABLE with respect to `rhs` -- `L` being symmetric, its adjoint is the same solve --
+        and with respect to NOTHING ELSE: the diagram is a constant of the call ( the derivatives of `L` are not
+        written ). The density must know how to integrate itself on a facet ( see `hessian_rows` ). On the CPU."""
+        if getattr( loom.resolved_device(), "is_cuda_gpu", False ) or not loom.resolved_device().is_cpu:
+            raise NotImplementedError( "laplacian_solve: on the CPU only" )
+        from .SdotPlanNd import _LIN
+        if linear_solver not in _LIN:
+            raise ValueError( f"unknown linear_solver: { linear_solver !r } ( { ', '.join( _LIN ) } )" )
+        dom = self._domain_cell()
+        dist_expr, _, dist_kwargs = self._dist_for()
+        tk = "double" if fp_size( dom.kernel_dtype ) == 64 else "float"
+        x = RealTensor[ self.num_point ]()
+        b = RealTensor[ self.num_point ]( getattr( rhs, "raw", rhs ) )
+        code = lambda src, dst, backward = False: FfiCode.inline( includes = [ "sdot/sdotplan/Adjoint.h" ], sources = [ "sdot/sdotplan/Linear.cpp" ], code = "\n".join( [
+            "auto &inputs = args.inputs; auto &outputs = args.outputs;",
+            *( [ "auto &grad_of_inputs = args.grad_of_inputs; auto &grad_of_outputs = args.grad_of_outputs;" ] if backward else [] ),
+            f"sdotplan::laplacian_solve<{ tk }>( queue, inputs.power_diagram, inputs.dom_cell, { dist_expr }, { src }, { _LIN[ linear_solver ] }, { int( self._scratch_capacity ) }, { dst } );" ] ) )
+        loom.ffi_call(
+            "power_diagram_laplacian_solve",
+            code( "inputs.rhs", "outputs.x" ),
+            # the adjoint of `rhs -> x` is itself: the cotangent of `x` in, the one of `rhs` out
+            code( "grad_of_outputs.x", "grad_of_inputs.rhs", backward = True ),
+            power_diagram = self,
+            dom_cell = dom,
+            rhs = b,
+            x = loom.out( x ),
+            has_dynamic_capacity = False,
+            **dist_kwargs,
+        )
+        return x
+
     @property
     def moments( self ):
         """`( masses, first, second )`: for each cell, `int rho`, `int x rho` ( `[ n, d ]` ) and
@@ -307,7 +398,7 @@ class PowerDiagram( Aggregate ):
         adjusted weights -- `2 mass_i ( p_i - b_i )` -- which `SdotPlanNd` does by itself."""
         dom = self._domain_cell()
         nb_words = self._scratch_words( self._scratch_capacity, self._nb_work_cells(), False )
-        nt = driver.device.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ self.num_point ] )
+        nt = loom.resolved_device().nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ self.num_point ] )
         num_thread = new_batch_axis( nt, prefix = "thread" )
         mass = RealTensor[ self.num_point ]()
         first = RealTensor[ self.num_point, self.dim ]()
@@ -343,7 +434,7 @@ class PowerDiagram( Aggregate ):
         nbrs = Neighbors( batch_axes = [ num_cell ] )
 
         nb_words = self._scratch_words( cap, self._nb_work_cells(), False )
-        nt = driver.device.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ num_cell ] )
+        nt = loom.resolved_device().nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ num_cell ] )
         dist_expr, _, dist_kwargs = self._dist_for()
 
         loom.ffi_call(
@@ -381,7 +472,7 @@ class PowerDiagram( Aggregate ):
         cells = Cell( d, init_as_unbounded = False, batch_axes = [ num_cell ], kernel_dtype = dom.kernel_dtype )
 
         nb_words = self._scratch_words( cap, 1, False )
-        nt = driver.device.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ num_cell ] )
+        nt = loom.resolved_device().nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ num_cell ] )
         loom.ffi_call(
             "power_diagram_cells",
             FfiCode.per_item( code = "inputs.power_diagram.build_cell( SI( inputs.ranks( batch_index ) ), inputs.dom_cell, "
@@ -395,8 +486,59 @@ class PowerDiagram( Aggregate ):
         )
         return cells
 
+    def support_pieces( self, threshold = 0.0 ):
+        """`( pieces, owners )`: the cells seen ONLY WHERE THE DENSITY HAS MASS -- `pieces` a `Cell` batched over the pieces
+        ( `None` if there is none ), piece `p` being a part of the cell of seed `owners[ p ]`.
+
+        The distribution describes where it has mass as convex BLOCKS ( `Distribution.display_blocks`: the boxes of tiles of an
+        `Image`, the simplices of a `Mesh` ) and says which of them each cell meets ( `blocks_of_cells`, host side, on the boxes
+        of `cells` ): a cell that lies where the density has mass is a piece of its own, the others are cut to each block they
+        meet -- in ONE call over the pieces ( `diagram::build_support_piece` ). The walls of a block carry `SEAM` when the
+        region behind has mass too ( an inner seam: `cell_viz` draws neither the face nor its edges ) and `SUPPORT` otherwise.
+
+        `threshold`: the density has mass where it is `> threshold * max`. A distribution that does not say where it has mass
+        ( `display_blocks` gives `None` ) gives the cells themselves."""
+        dist = self.distribution
+        blocks = None if dist is None else dist.display_blocks( threshold )
+        if blocks is None:
+            return self.cells, np.arange( int( self.nb_points.value ) )
+
+        owners, which = dist.blocks_of_cells( self.cells, threshold )
+        if len( owners ) == 0:
+            return None, owners                    # no cell meets a region with mass
+        d = self.dim_count
+        dirs, offs, ids = blocks
+        num_piece = new_batch_axis( len( owners ), prefix = "piece" )
+        num_block = Axis( ShapeVar( dirs.shape[ 0 ] ), name = "num_block" )
+        num_wall = Axis( ShapeVar( dirs.shape[ 1 ] ), name = "num_wall" )
+        ranks = IntTensor[ num_piece ]( np.asarray( self._ranks_of_items() ).reshape( -1 )[ owners ] )
+
+        dom = self._domain_cell()
+        cap = self._scratch_capacity
+        pieces = Cell( d, init_as_unbounded = False, batch_axes = [ num_piece ], kernel_dtype = dom.kernel_dtype )
+
+        nb_words = self._scratch_words( cap, 1, False )
+        nt = loom.resolved_device().nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ num_piece ] )
+        loom.ffi_call(
+            "power_diagram_support_pieces",
+            FfiCode.per_item( code = "inputs.power_diagram.build_support_piece( SI( inputs.ranks( batch_index ) ), SI( inputs.blocks( batch_index ) ), "
+                           "inputs.block_dirs, inputs.block_offs, inputs.block_ids, inputs.dom_cell, outputs.pieces( batch_index ), "
+                           "scratch.pool, thread_index );",
+                max_nb_threads = "return scratch.pool.words.shape( 0 );" ),
+            power_diagram = self,
+            dom_cell = dom,
+            ranks = ranks,
+            blocks = IntTensor[ num_piece, dict( size = 32 ) ]( np.asarray( which, np.int32 ) ),
+            block_dirs = RealTensor[ num_block, num_wall, self.dim ]( dirs ),
+            block_offs = RealTensor[ num_block, num_wall ]( offs ),
+            block_ids = IntTensor[ num_block, num_wall, dict( size = 32 ) ]( ids ),
+            pool = CellScratch.for_call( nb_words, dom.kernel_dtype, nb_threads = nt ),
+            pieces = loom.out( pieces, capacities = { "nb_vertices": cap, "nb_cuts": cap + dirs.shape[ 1 ] } ),
+        )
+        return pieces, owners
+
     def cell( self, i ) -> Cell:
-        """The cell of seed `i`, built PYTHON SIDE -- one `driver.call` per cut.
+        """The cell of seed `i`, built PYTHON SIDE -- one `loom.ffi_call` per cut.
 
         The slow path, and deliberately so: the same geometry obtained by an orchestration
         entirely different from the kernel's, hence the tests' ORACLE. It is NOT the display
@@ -424,9 +566,23 @@ class PowerDiagram( Aggregate ):
             res.cut( direction, offset, j )
         return res
 
-    def add_to_viz( self, viz, **kwargs ):
-        """Draws itself into a `Visualizer`: all the cells, in one call ( see `cells` )."""
-        return self.cells.add_to_viz( viz, **kwargs )
+    def add_to_viz( self, viz, seeds = True, seed_color = "#000000", support_only = True, threshold = 0.0, **kwargs ):
+        """Draws itself into a `Visualizer`: all the cells, in one call ( see `cells` ), and the
+        seeds as points when `seeds` ( `seed_color` ). `kwargs` are those of `Cell.add_to_viz`
+        ( `opacity`, `faces`, `edges`, ... ). The quick ways to look at it -- `write_html`,
+        `write_pvd`, `show` -- are those of `Displayable`.
+
+        `support_only`: the cells only where the distribution has mass ( `support_pieces`, with
+        `threshold` ) -- an image with zero pixels does not show its cells there."""
+        if support_only:
+            pieces, owners = self.support_pieces( threshold )
+            if pieces is not None:
+                pieces.add_to_viz( viz, owners = owners, nb_colors = int( self.nb_points.value ), **kwargs )
+        else:
+            self.cells.add_to_viz( viz, **kwargs )
+        if seeds:
+            viz.add_points( np.asarray( self.positions ).reshape( -1, self.dim_count ), color = seed_color )
+        return viz
 
 
 class Neighbors( Aggregate ):

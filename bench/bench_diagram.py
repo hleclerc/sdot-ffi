@@ -38,13 +38,8 @@ The reference numbers are those of `reference_lmo.py` ( CPU ) and `reference_lmo
 `new / old` is > 1 where we are slower.
 """
 
-import numpy
 from errand import Param, bench
 
-import benchlib
-import cases
-import reference_lmo
-import reference_lmo_gpu
 
 CASE_CHOICES = [ "uniform", "lines_voronoi", "lines_equal", "planes_voronoi", "planes_equal" ]
 
@@ -71,13 +66,18 @@ if p := bench( "diagram",
                                   help = "GPU, 2D card kernel: what one call computes -- `measures`; `facets`: the measures AND the laplacian's CSR "
                                          "( Newton's turn: `_card_cells`, cells + COO + assembly ); `vjp`: the adjoint of the measures alone "
                                          "( the pullback, wrt the weights, or the positions without weights ); `moments`: measures + barycentres + costs" ) ):
+    import numpy
+    import benchlib
+    import cases
+    import reference_lmo
+    import reference_lmo_gpu
     benchlib.set_threads( p.threads, p.pin )          # BEFORE the first kernel: the pool reads them once
     benchlib.set_kernel_timing()                      # BEFORE the first kernel too: each library reads it once
     from sdot import AaBsp, PowerDiagram, box_half_spaces
-    from loom.drivers.driver import driver
+    import loom
     import time
 
-    on_gpu = bool( getattr( driver.device, "is_cuda_gpu", False ) )
+    on_gpu = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     reps = p.reps or ( 10 if on_gpu else 3 )
     name = f"uniform{ p.dim }d" if p.case == "uniform" else p.case
     pos, w, d = cases.case( name, n = p.n or None, seed = p.seed, wscale = p.wscale )

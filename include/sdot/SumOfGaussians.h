@@ -6,6 +6,7 @@
 #include <loom/support/containers/Vector.h>
 #include <loom/support/atomic_add.h>
 #include "PointwiseDensity.h"
+#include "GaussianTree.h"
 
 namespace sdot {
 
@@ -35,7 +36,25 @@ struct SumOfGaussians {
     /// A member APART from the generated attributes: `0` by default, hence absent from any ordinary call.
     TF conv_s = 0;
 
-    HD TF sigma_of( SI i ) const { const TF s = TF( sigmas( i ) ); return conv_s > 0 ? sdot::sqrt( s * s + conv_s * conv_s ) : s; }
+    /// THE LOCAL TERMS ( `GaussianTree.h` ). With a `tree` ( hung by `Convolved<SumOfGaussians>`, the solver ), each cell
+    /// sees only the terms that weigh on it -- the gaussians near it, or groups of them merged at the continuation
+    /// width -- and the sums below run over `terms` instead of the generated attributes. FORWARD ONLY: the adjoint
+    /// ( `add_value_grad_at`, `integrate_over_simplex_bwd` ) always runs over the gaussians themselves, and a density
+    /// with a tree is never differentiated ( the solver does not ).
+    using Term = GaussianTerm<TF,ct_dim>;
+    const GaussianTree<TF,ct_dim> *tree = nullptr;
+    const Term *terms = nullptr;
+    SI nb_local = 0;
+
+    HD SI nb_terms () const { return terms ? nb_local : SI( nb_gaussians ); }
+    HD TF center_of( SI i, PI c ) const { return terms ? terms[ i ].c[ c ] : TF( positions( i, c ) ); }
+    HD TF weight_of( SI i ) const { return terms ? terms[ i ].w : TF( weights( i ) ); }
+
+    HD TF sigma_of( SI i ) const {
+        if ( terms ) return terms[ i ].s;                 // the convolution is already in
+        const TF s = TF( sigmas( i ) );
+        return conv_s > 0 ? sdot::sqrt( s * s + conv_s * conv_s ) : s;
+    }
     HD SumOfGaussians with_convolution( TF s ) const { SumOfGaussians r( *this ); r.conv_s = s; return r; }
     /// the smallest width ( before convolution ): the scale below which the continuation stops
     HD TF smallest_sigma() const { TF r = TF( sigmas( 0 ) ); for ( SI i = 1; i < SI( sigmas.shape( 0 ) ); ++i ) r = sdot::fmin( r, TF( sigmas( i ) ) ); return r; }
@@ -49,12 +68,41 @@ struct SumOfGaussians {
     ///   * in 2D we KNOW how (see `wedge_measure`), so we pass ourselves;
     ///   * beyond that we do not, so we declare ourselves a BLACK BOX by wrapping in
     ///     `PointwiseDensity`, which only needs `value_at` / `gradient_at`.
+    ///
+    /// With a `tree`, the piece is integrated by a copy of `self` that carries the terms of this cell.
     HD void for_each_piece( const auto &cell, auto &&/*ws*/, auto &&func ) const {
+#if ! defined( __CUDA_ARCH__ )
+        if ( tree && ! terms ) {
+            double lo[ ct_dim ], hi[ ct_dim ];
+            for ( int d = 0; d < ct_dim; ++d ) { lo[ d ] = 1e300; hi[ d ] = -1e300; }
+            for ( SI v = 0; v < SI( cell.nb_vertices() ); ++v )
+                for ( int d = 0; d < ct_dim; ++d ) {
+                    const double x = double( cell.coord( int( v ), d ) );
+                    lo[ d ] = x < lo[ d ] ? x : lo[ d ];
+                    hi[ d ] = x > hi[ d ] ? x : hi[ d ];
+                }
+            thread_local std::vector<Term> buf;
+            tree->gather( lo, hi, double( conv_s ), buf );
+            SumOfGaussians local( *this );
+            local.terms = buf.data();
+            local.nb_local = SI( buf.size() );
+            if constexpr ( ct_dim == 2 )
+                func( cell, local );
+            else
+                func( cell, PointwiseDensity{ local } );
+            return;
+        }
+#endif
         if constexpr ( ct_dim == 2 )
             func( cell, *this );
         else
             func( cell, PointwiseDensity{ *this } );
     }
+
+    /// a term WIDE against the triangle `pts` ( during a continuation ) is integrated by a 7 point rule instead of the
+    /// exact reduction: the error goes as `( diameter / width )^6`, and it costs 7 exponentials instead of ~100
+    static constexpr TF quadrature_ratio = 1.5;
+    HD TF quadrature_term( SI i, const auto &pts ) const;
 
     // ---- EXACT integration in 2D ------------------------------------------------------------------
     // An isotropic gaussian over a triangle has no elementary closed form -- it is Owen's T
@@ -88,7 +136,8 @@ struct SumOfGaussians {
     static constexpr TF  tail_cut   = 8;    ///< `exp( -t^2/2 ) < 1e-14` beyond: the tail is exact
     static constexpr int nb_panels  = 4;    ///< Gauss-Legendre panels over the core
 
-    /// The SIGNED standard normal measure of the triangle `( 0, P, Q )` -- the corner.
+    /// The SIGNED standard normal measure of the triangle `( 0, P, Q )` -- the corner. `P` and `Q` are 2D whatever
+    /// `ct_dim`: the in-plane frame of a 3D facet ( `facet_mass` ) goes through here too.
     HD TF wedge_measure( const auto &P, const auto &Q ) const;
 
     /// The standard normal measure of the triangle `ys` (positive, any orientation).
@@ -117,10 +166,14 @@ struct SumOfGaussians {
     /// the two quantities from which everything else follows, computed once.
     HD auto kernel_at( SI i, const auto &x ) const;
 
-    /// `Int_{edge} rho ds` over the edge `cut` of the 2D cell `pc` ( `[ v_cut, v_cut+1 ]` ) -- what the
-    /// laplacian of a transport reads ( `sdotplan/Sweep.h` ): a gaussian along a segment is
-    /// an `erf`, the distance to the segment being constant. 2D only.
-    HD TF   facet_mass    ( const auto &pc, int cut ) const;
+    /// `Int_{facet} rho ds` over the facet `cut` of the cell `pc` -- what the laplacian of a transport reads
+    /// ( `sdotplan/Sweep.h` ). In 2D, the edge `[ v_cut, v_cut+1 ]`: a gaussian along a segment is an `erf`, the
+    /// distance to the segment being constant. In 3D, a planar polygon: an isotropic gaussian SPLITS into a 1D factor
+    /// in the distance to the plane and a 2D gaussian in the plane, whose measure over the polygon is the exact 2D
+    /// reduction ( `wedge_measure` ) on a fan of triangles. The proxy of a 3D mesh needs it ( `SdotPlanNd._solve_by_proxy` ).
+    HD TF   facet_mass    ( const auto &pc, int cut ) const requires ( ct_dim == 2 || ct_dim == 3 );
+    HD TF   facet_mass_2d ( const auto &pc, int cut ) const;
+    HD TF   facet_mass_3d ( const auto &pc, int cut ) const;   ///< `pc.for_each_facet_triangle` ( `LocalN` )
 
     HD TF   value_at      ( const auto &x ) const;   ///< rho( x )
     HD auto gradient_at   ( const auto &x ) const;   ///< grad rho( x ), a `Vector<TF,ct_dim>`

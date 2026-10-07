@@ -509,12 +509,20 @@ __global__ void set_shape_var( SV sv, SI v ) { sv.set( v ); }
 /// `w + ( t0 + s ) d` ( a bisector's offset is affine in the weights; a side of the box does not move )
 template<class TF,class TR>
 __device__ __forceinline__ void line_along( const Strided<TF,2> &pos, const double *w, const double *d, double t0, SI k, TR c,
-                                            double px, double py, const double ( &box )[ 4 ], double &nx, double &ny, double &off, double &delta ) {
+                                            double px, double py, const double ( &box )[ 4 ], const Cuts<TF> &cuts, double &nx, double &ny, double &off, double &delta ) {
     if ( c >= 0 ) {
         nx = double( pos( SI( c ), 0 ) ) - px;
         ny = double( pos( SI( c ), 1 ) ) - py;
         off = 0.5 * ( nx * nx + ny * ny ) + 0.5 * ( ( w[ k ] + t0 * d[ k ] ) - ( w[ c ] + t0 * d[ c ] ) );
         delta = 0.5 * ( d[ k ] - d[ c ] );
+        return;
+    }
+    if ( c <= TR( -5 ) ) {                               // a cut of the domain ( `Cuts` ): it does not move either
+        const int j = int( -5 - c );
+        nx = double( cuts.dir( j, 0 ) );
+        ny = double( cuts.dir( j, 1 ) );
+        off = double( cuts.off( j ) ) - nx * px - ny * py;
+        delta = 0;
         return;
     }
     const int f = int( -1 - c );                         // 0 bottom, 1 right, 2 top, 3 left
@@ -528,19 +536,19 @@ __device__ __forceinline__ void line_along( const Strided<TF,2> &pos, const doub
 /// edges stay the same. The vertex `q` is the crossing of the lines `q - 1` and `q`: affine in `s` ( same matrix, the
 /// right-hand side affine ). `false`: two lines nearly parallel -- this cell has no say ( the trial diagram decides ).
 template<class TF,class TR>
-__device__ bool area_polynomial( const Strided<TF,2> &pos, const Strided<TF,1> &box_min, const Strided<TF,1> &box_max,
+__device__ bool area_polynomial( const Strided<TF,2> &pos, const Strided<TF,1> &box_min, const Strided<TF,1> &box_max, const Cuts<TF> &cuts,
                                  const double *w, const double *d, double t0, const TR *edges, SI n, SI k, int nb,
                                  double &a0, double &a1, double &a2 ) {
     const double px = double( pos( k, 0 ) ), py = double( pos( k, 1 ) );
     const double box[ 4 ] = { double( box_min( 0 ) ) - px, double( box_min( 1 ) ) - py, double( box_max( 0 ) ) - px, double( box_max( 1 ) ) - py };
     double ax, ay, ao, ad;
-    line_along( pos, w, d, t0, k, edges[ SI( nb - 1 ) * n + k ], px, py, box, ax, ay, ao, ad );
+    line_along( pos, w, d, t0, k, edges[ SI( nb - 1 ) * n + k ], px, py, box, cuts, ax, ay, ao, ad );
     double c0 = 0, c1 = 0, c2 = 0;
     double fx = 0, fy = 0, fvx = 0, fvy = 0;              // the vertex 0 and its velocity, to close the loop
     double qx = 0, qy = 0, qvx = 0, qvy = 0;              // the previous vertex
     for ( int i = 0; i < nb; ++i ) {
         double bx, by, bo, bd;
-        line_along( pos, w, d, t0, k, edges[ SI( i ) * n + k ], px, py, box, bx, by, bo, bd );
+        line_along( pos, w, d, t0, k, edges[ SI( i ) * n + k ], px, py, box, cuts, bx, by, bo, bd );
         const double det = ax * by - ay * bx;
         if ( ! ( det * det > DET_MIN * DET_MIN * ( ax * ax + ay * ay ) * ( bx * bx + by * by ) ) )
             return false;
@@ -586,6 +594,7 @@ template<class TF,class TR>
 struct AlphaForward {
     Strided<TF,2> pos;
     Strided<TF,1> box_min, box_max;
+    Cuts<TF>      cuts;
     const double *w, *d;
     const TR     *edges;
     const int    *nb_edges;
@@ -596,7 +605,7 @@ struct AlphaForward {
         if ( nb < 3 )
             return;
         double a0, a1, a2;
-        if ( ! area_polynomial( pos, box_min, box_max, w, d, 0.0, edges, n, k, nb, a0, a1, a2 ) )
+        if ( ! area_polynomial( pos, box_min, box_max, cuts, w, d, 0.0, edges, n, k, nb, a0, a1, a2 ) )
             return;
         double r1, r2;
         const int nr = quadratic_roots( rho * a2, rho * a1, fmax( rho * a0 - eps, 0.0 ), r1, r2 );
@@ -613,6 +622,7 @@ template<class TF,class TR>
 struct AlphaBackward {
     Strided<TF,2> pos;
     Strided<TF,1> box_min, box_max;
+    Cuts<TF>      cuts;
     const double *w, *d, *a;
     const TR     *edges;
     const int    *nb_edges;
@@ -626,7 +636,7 @@ struct AlphaBackward {
         double target = 0.5 * t_trial;
         const int nb = nb_edges[ k ];
         double a0, a1, a2;
-        if ( nb >= 3 && area_polynomial( pos, box_min, box_max, w, d, t_trial, edges, n, k, nb, a0, a1, a2 ) ) {
+        if ( nb >= 3 && area_polynomial( pos, box_min, box_max, cuts, w, d, t_trial, edges, n, k, nb, a0, a1, a2 ) ) {
             double r1, r2, beta = -1e300;
             const int nr = quadratic_roots( rho * a2, rho * a1, rho * a0 - eps, r1, r2 );
             if ( nr >= 1 && r1 < 0 ) beta = r1;
@@ -650,18 +660,18 @@ struct AlphaBackward {
 /// two consecutive lines are nearly parallel ( no say ). Counterclockwise as the cell it comes from: a cell that turns inside
 /// out has a negative mass ( it is crushed ).
 template<class TF,class TR,class D>
-__device__ bool frozen_mass( const Strided<TF,2> &pos, const Strided<TF,1> &box_min, const Strided<TF,1> &box_max, const double *w, const double *d,
+__device__ bool frozen_mass( const Strided<TF,2> &pos, const Strided<TF,1> &box_min, const Strided<TF,1> &box_max, const Cuts<TF> &cuts, const double *w, const double *d,
                              double t, const TR *edges, SI n, SI k, int nb, const D &dens, double &m ) {
     const double px = double( pos( k, 0 ) ), py = double( pos( k, 1 ) );
     const double box[ 4 ] = { double( box_min( 0 ) ) - px, double( box_min( 1 ) ) - py, double( box_max( 0 ) ) - px, double( box_max( 1 ) ) - py };
     double ax, ay, ao, ad;
-    line_along( pos, w, d, t, k, edges[ SI( nb - 1 ) * n + k ], px, py, box, ax, ay, ao, ad );
+    line_along( pos, w, d, t, k, edges[ SI( nb - 1 ) * n + k ], px, py, box, cuts, ax, ay, ao, ad );
     DensSums acc;
     DensState<D> st;
     double fx = 0, fy = 0, qx = 0, qy = 0;
     for ( int i = 0; i < nb; ++i ) {
         double bx, by, bo, bd;
-        line_along( pos, w, d, t, k, edges[ SI( i ) * n + k ], px, py, box, bx, by, bo, bd );
+        line_along( pos, w, d, t, k, edges[ SI( i ) * n + k ], px, py, box, cuts, bx, by, bo, bd );
         const double det = ax * by - ay * bx;
         if ( ! ( det * det > DET_MIN * DET_MIN * ( ax * ax + ay * ay ) * ( bx * bx + by * by ) ) )
             return false;
@@ -698,6 +708,7 @@ template<class TF,class TR,class D>
 struct AlphaForwardDens {
     Strided<TF,2> pos;
     Strided<TF,1> box_min, box_max;
+    Cuts<TF>      cuts;
     const double *w, *d;
     const TR     *edges;
     const int    *nb_edges;
@@ -708,7 +719,7 @@ struct AlphaForwardDens {
         const int nb = nb_edges[ k ];
         if ( nb < 3 )
             return;
-        auto mass = [&]( double t, double &m ) { return frozen_mass( pos, box_min, box_max, w, d, t, edges, n, k, nb, dens, m ); };
+        auto mass = [&]( double t, double &m ) { return frozen_mass( pos, box_min, box_max, cuts, w, d, t, edges, n, k, nb, dens, m ); };
         double m1, hi = -1;
         if ( ! mass( 1.0, m1 ) )
             return;
@@ -716,7 +727,7 @@ struct AlphaForwardDens {
             hi = 1;
         else {
             double a0, a1, a2;
-            if ( area_polynomial( pos, box_min, box_max, w, d, 0.0, edges, n, k, nb, a0, a1, a2 ) && a2 > 0 ) {
+            if ( area_polynomial( pos, box_min, box_max, cuts, w, d, 0.0, edges, n, k, nb, a0, a1, a2 ) && a2 > 0 ) {
                 const double ts = -a1 / ( 2 * a2 );
                 double ms;
                 if ( ts > 0 && ts < 1 && mass( ts, ms ) && ms < eps )
@@ -735,6 +746,7 @@ template<class TF,class TR,class D>
 struct AlphaBackwardDens {
     Strided<TF,2> pos;
     Strided<TF,1> box_min, box_max;
+    Cuts<TF>      cuts;
     const double *w, *d, *a;
     const TR     *edges;
     const int    *nb_edges;
@@ -748,7 +760,7 @@ struct AlphaBackwardDens {
         acc.c += 1;
         double target = 0.5 * t_trial;
         const int nb = nb_edges[ k ];
-        auto mass = [&]( double t, double &m ) { return frozen_mass( pos, box_min, box_max, w, d, t, edges, n, k, nb, dens, m ); };
+        auto mass = [&]( double t, double &m ) { return frozen_mass( pos, box_min, box_max, cuts, w, d, t, edges, n, k, nb, dens, m ); };
         double m0;
         if ( nb >= 3 && mass( 0.0, m0 ) && m0 >= eps ) {
             const double tg = mass_bisection( 0.0, t_trial, eps, mass );
@@ -804,7 +816,7 @@ struct Slot {
 /// density; no `EDGES`: the 3D step is `trials` )
 template<int DIM,class V,unsigned OUT,class TF,class TI,class D> struct SolveCard;
 template<class V,unsigned OUT,class TF,class TI,class D> struct SolveCard<2,V,OUT,TF,TI,D> { using type = Card<V,true,OUT,TF,TI,D>; };
-template<class V,unsigned OUT,class TF,class TI,class D> struct SolveCard<3,V,OUT,TF,TI,D> { using type = gpu3d::Card<V,true,OUT & ~EDGES,TF,TI>; };
+template<class V,unsigned OUT,class TF,class TI,class D> struct SolveCard<3,V,OUT,TF,TI,D> { using type = gpu3d::Card<V,true,OUT & ~EDGES,TF,TI,D>; };
 
 /// the walk's node records of a card, writable ( the majorants write them )
 template<class C>
@@ -844,9 +856,10 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     using DH = typename DensityHostOf<std::decay_t<decltype( dens_in )>>::type;
     using D  = typename DH::Dev;
     constexpr bool CONST = std::is_same_v<D,DensConst>;
-    constexpr int DIM = PD::ct_dim;                      // ( 3D: `Cell3D.cuh`'s cells, a constant density, the `trials` step )
+    constexpr int DIM = PD::ct_dim;                      // ( 3D: `Cell3D.cuh`'s cells, a constant or a tetrahedral mesh, the `trials` step )
     static_assert( DIM == 2 || DIM == 3, "the card's solve is 2D or 3D" );
-    static_assert( DIM == 2 || CONST, "the card's 3D solve integrates a constant density" );
+    static_assert( DIM == 2 ? ! std::is_same_v<D,gpu3d::DensMesh3> : ( CONST || std::is_same_v<D,gpu3d::DensMesh3> ),
+                   "the card's 2D solve integrates a constant, an image, gaussians or a triangle mesh; its 3D solve a constant or a tetrahedral mesh" );
     using CardT = typename SolveCard<DIM,V,MEASURES | FACETS | EDGES,TF,TI,D>::type;
     using CardD = typename SolveCard<DIM,VD,MEASURES | FACETS | EDGES,TF,TI,D>::type;
     using MomT  = typename SolveCard<DIM,VD,MEASURES | MOMENTS,TF,TI,D>::type;
@@ -866,6 +879,8 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     const auto ids = strided( pd.tree.seed_indices );
     const auto pos = strided( pd.sorted_positions );
     const auto box_min = strided( pd.box_min ), box_max = strided( pd.box_max );
+    Cuts<TF> cuts;                                       // the domain's other half-spaces, or its polygon, when it is not a box
+    fill_cuts( cuts, pd );
     auto vec = [&]( SI m ) { return static_cast<double *>( take( allocator, SI( sizeof( double ) ) * std::max<SI>( m, 1 ) ) ); };
 
     // ---- the options ( one read back )
@@ -880,7 +895,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     const int maxit = int( o[ O_MAXIT ] ), max_backtracks = int( o[ O_MAX_BACKTRACKS ] ), step_kind = int( o[ O_STEP ] );
     const int residual = int( o[ O_RESIDUAL ] );
     const double power = o[ O_POWER ], switch_residual = o[ O_SWITCH ];
-    const int lin_kind = int( o[ O_LIN ] );
+    int lin_kind = int( o[ O_LIN ] );                    // ( LIN_HOST afterwards if the card's solver failed: see `solved` )
     const bool trace = o[ O_TRACE ] != 0;
     const int continuation = int( o[ O_CONTINUATION ] );
     const SI agg_nb_dups = SI( o[ O_AGG_NB_DUPS ] );
@@ -888,7 +903,7 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
     // ---- the fourth pass's slots, ONE budget for every card of the solve ( they run one after the other ), sized for the
     // largest cell form ( the double kernel's, MIXED )
     using Ovf = std::conditional_t<DIM == 2, Overflow, gpu3d::Slots>;
-    Ovf overflow = Ovf::sized( n, overflow_warps, max_vertices );
+    Ovf overflow = Ovf::sized( n + start_count( pd ), overflow_warps, max_vertices );
     overflow.bytes = std::max( overflow.template bytes_for<typename V::TK,TR>(), overflow.template bytes_for<typename VD::TK,TR>() );
     unsigned char *ovf_ptr = static_cast<unsigned char *>( take( allocator, overflow.bytes ) );
     if ( ! ovf_ptr )
@@ -1566,8 +1581,22 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
 
             // the direction
             const double tl0 = wall_now();
-            const bool solved = lin_kind == LIN_HOST ? host.solve( queue, L, b, d )
-                              : lin_float ? linf.solve( queue, allocator, L, b, d ) : lin.solve( queue, allocator, L, b, d );
+            bool solved = lin_kind == LIN_HOST ? host.solve( queue, L, b, d )
+                        : lin_float ? linf.solve( queue, allocator, L, b, d ) : lin.solve( queue, allocator, L, b, d );
+            if ( ! solved && lin_kind != LIN_HOST ) {
+                // THE FALLBACK: the card's solver has limits that a pathological laplacian can pass ( a row of thousands of
+                // entries: a seed facing a long line of seeds ). The CPU solver of `Linear.cpp` takes it, on a copy of the
+                // laplacian each way -- slower, but the solve goes on, and for the rest of it ( the matrix will not get simpler )
+                std::printf( "sdot: the card's linear solver gave up ( see above ): the rest of the solve runs its linear systems on the host "
+                             "( slower; if the seeds are aligned or clustered, that is what makes it hard )\n" );
+                std::fflush( stdout );
+                sp::LinearOptions hl;
+                if ( o[ O_LIN_TOL ] > 0 ) hl.tol = o[ O_LIN_TOL ];
+                host.prepare( int( sp::Lin::AUTO ), n, hl );
+                lin_kind = LIN_HOST;
+                coo_of = nullptr;
+                solved = host.solve( queue, L, b, d );
+            }
             t_lin += wall_now() - tl0;
             tm_asm.collect();
             if ( lin_kind != LIN_HOST )
@@ -1593,9 +1622,9 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
                 const double th0 = wall_now();
                 tm_lim.start( queue );
                 if constexpr ( CONST )
-                    reduce( queue, n, AlphaForward<TF,TR>{ pos, box_min, box_max, w, d, cur->edges, cur->nb_edges, n, rho, eps }, red_min.partials, red_min.out );
+                    reduce( queue, n, AlphaForward<TF,TR>{ pos, box_min, box_max, cuts, w, d, cur->edges, cur->nb_edges, n, rho, eps }, red_min.partials, red_min.out );
                 else
-                    reduce( queue, n, AlphaForwardDens<TF,TR,D>{ pos, box_min, box_max, w, d, cur->edges, cur->nb_edges, n, card.pb.dens, eps },
+                    reduce( queue, n, AlphaForwardDens<TF,TR,D>{ pos, box_min, box_max, cuts, w, d, cur->edges, cur->nb_edges, n, card.pb.dens, eps },
                             red_min.partials, red_min.out );
                 Min1 am;
                 read_back( queue, &am, ( const Min1 * ) red_min.out, 1 );
@@ -1619,10 +1648,10 @@ void solve( const CudaQueue &queue, const auto &pd, const auto &nu_in, const aut
                     const double th1 = wall_now();
                     tm_lim.start( queue );
                     if constexpr ( CONST )
-                        reduce( queue, n, AlphaBackward<TF,TR>{ pos, box_min, box_max, w, d, tri->a, tri->edges, tri->nb_edges, n, rho, eps, t, nue },
+                        reduce( queue, n, AlphaBackward<TF,TR>{ pos, box_min, box_max, cuts, w, d, tri->a, tri->edges, tri->nb_edges, n, rho, eps, t, nue },
                                 red_mc.partials, red_mc.out );
                     else
-                        reduce( queue, n, AlphaBackwardDens<TF,TR,D>{ pos, box_min, box_max, w, d, tri->a, tri->edges, tri->nb_edges, n, card.pb.dens, eps, t, nue },
+                        reduce( queue, n, AlphaBackwardDens<TF,TR,D>{ pos, box_min, box_max, cuts, w, d, tri->a, tri->edges, tri->nb_edges, n, card.pb.dens, eps, t, nue },
                                 red_mc.partials, red_mc.out );
                     MinCount mc;
                     read_back( queue, &mc, ( const MinCount * ) red_mc.out, 1 );

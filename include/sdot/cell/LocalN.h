@@ -822,6 +822,60 @@ struct LocalN {
         }
     }
 
+    /// IN 3D: `func( o, a, b )`, the vertex indices of a FAN of triangles that tiles the face carried by cut `f` -- `o` one of its
+    /// vertices, `( a, b )` each of its edges once ( those through `o` give flat triangles, harmless ). The face is planar and convex, so
+    /// the triangles all have the same orientation. Reads the TOPOLOGY only and writes nothing: it may be called from inside
+    /// `for_each_facet` ( `SumOfGaussians::facet_mass` does ).
+    HD void for_each_facet_triangle( int f, auto &&func ) const {
+        static_assert( D == 3 );
+        int o = -1;
+        for ( int i = 0; i < nv && o < 0; ++i )
+            for ( int r = 0; r < 3; ++r )
+                if ( vk[ r ][ i ] == f )
+                    o = i;
+        if ( o < 0 )
+            return;
+        for ( int a = 0; a < nv; ++a ) {
+            for ( int j = 0; j < 3; ++j ) {
+                const int b = vn[ j ][ a ];
+                if ( b <= a )
+                    continue;
+                bool on_f = false;                       // the edge is on the face if `f` is one of the two cuts that carry it
+                for ( int r = 0; r < 3; ++r )
+                    on_f = on_f || ( r != j && vk[ r ][ a ] == f );
+                if ( on_f )
+                    func( o, a, b );
+            }
+        }
+    }
+
+    /// IN 3D: the AREA and the CENTROID of the face carried by cut `f` ( `false` if it has none ) -- what the integral of an affine
+    /// function on the face needs: `area * f( centroid )`. The triangles of `for_each_facet_triangle`, each weighing its own area,
+    /// at its own center.
+    template<class TF>
+    HD bool facet_centroid( int f, TF ( &g )[ 3 ], TF &area ) const {
+        static_assert( D == 3 );
+        if ( nv < 4 )
+            return false;
+        TF w = 0, m[ 3 ] = { 0, 0, 0 };
+        for_each_facet_triangle( f, [&]( int o, int a, int b ) {
+            const TF ax = v[0][a] - v[0][o], ay = v[1][a] - v[1][o], az = v[2][a] - v[2][o];
+            const TF bx = v[0][b] - v[0][o], by = v[1][b] - v[1][o], bz = v[2][b] - v[2][o];
+            const TF cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
+            const TF t = sdot::sqrt( cx * cx + cy * cy + cz * cz ) / 2;
+            w += t;
+            m[ 0 ] += t * ( v[0][o] + v[0][a] + v[0][b] ) / 3;
+            m[ 1 ] += t * ( v[1][o] + v[1][a] + v[1][b] ) / 3;
+            m[ 2 ] += t * ( v[2][o] + v[2][a] + v[2][b] ) / 3;
+        } );
+        if ( ! ( w > 0 ) )
+            return false;
+        area = w;
+        for ( int c = 0; c < 3; ++c )
+            g[ c ] = m[ c ] / w;
+        return true;
+    }
+
     /// `func( c, measure )` for each cut `c` that carries a face: its AREA ( 3D only )
     template<class TF>
     HD void for_each_facet( auto &&func ) const {

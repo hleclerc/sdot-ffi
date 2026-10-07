@@ -14,7 +14,7 @@ from loom.tensor import Axis
 
 from loom.compilation.FfiCode import FfiCode
 from loom.util import Aggregate
-from loom.drivers.driver import driver
+import loom
 
 
 class SdotPlan1d( Aggregate ):
@@ -48,8 +48,8 @@ class SdotPlan1d( Aggregate ):
         self._with_barycenters = bool( with_barycenters )
 
         # normalization
-        src_dist = src_dist.normalized_version()
-        dst_dist = dst_dist.normalized_version()
+        src_dist = src_dist.normalized_version( nb_dims = 1 )
+        dst_dist = dst_dist.normalized_version( nb_dims = 1 )
         # dispatch on CAPABILITY, not a concrete type: any `_is_dirac_source` distribution answers the
         # C++ `position(i)` / `add_position_grad` contract SdotPlan1d needs (SumOfDiracs reads a buffer,
         # ProjectedSumOfDiracs computes the projection on the fly). Keep the diracs on the src side.
@@ -119,7 +119,7 @@ class SdotPlan1d( Aggregate ):
         rebuilt by every forward/backward call here.
         """
         n  = int( self.nb_diracs.value )
-        nt = driver.device.nb_threads( batch_axes = self.batch_axes, nb_local_bytes_per_thread = 3 * 8 * n )
+        nt = loom.resolved_device().nb_threads( batch_axes = self.batch_axes, nb_local_bytes_per_thread = 3 * 8 * n )
         # `NB_BUCKETS = 256` (8-bit radix digit, see `SdotPlan1d.cxx::sort_diracs`) -- MUST match that
         # constant by hand. The histogram is now ONE ROW PER SUB-GROUP (warp), not per work-item (see
         # `sort_diracs`'s docstring) -- `nb_shared_bytes_per_subgroup` tells `group_size` to budget
@@ -130,7 +130,7 @@ class SdotPlan1d( Aggregate ):
         # allocates one extra shared row (the cross-chunk bucket offsets) on top -- tell `group_size`
         # about that fixed overhead so its shared-memory budget check matches what actually gets
         # allocated.
-        gs = driver.device.group_size( nb_shared_bytes_per_subgroup = 2 * 256 * 4, nb_shared_bytes_fixed = 256 * 4 )
+        gs = loom.resolved_device().group_size( nb_shared_bytes_per_subgroup = 2 * 256 * 4, nb_shared_bytes_fixed = 256 * 4 )
         num_group = Axis( ShapeVar( nt ), name = "num_group" )
         num_local = Axis( ShapeVar( gs ), name = "num_local" )
         num_scan  = Axis( ShapeVar( gs + 1 ), name = "num_local_scan" )   # `+1` = the phi_total broadcast slot
@@ -144,7 +144,7 @@ class SdotPlan1d( Aggregate ):
 
     def update_outputs( self ):
         # give the target distribution first refusal: e.g. `Image.try_update_sdotplan1d` solves
-        # the whole thing in closed-form pure JAX (no driver.call/C++ kernel at all) when the
+        # the whole thing in closed-form pure JAX (no loom.ffi_call/C++ kernel at all) when the
         # combination qualifies (JAX backend, 1D, <=1 batch axis, no barycenters, a dirac
         # source that can supply plain positions/weights) -- see [[pure-jax-otplan1d]]. `False`
         # means "unsupported combination", not "error" -- fall through to the general path.
@@ -152,7 +152,7 @@ class SdotPlan1d( Aggregate ):
             return
 
         # second refusal, this time from the BATCH shape itself: when there is one, loop over
-        # it with `jax.lax.map` (one `driver.call` per angle) instead of one call handling every
+        # it with `jax.lax.map` (one `loom.ffi_call` per angle) instead of one call handling every
         # angle's memory at once -- see `_update_outputs_via_angle_loop`'s docstring for why.
         if self.batch_axes and self._update_outputs_via_angle_loop():
             return
@@ -185,7 +185,7 @@ class SdotPlan1d( Aggregate ):
             max_nb_threads = "return scratch.sorted_indices.shape( 0 );",
             group_size = f"return { group_size_expr };",
             local_mem_elems = ( f"const int gs = { group_size_expr };\n"
-                                f"        const int sg = { driver.device.subgroup_size };\n"
+                                f"        const int sg = { loom.resolved_device().subgroup_size };\n"
                                 f"        return ( 2 * ( ( gs + sg - 1 ) / sg ) + 1 ) * 256;" ),
         )
         loom.ffi_call(
@@ -217,18 +217,18 @@ class SdotPlan1d( Aggregate ):
 
     def _update_outputs_via_angle_loop( self ):
         """Loop over the (single) batch axis with `jax.lax.map` + `jax.checkpoint`, building a
-        FRESH, unbatched `SdotPlan1d` (one `driver.call` -- sort AND sweep, unaffected by this)
+        FRESH, unbatched `SdotPlan1d` (one `loom.ffi_call` -- sort AND sweep, unaffected by this)
         per angle, instead of one call whose internal scratch/output memory scales with how many
         CONCURRENT angles it processes at once (`_scratch`'s `nt`, or an `[ nb_angles, n, dim ]`
         `barycenters` output). Mirrors `Image.try_update_sdotplan1d`'s own `lax.map`, extended to
-        the driver.call/C++ path: 'we will always have a large n', so bounding peak memory to
+        the loom.ffi_call/C++ path: 'we will always have a large n', so bounding peak memory to
         ONE angle -- regardless of the total angle count -- matters more than batching several
         angles' GPU work concurrently (confirmed: `with_barycenters=True` OOMs today's single
         batched call at n=1e8 x 20 angles; looping fixes it, see [[pure-jax-otplan1d]]). Declines
         (returns False, caller keeps the single batched call) when: not JAX, more than one batch
         axis, or either distribution cannot slice itself (`batch_slice`).
         """
-        framework = driver.framework.module_name
+        framework = loom.resolved_framework().module_name
         if len( self.batch_axes ) != 1 or framework not in ( "jax", "torch" ):
             return False
         # probed with a concrete Python int (outside any trace, so this is free): confirms both
@@ -238,10 +238,10 @@ class SdotPlan1d( Aggregate ):
 
         with_barycenters = self._with_barycenters
 
-        # `driver.checkpoint` is `jax.checkpoint` under Jax. Under Torch the angles are looped over in
+        # `loom.checkpoint` is `jax.checkpoint` under Jax. Under Torch the angles are looped over in
         # Python ( eager autograd: one angle's buffers live at a time once checkpointed ), which also
-        # keeps every `driver.call` unbatched -- the path the C++ backward is exercised on.
-        @driver.checkpoint
+        # keeps every `loom.ffi_call` unbatched -- the path the C++ backward is exercised on.
+        @loom.checkpoint
         def body( index ):
             src_i = self.src_dist.batch_slice( index )
             dst_i = self.dst_dist.batch_slice( index )
@@ -264,8 +264,8 @@ class SdotPlan1d( Aggregate ):
             result = jax.lax.map( body, jnp.arange( n_batch ) )
         else:
             outs = [ body( i ) for i in range( int( n_batch ) ) ]
-            result = tuple( driver.stack( list( column ), axis = 0 ) for column in zip( *outs ) ) if with_barycenters \
-                     else driver.stack( outs, axis = 0 )
+            result = tuple( loom.ops().stack( list( column ), axis = 0 ) for column in zip( *outs ) ) if with_barycenters \
+                     else loom.ops().stack( outs, axis = 0 )
         if with_barycenters:
             cost, barycenters = result
             self.barycenters = barycenters
@@ -290,7 +290,7 @@ class SdotPlan1d( Aggregate ):
         """
         self.dst_dist.ensure_cell_cum_mass()
         group_size_expr = "scratch.num_local_marker.shape( 0 )"   # a C++ expression, read off an argument
-        gs = driver.device.group_size( nb_shared_bytes_per_subgroup = 0, nb_shared_bytes_fixed = 0 )
+        gs = loom.resolved_device().group_size( nb_shared_bytes_per_subgroup = 0, nb_shared_bytes_fixed = 0 )
         # ONE group only: this call handles a SINGLE angle (the caller's `lax.scan` supplies the outer
         # angle loop), so there is no "concurrent angles" axis to size `num_group` on (contrast
         # `_scratch`, sized on `nt` concurrent angles for the internally-sorting, all-angles-at-once path).

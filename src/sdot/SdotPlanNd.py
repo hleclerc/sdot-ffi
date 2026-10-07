@@ -7,7 +7,7 @@ It is requested from an `OtProblem`, and in no other way:
     sol = OtProblem( SumOfDiracs( pos ), image ).solve()
     sol = ot_solve( SumOfDiracs( pos ), image )        # the same, for a transport solved ONCE
 
-THE WHOLE FIT IS IN C++ ( `sdot/sdotplan/` ), in ONE `driver.call`: the starting point, the
+THE WHOLE FIT IS IN C++ ( `sdot/sdotplan/` ), in ONE `loom.ffi_call`: the starting point, the
 damped Newton, its diagrams, the laplacian, the linear solver, the damping. Python only sets up
 the problem and reads what comes out. That is what the `solvers_des_familles` bench concluded
 ( README § 3, § 7, § 9, § 10 ):
@@ -32,9 +32,10 @@ The same solve, in ONE ffi call too, whose handler drives the Newton loop on the
 run on the card, and the host only reads back the scalars it decides on -- so the solve runs under `jax.jit` as well. The
 tree itself is one more card call just before ( `gpu/Bsp2D.cuh`, `AaBsp._init_on_card` ): under `jax.jit` it is part of
 the jitted program, built at every call, from traced positions as well as from constant ones. It
-takes 2D problems in a box against a constant density, an `Image` on a regular grid or isotropic gaussians, with the width
-continuation of the CPU, and 3D problems in a box against a constant density ( the step `trials`, as on the CPU; the cells of
-`gpu/Cell3D.cuh` ); anything else raises on a card ( the CPU solves it ).
+takes 2D problems against a constant density ( a box, or a convex polygon the cells start from: `Polytope`, `Polygon` ), an
+`Image` on a regular grid, isotropic gaussians or a triangle `Mesh`, with the width continuation of the CPU where there is one
+( not for a polytope; for a mesh, the spreading runs its stages, see `_solve_by_spreading` ), and 3D problems against a constant density ( a box or a convex polyhedron; the step `trials`,
+as on the CPU; the cells of `gpu/Cell3D.cuh` ); anything else raises on a card ( the CPU solves it ).
 
 = The starting point
 
@@ -79,16 +80,20 @@ for a functional that was not anticipated. Nothing in the solve goes through the
 Python side.
 """
 
+import copy
 import warnings
+
+import numpy as np
 
 import loom
 from loom.compilation.FfiCode import FfiCode
-from loom.drivers.driver import driver
+import loom
 from loom.tensor import Axis, CtShapeVar, IntTensor, RealTensor, ShapeVar, Tensor
 from loom.util import Aggregate
 
 from .CellScratch import fp_size
 from .PowerDiagram import PowerDiagram
+from .viz.Displayable import Displayable
 
 
 # what `stats` carries, in the order of `sdotplan/Solve.h::Stat`
@@ -184,6 +189,7 @@ class _Options( Aggregate ):
     agg_margin     : RealTensor
     agg_gap        : RealTensor
     agg_nb_dups    : IntTensor
+    keep_start     : IntTensor
     kernel_fp_size : CtShapeVar
 
 
@@ -272,8 +278,18 @@ class _History( Aggregate ):
     nb_points : ShapeVar
 
 
-class SdotPlanNd:
+class SdotPlanNd( Displayable ):
     """see the module docstring"""
+
+    #: the width continuation of a mesh ( `_solve_by_spreading` ): the largest step of the path, as a ratio of `k + 1`, and the
+    #: smallest one a failed stage may be cut down to; the Newton steps of a stage
+    SPREAD_RATIO = 4.0
+    SPREAD_MIN_RATIO = 1.05
+    SPREAD_STAGE_ITER = 60
+    #: `continuation = "auto"` on a target that spreads: from this `spread_start()` on ( a density far from flat, whose max is still
+    #: over 3 times its mean after so many averages ), the continuation runs at once -- the plain Newton was measured to fail there,
+    #: and trying it first was about half of the time of the solve
+    SPREAD_DIRECT = 16
 
     # -- how to get one -----------------------------------------------------------------------
 
@@ -282,9 +298,123 @@ class SdotPlanNd:
         """THE path: `OtProblem.solve()` and only it goes through here. `warm` is the last SOLUTION
         the problem returned -- the start when the settings do not impose one ( see
         `_start_from_plan` )."""
+        if not getattr( problem, "_is_detached", False ) and cls._wants_derivatives( problem, settings ):
+            # THE SOLVE IS NOT DIFFERENTIATED: it runs on detached inputs, and its outputs get their derivative from the implicit
+            # function theorem ( `_attach_derivatives` )
+            plan = cls._solve( problem._detached(), settings, verbose, warm )
+            plan._attach_derivatives( problem, settings )
+            return plan
+        spreads = cls._spreads( problem, settings )
+        if spreads:
+            k0 = problem.target.spread_start()
+            if k0 is not None and ( settings.continuation == "always" or k0 >= cls.SPREAD_DIRECT ):
+                if verbose and settings.continuation != "always":
+                    print( f"  the target is far from flat ( spread_start = { k0 } ): width continuation by its spreading at once" )
+                return cls._solve_by_spreading( problem, settings, verbose, k0 = k0 )
+        # the plain solve first; a target the C++ cannot blur ( a mesh ) that it fails on goes through its spreading
+        tried = copy.copy( settings )
+        tried.on_failure = "ignore" if spreads else settings.on_failure
         self = cls.__new__( cls )
-        self._build( problem, settings, verbose, warm )
+        self._build( problem, tried, verbose, warm )
+        if spreads and not self.converged:
+            if verbose:
+                print( f"  the plain solve did not converge ( { self.stats[ 'status' ] } ): width continuation by the spreading of the mesh" )
+            return cls._solve_by_spreading( problem, settings, verbose, plain = self )
+        self._check_converged( settings )
         return self
+
+    @staticmethod
+    def _wants_derivatives( problem, settings ):
+        """`differentiable = "auto"`: when one of the inputs is traced"""
+        flag = getattr( settings, "differentiable", "auto" )
+        if flag != "auto":
+            return bool( flag )
+        from loom.tensor import Tensor
+        def traced( agg ):
+            for v in vars( agg ).values():
+                if isinstance( v, Aggregate ):
+                    if traced( v ):
+                        return True
+                elif isinstance( v, Tensor ) and v.is_defined and loom.is_traced( v.raw ):
+                    return True
+            return False
+        return traced( problem.source ) or traced( problem.target )
+
+    @staticmethod
+    def _spreads( problem, settings ):
+        """the TARGET spreads itself for the width continuation ( `Distribution.spread`: a mesh, which the C++ does not convolve ), and
+        the settings allow a continuation"""
+        if settings.continuation == "never" or getattr( settings, "ot_plan", None ) is not None:
+            return False
+        return callable( getattr( problem.target, "spread", None ) )
+
+    @classmethod
+    def _solve_by_spreading( cls, problem, settings, verbose, plain = None, k0 = None ):
+        """THE WIDTH CONTINUATION OF A MESH: the path of its spread densities ( `Mesh.spread( k )`, the corner averages: the same mesh,
+        the same pieces, wider values ), from `k = Mesh.spread_start()` down to `k = 0`, the mesh itself. Each stage starts from the
+        weights of the last converged one, at a loose tolerance ( `1e-2 / n` ); the steps are in `log( k + 1 )`, at most
+        `SPREAD_RATIO`, lengthened after a success and halved after a failure, down to `SPREAD_MIN_RATIO` -- between `k = 1` and
+        `k = 0` too, where the spread density is a mix of the mesh and of its first average."""
+        import math
+        from .OtProblem import OtProblem
+        target = problem.target
+        k0 = target.spread_start() if k0 is None else k0
+        if k0 is None:                                     # ( the mesh is not readable on the host: nothing to spread )
+            if plain is None:
+                plain = cls.__new__( cls )
+                plain._build( problem, settings, verbose, None )
+            plain._check_converged( settings )
+            return plain
+        n = int( problem.nb_diracs )
+        s_end = math.log( k0 + 1 )
+        big = math.log( cls.SPREAD_RATIO )
+        s, s_prev, ds, w = 0.0, 0.0, big, None
+        stages, rejected, nb_iter = [], 0, 0
+        while True:
+            last = s >= s_end - 1e-9                       # ( no stage at k ~ 1e-12 before the mesh )
+            k = 0.0 if last else ( k0 + 1 ) * math.exp( -s ) - 1
+            stage = copy.copy( settings )
+            stage.weights0, stage.ot_plan, stage.on_failure, stage.continuation = w, None, "ignore", "never"
+            stage.tuning = copy.copy( settings.tuning )
+            stage.tuning.keep_start = w is not None
+            if last:
+                sol = cls.__new__( cls )
+                sol._build( problem, stage, verbose, None )
+            else:
+                stage.tol = max( settings.tol, 1e-2 / n )
+                stage.max_iter = min( settings.max_iter, cls.SPREAD_STAGE_ITER )
+                try:
+                    sol = OtProblem( problem.source, target.spread( k ) ).solve( stage, verbose )
+                except RuntimeError:                       # ( a stage that the solver could not run: a failed stage )
+                    sol = None
+            ok = sol is not None and sol.converged
+            if sol is not None:
+                nb_iter += int( sol.stats[ "nb_iter" ] )
+            if verbose:
+                print( f"  spreading, k = { 0 if last else k:.3g}: { sol.stats[ 'status' ] if sol is not None else 'failed' }" )
+            if ok:
+                stages.append( 0.0 if last else k )
+                w = np.asarray( sol.weights ).reshape( -1 )
+                if last:
+                    break
+                s_prev, ds = s, min( ds * 1.5, big )
+            else:
+                rejected += 1
+                if w is None or ds / 2 < math.log( cls.SPREAD_MIN_RATIO ):
+                    if sol is None or not last:            # ( the path is stuck: the mesh from the last weights, for the status )
+                        sol = cls.__new__( cls )
+                        final = copy.copy( settings )
+                        final.weights0, final.ot_plan, final.continuation = w, None, "never"
+                        final.tuning = copy.copy( settings.tuning )
+                        final.tuning.keep_start = w is not None
+                        final.on_failure = "ignore"
+                        sol._build( problem, final, verbose, None )
+                    break
+                ds /= 2
+            s = min( s_prev + ds, s_end )
+        sol.stats.update( spread_start = k0, spread_stages = stages, spread_rejected = rejected, spread_nb_iter = nb_iter )
+        sol._check_converged( settings )
+        return sol
 
     def __init__( self, src_dist, dst_dist, verbose = False, **kwargs ):
         """DEPRECATED -- `OtProblem( src_dist, dst_dist ).solve( Iterative( ... ) )`.
@@ -310,9 +440,9 @@ class SdotPlanNd:
     def _build( self, problem, settings, verbose, warm = None ):
         # two solvers: the CPU's ( `sdotplan/Solve.h`, host code on the CPU queue ) and, on a CUDA device, the card's
         # ( `gpu/Newton2D.cuh`: 2D or 3D, a box -- see `_build_card` ); any other device is refused
-        on_card = bool( getattr( driver.device, "is_cuda_gpu", False ) )
-        if not driver.device.is_cpu and not on_card:
-            raise NotImplementedError( f"SdotPlanNd: no solver for the device { driver.device } ( the CPU, or a CUDA card in 2D )" )
+        on_card = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
+        if not loom.resolved_device().is_cpu and not on_card:
+            raise NotImplementedError( f"SdotPlanNd: no solver for the device { loom.resolved_device() } ( the CPU, or a CUDA card in 2D )" )
         tun = settings.tuning
         if settings.precision == "mixed" and not on_card:
             raise ValueError( "precision = 'mixed' ( the float kernel, then the double one ) is the card's: on the CPU, 'fp64' or 'fp32'" )
@@ -362,7 +492,7 @@ class SdotPlanNd:
         # ON THE CARD, what the solve will take from the card, checked before anything is launched ( `CardMemory.py` )
         self._card_mg_recycle = None
         if on_card and d in ( 2, 3 ):
-            traced = any( driver.is_traced( getattr( x, "raw", x ) ) for x in ( src_dist.positions, src_dist.weights )
+            traced = any( loom.is_traced( getattr( x, "raw", x ) ) for x in ( src_dist.positions, src_dist.weights )
                           if getattr( x, "is_defined", True ) )
             self._card_mg_recycle = self._check_card_memory( int( src_dist.nb_diracs.value ), settings, jitted = traced, dim = d )
 
@@ -382,11 +512,11 @@ class SdotPlanNd:
             else:
                 accelerator = AaBsp( pos_raw, getattr( w_start, "raw", w_start ) )
             accelerator._majorant_weights = w_start
-        elif w0_given is not None and accelerator is None and not driver.is_traced( pos_raw ) \
-                and driver.is_traced( getattr( w0_given, "raw", w0_given ) ):
+        elif w0_given is not None and accelerator is None and not loom.is_traced( pos_raw ) \
+                and loom.is_traced( getattr( w0_given, "raw", w0_given ) ):
             accelerator = AaBsp( pos_raw )
         # ( and what is concrete is EVALUATED under the trace: the domain, the tree, the density's values stay readable )
-        with driver.concrete_eval():
+        with loom.concrete_eval():
             self._pd = PowerDiagram( src_dist.positions, w_start,
                                      accelerator = accelerator, kernel_dtype = settings.kernel_dtype,
                                      distribution = dst_dist, memory = tun.memory,
@@ -412,7 +542,7 @@ class SdotPlanNd:
             mg_pack = int( tun.mg_pack or 0 ), mg_recycle = -1 if tun.mg_recycle is None else int( tun.mg_recycle ), mg_rebuild = int( tun.mg_rebuild or 0 ), mg_stop = int( tun.mg_stop or 0 ), mg_nu = int( tun.mg_nu or 0 ),
             step = _STEP[ step ], residual = _RESIDUAL[ tun.residual ], trace = int( bool( verbose ) ), continuation = _CONTINUATION[ settings.continuation ],
             cap0 = int( pd._scratch_capacity ),
-            agg_margin = self._agg_margin, agg_gap = self._agg_gap, agg_nb_dups = self._agg_nb_dups,
+            agg_margin = self._agg_margin, agg_gap = self._agg_gap, agg_nb_dups = self._agg_nb_dups, keep_start = int( bool( getattr( tun, "keep_start", False ) ) ),
             kernel_fp_size = fp_size( pd.kernel_dtype ),
         )
 
@@ -464,8 +594,8 @@ class SdotPlanNd:
                     "os.lin_options.mg_pack = int( SI( inputs.options.mg_pack ) ); os.lin_options.mg_recycle = int( SI( inputs.options.mg_recycle ) ); os.lin_options.mg_rebuild = int( SI( inputs.options.mg_rebuild ) ); os.lin_options.mg_stop = int( SI( inputs.options.mg_stop ) ); os.lin_options.mg_nu = int( SI( inputs.options.mg_nu ) );",
                     "os.continuation = int( SI( inputs.options.continuation ) ); os.continuation_threshold = double( inputs.options.conv_threshold );",
                     "os.conv_s0 = double( inputs.options.conv_s0 ); os.conv_ratio = double( inputs.options.conv_ratio ); os.conv_min = double( inputs.options.conv_min );",
-                    "os.agg_margin = double( inputs.options.agg_margin ); os.agg_gap = double( inputs.options.agg_gap ); os.agg_nb_dups = SI( inputs.options.agg_nb_dups );",
-                    f"sdotplan::solve<TK_sdotplan>( queue, pd_sdotplan, inputs.power_diagram, inputs.dom_cell, { dist_expr }, inputs.nu, inputs.w0, inputs.dups, os, "
+                    "os.agg_margin = double( inputs.options.agg_margin ); os.agg_gap = double( inputs.options.agg_gap ); os.agg_nb_dups = SI( inputs.options.agg_nb_dups ); os.keep_start = SI( inputs.options.keep_start ) != 0;",
+                    f"sdotplan::solve<TK_sdotplan>( queue, pd_sdotplan, inputs.power_diagram, inputs.dom_cell, { dist_expr }, inputs.nu, inputs.w0, inputs.dups, inputs.start_box, os, "
                     "outputs.weights, outputs.history, outputs.stats, outputs.cell_masses, outputs.barycenters, outputs.cost, outputs.clusters );",
                 ] ) ),
             power_diagram = pd,
@@ -473,6 +603,7 @@ class SdotPlanNd:
             nu = self._masses,
             w0 = w0,
             dups = self._agg_dups,
+            start_box = self._start_box( dst_dist, d ),
             options = options,
             weights = loom.out( weights ),
             # `nb_steps` is WRITTEN by the kernel ( the number of accepted steps ), so it must be
@@ -495,6 +626,7 @@ class SdotPlanNd:
 
         #: the FITTED weights, `[ n ]`, indexed like `positions` ( `weights[ 0 ] == 0`: the gauge )
         self.weights = weights
+        self._weights_fit = weights
         #: the measure of each cell at the FITTED weights, `[ n ]` -- the one Newton measured
         self.cell_masses = cell_masses
         #: the barycenter of each cell, `[ n, d ]` ( its seed if it is empty )
@@ -504,6 +636,15 @@ class SdotPlanNd:
         self._clusters = clusters
         self._read_stats( stats, settings )
         self._read_history( history, settings, pd )
+        self._check_converged( settings )
+
+    @staticmethod
+    def _start_box( dist, d ):
+        """THE BOX THE STARTING POINT PACKS THE SEEDS IN, `[ flag, lo, hi ]` ( `sdotplan/Solve.h::similarity` ): what the target says lies
+        inside its support ( `Distribution.inscribed_box` ), flag 1 -- or flag 0, and the solver takes the box of the domain."""
+        box = dist.inscribed_box() if hasattr( dist, "inscribed_box" ) else None
+        vals = np.zeros( 2 * d + 1 ) if box is None else np.concatenate( [ [ 1.0 ], np.asarray( box[ 0 ], dtype = float ), np.asarray( box[ 1 ], dtype = float ) ] )
+        return RealTensor[ Axis( ShapeVar( 2 * d + 1 ), name = "num_start_box" ) ]( vals )
 
     def _aggregation_inputs( self, pos_raw, settings, n ):
         """THE AGGREGATION'S INPUTS ( `sdotplan/Aggregation.h` ): `_agg_margin` ( 0: off ), and the EXACT DUPLICATES, which the
@@ -518,7 +659,7 @@ class SdotPlanNd:
         if settings.aggregate:
             margin = getattr( settings.tuning, "aggregation_margin", None )
             self._agg_margin = float( _AGGREGATE_MARGIN if margin is None else margin )
-            if driver.is_traced( pos_raw ):
+            if loom.is_traced( pos_raw ):
                 self._dup_note = "not checked ( traced positions )"
             else:
                 P = np.asarray( pos_raw.cpu() if hasattr( pos_raw, "cpu" ) and not isinstance( pos_raw, np.ndarray ) else pos_raw,
@@ -615,13 +756,13 @@ class SdotPlanNd:
             reason = "the card's cells take a box domain, the BSP tree and no neighbour memory"
         else:
             dens = pd._card_solve_density()
-            if d == 3 and dens is not None and dens[ "kind" ] != "const":
+            if d == 3 and dens is not None and dens[ "kind" ] not in ( "const", "mesh" ):
                 dens = None
             if dens is None:
                 reason = ( "the card integrates a constant density, an `Image` on a regular grid ( a diagonal frame, uniform knots, "
-                           "covering the box ) or isotropic gaussians in 2D -- not this distribution" if d == 2 else
-                           "in 3D the card integrates a constant density only ( Lebesgue on the box, or an `Image` of equal values "
-                           "covering it ) -- not this distribution" )
+                           "covering the box ), isotropic gaussians or a triangle `Mesh` in 2D -- not this distribution" if d == 2 else
+                           "in 3D the card integrates a constant density ( Lebesgue on the box, or an `Image` of equal values "
+                           "covering it ) or a tetrahedral `Mesh` -- not this distribution" )
         if reason is not None:
             raise NotImplementedError( f"SdotPlanNd on a CUDA device: { reason }. Use the CPU device ( LOOM_DEVICE=cpu ) "
                                        "for this problem." )
@@ -698,6 +839,19 @@ class SdotPlanNd:
             nx, ny = int( dens[ "geom" ][ 4 ] ), int( dens[ "geom" ][ 5 ] )
             name, dens_expr = "sdotplan_solve_card_2d_image", "sdot::gpu2d::image_in( args.inputs.img_values )"
             dens_args = dict( img_values = RealTensor[ axis( nx * ny, "num_card_pixel" ) ]( dens[ "values" ] ) )
+        elif dens[ "kind" ] == "mesh":
+            # ( 2D: triangles, `Density2D.cuh::DensMesh`; 3D: tetrahedra, `Density3D.cuh::DensMesh3` )
+            ne, nn, nb = int( dens[ "tri" ].shape[ 0 ] ), int( dens[ "nodes" ].shape[ 0 ] ), int( dens[ "lo" ].shape[ 0 ] )
+            name = f"sdotplan_solve_card_{ d }d_mesh"
+            dens_expr = ( f"sdot::gpu2d::{ 'mesh_in' if d == 2 else 'mesh3_in' }( args.inputs.m_nodes, args.inputs.m_values, args.inputs.m_tri, "
+                          "args.inputs.m_grad, args.inputs.m_lo, args.inputs.m_hi, args.inputs.m_links )" )
+            dens_args = dict( m_nodes = RealTensor[ axis( nn, "num_card_mnode" ), axis( d, "num_card_mdim" ) ]( dens[ "nodes" ] ),
+                              m_values = RealTensor[ axis( ne, "num_card_melem_v" ), axis( d + 1, "num_card_mcorner_v" ) ]( dens[ "values" ] ),   # ( DG1 )
+                              m_tri = IntTensor[ axis( ne, "num_card_melem" ), axis( d + 1, "num_card_mcorner" ), dict( size = 32 ) ]( dens[ "tri" ] ),
+                              m_grad = RealTensor[ axis( ne, "num_card_melem_g" ), axis( d * ( d + 1 ), "num_card_mgrad" ) ]( dens[ "grad" ] ),
+                              m_lo = RealTensor[ axis( nb, "num_card_mbnode_l" ), axis( d, "num_card_mdim_l" ) ]( dens[ "lo" ] ),
+                              m_hi = RealTensor[ axis( nb, "num_card_mbnode_h" ), axis( d, "num_card_mdim_h" ) ]( dens[ "hi" ] ),
+                              m_links = IntTensor[ axis( nb, "num_card_mbnode_k" ), axis( 4, "num_card_mlink" ), dict( size = 32 ) ]( dens[ "links" ] ) )
         else:
             ng = int( dens[ "sigma" ].shape[ 0 ] )
             name, dens_expr = "sdotplan_solve_card_2d_gauss", "sdot::gpu2d::gauss_in( args.inputs.g_pos, args.inputs.g_sigma, args.inputs.g_mass )"
@@ -734,12 +888,14 @@ class SdotPlanNd:
         )
         pd._solver_weights_after( pd_produced )
         self.weights = weights
+        self._weights_fit = weights
         self.cell_masses = cell_masses
         self.barycenters = barycenters
         self.cost = cost
         self._clusters = clusters
         self._read_stats( stats, settings )
         self._read_history( history, settings, pd )
+        self._check_converged( settings )
 
     @staticmethod
     def _start_from_plan( plan, src_dist, impose ):
@@ -763,12 +919,12 @@ class SdotPlanNd:
                                   f"source has { n } -- it cannot serve as a start. Remove it, "
                                   "or keep an `OtProblem` ( it expires its solution on its own )" )
             return None, f"none ( the kept plan carries { n_plan } weights, the source has { n } )"
-        return plan.weights, "ot_plan"
+        return getattr( plan, "_weights_fit", plan.weights ), "ot_plan"
 
     def _read_stats( self, stats, settings ):
         #: what the solver reports ( see `sdotplan/Solve.h::Stat` ), plus `status` and `start` spelled out
         st = stats.raw
-        if driver.is_traced( st ):
+        if loom.is_traced( st ):
             # under a trace ( `jax.jit` ): the numbers are tracers, kept as such -- nothing is read on the host
             self.stats = { name: st[ k ] for k, name in enumerate( _STATS ) }
             self.stats[ "duplicates" ] = self._dup_note
@@ -800,7 +956,7 @@ class SdotPlanNd:
         #: one dict per ACCEPTED step -- `step = 0` is the starting point: `t`, `residual_l2`,
         #: `min_measure`, `max_abs_residual`, `nb_diag` ( cumulative ), `nb_evals` ( the diagrams of
         #: this step ), and `weights` if `keep_weights`
-        if driver.is_traced( history.rows.raw ):
+        if loom.is_traced( history.rows.raw ):
             self.history = None                      # under a trace: not read ( it would be a host read of a tracer )
             return
         nb_steps = int( history.nb_steps.value )
@@ -812,6 +968,14 @@ class SdotPlanNd:
             if settings.keep_weights:
                 entry[ "weights" ] = RealTensor[ pd.num_point ]( history.weights.raw[ s ] )
             self.history.append( entry )
+
+    def _check_converged( self, settings ):
+        """`OtNotConverged` when the solve ended without meeting its tolerance ( `Iterative( on_failure )` )"""
+        if getattr( settings, "on_failure", "raise" ) != "raise" or loom.is_traced( self.stats[ "residual" ] ):
+            return
+        if not self.converged:
+            from .OtProblem import OtNotConverged
+            raise OtNotConverged( self )
 
     # -- what the solution says ----------------------------------------------------------------
 
@@ -830,7 +994,7 @@ class SdotPlanNd:
         members are only within the floor of the doubles ( `stats[ "residual_full" ]` ), an exact duplicate's cell being
         empty -- see the module docstring and README § 23.11."""
         nb = self.stats[ "nb_clusters" ]
-        if not driver.is_traced( nb ) and int( nb ) == 0:
+        if not loom.is_traced( nb ) and int( nb ) == 0:
             return None
         return self._clusters
 
@@ -844,15 +1008,97 @@ class SdotPlanNd:
         """`measure_i( weights ) - nu_i` -- ZERO at the sought point, DIFFERENTIABLE with respect to
         `weights` ( see `PowerDiagram.measures` ). One more diagram: it is a diagnostic tool, not
         an output of the solve ( `cell_masses` is )."""
-        w = self.weights if weights is None else weights
+        w = self._weights_fit if weights is None else weights
         return self.power_diagram( w ).measures - self.target_masses
+
+    # -- the derivative ---------------------------------------------------------------------------
+
+    def _attach_derivatives( self, problem, settings ):
+        """THE DERIVATIVE OF THE SOLVE, by the implicit function theorem -- `self` was solved on DETACHED inputs ( the
+        C++ solve has no adjoint ), `problem` carries the live ones.
+
+        At the fitted weights `w`, `F( w, p, nu, rho ) = m( w, p, rho ) - nu_eff` vanishes, `nu_eff = nu * sum( m ) / sum( nu )`
+        being the target masses rescaled to what the domain holds of the density ( `sum( m )` does not depend on `w`: the
+        cells tile the domain ). Its jacobian with respect to `w` is the laplacian `L` of the Laguerre graph, so
+        `dw = - L^-1 ( d_p F dp + d_rho F drho - d nu_eff )`. That is written as ONE NEWTON STEP with the jacobian frozen:
+
+            w_live = w - L^-1 F( w_live ... )          ( value: `w`, since `F( w ) = 0` )
+
+        where `F` is built from the differentiable `PowerDiagram.measures` ( the derivative with respect to the seeds and the
+        density ) and `L^-1` is `PowerDiagram.laplacian_solve` ( differentiable with respect to its right-hand side ONLY: the
+        derivative of `L` multiplies `F( w ) = 0` ). Nothing in here is specific to a framework: it is all `loom.ffi_call`.
+
+        What is then differentiable: `weights`, and `cell_masses` ( the masses of the live diagram at those weights ), and with
+        them, through the moments of the density over the cells ( `PowerDiagram.moment`, differentiable like `measures` ):
+
+          * the BARYCENTERS, `first_i / mass_i` at the live weights, so with their implicit derivative;
+          * the COST, written as the DUAL functional `D = sum_i int_{cell_i} |x - p_i|^2 rho + sum_i w_i ( nu_i - m_i )`.
+            At the fitted weights `D` equals the cost and `d D / d w = nu - m` vanishes: differentiating `D` with the live weights
+            therefore gives the ENVELOPE derivative ( `2 m_i ( p_i - b_i )` for the seeds, `w_i` for the masses, `int psi d rho` for the
+            density ) without any of it written down, and the live weights' own derivative multiplies zero.
+
+        The values of the cost and of the barycenters are those of the solver ( closed forms where the density has them );
+        their derivatives are those of the quadrature of `PowerDiagram.moment` -- a few `1e-6` apart."""
+        src, dst = problem.source, problem.target
+        fit = self._weights_fit
+        ax = self._pd.num_point
+        kd = settings.kernel_dtype
+        frozen = PowerDiagram( self.problem.source.positions, fit.raw, distribution = self.problem.target, kernel_dtype = kd, memory = 0 )
+        live = PowerDiagram( src.positions, fit.raw, distribution = dst, kernel_dtype = kd, memory = 0 )
+        m = RealTensor[ ax ]( live.measures.raw )
+        nu = RealTensor[ ax ]( src.weights.raw )
+        residual = m - nu * ( m.sum() / nu.sum() )
+        step = RealTensor[ ax ]( frozen.laplacian_solve( residual.raw, linear_solver = settings.tuning.linear_solver ).raw )
+        weights = RealTensor[ ax ]( fit.raw ) - step
+        self.weights = weights
+        at = PowerDiagram( src.positions, weights.raw, distribution = dst, kernel_dtype = kd, memory = 0 )
+        m = RealTensor[ ax ]( at.measures.raw )
+        self.cell_masses = m
+
+        # the moments at the live weights: `first_c`, `second`, and the mass by the SAME quadrature
+        d = int( at.dim_count )
+        first = [ RealTensor[ ax ]( at.moment( c ).raw ) for c in range( d ) ]
+        second = RealTensor[ ax ]( at.moment( d ).raw )
+        mass = RealTensor[ ax ]( at.moment( d + 1 ).raw )
+        pos = [ RealTensor[ ax ]( src.positions.raw[ :, c ] ) for c in range( d ) ]
+        pp = sum( ( p * p for p in pos[ 1: ] ), pos[ 0 ] * pos[ 0 ] )
+        px = sum( ( p * f for p, f in zip( pos[ 1: ], first[ 1: ] ) ), pos[ 0 ] * first[ 0 ] )
+        nu_eff = nu * ( m.sum() / nu.sum() )
+        self.cost = ( second - 2 * px + pp * mass ).sum() + ( weights * ( nu_eff - m ) ).sum()
+
+        # an empty cell keeps its seed as barycenter ( there is nothing else to say )
+        full = loom.ops().stack( [ loom.ops().where( mass.raw > 0, f.raw / loom.ops().where( mass.raw > 0, mass.raw, 1.0 ), p.raw ) for f, p in zip( first, pos ) ], axis = 1 )
+        self.barycenters = RealTensor[ ax, self._pd.dim ]( full )
 
     def power_diagram( self, weights = None ) -> PowerDiagram:
         """THE ON-DEMAND TOOL: the `PowerDiagram` for `weights` ( by default: the FITTED weights )
         -- always the SAME object, on which those weights are set. For drawing, for inspecting, for
         a functional that was not anticipated; nothing in the solve goes through it."""
-        self._pd.weights = self.weights if weights is None else weights
+        self._pd.weights = self._weights_fit if weights is None else weights
         return self._pd
+
+    # -- display ----------------------------------------------------------------------------------
+
+    def add_to_viz( self, viz, weights = None, seeds = True, transport = False, target = True, **kwargs ):
+        """Draws the plan into a `Visualizer`: the power diagram at the FITTED weights ( `weights`
+        to see another one ), its seeds, and -- when `transport` -- the segment from each seed to
+        the barycenter of its cell ( only with the fitted weights ). `target`: the target density
+        adds what it knows of itself ( `Distribution.add_to_viz` ). `kwargs` are those of
+        `PowerDiagram.add_to_viz`. For the quick ways to look at it -- `write_html`, `write_pvd`,
+        `show` -- see `Displayable`."""
+        self.power_diagram( weights ).add_to_viz( viz, seeds = seeds, **kwargs )
+        if transport:
+            if weights is not None:
+                raise ValueError( "transport = True: the barycenters are those of the fitted weights" )
+            d = self.problem.nb_dims
+            pos = np.asarray( self._pd.positions ).reshape( -1, d )
+            bar = np.asarray( self.barycenters ).reshape( -1, d )
+            n = len( pos )
+            viz.add_edges( np.concatenate( [ pos, bar ] ), np.stack( [ np.arange( n ), n + np.arange( n ) ], axis = 1 ),
+                           color = "#d62728" )
+        if target:
+            self.problem.target.add_to_viz( viz )
+        return viz
 
     # -- what the plan is WORTH -------------------------------------------------------------------
 

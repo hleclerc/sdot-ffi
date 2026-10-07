@@ -1,7 +1,7 @@
 """Closed-form 1D optimal-transport cost between a Dirac source and a piecewise-constant
 target density, computed with plain (differentiable) JAX ops -- no custom kernel, no
-`driver.call`. See `Image.try_update_sdotplan1d` for the dispatch that picks this path over
-the general driver.call/C++ one, and [[pure-jax-otplan1d]] for the evaluation that led here
+`loom.ffi_call`. See `Image.try_update_sdotplan1d` for the dispatch that picks this path over
+the general loom.ffi_call/C++ one, and [[pure-jax-otplan1d]] for the evaluation that led here
 (1.2x-3.7x faster than the C++ kernel at n=1e6-3e7, matches it to float32 precision).
 
 Moment trick: for a piecewise-CONSTANT target density, the cumulative mass/first/second

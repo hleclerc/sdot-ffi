@@ -29,7 +29,7 @@ class CellScratch( Aggregate ):
     and the kernel's float as a compile-time constant.
 
     `nb_words` is an OUTPUT with a capacity: it is how a kernel says it ran out of room
-    ( `cell/Ops.h::ask_more` ), and how `driver.call` finds out and retries with double the size.
+    ( `cell/Ops.h::ask_more` ), and how `loom.ffi_call` finds out and retries with double the size.
     """
     words          : IntTensor[ "num_thread", "num_word", dict( size = 32 ) ]
 

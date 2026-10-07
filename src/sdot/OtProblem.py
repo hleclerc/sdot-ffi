@@ -50,6 +50,8 @@ And the lesson not to relearn ( README § 24.5 ) : **a default belongs to the re
 measured.** `residu = log` wins on direct solves and breaks continuation in density.
 """
 
+import copy
+
 import numpy as np                  # the only host arrays in here : the few planes of the domain
 
 
@@ -93,7 +95,9 @@ class Tuning:
                   # weights moves more than `tol / aggregation_margin` of mass between them ( `None`: 4 )
                   aggregation_margin = None,
                   # the machine : the spatial accelerator, the neighbour memory ( § 11 ), the scratch ( § 18.2 )
-                  accelerator = None, memory = None, scratch_capacity = None ):
+                  accelerator = None, memory = None, scratch_capacity = None,
+                  # keep the given starting weights even if they empty a cell ( the stages of a continuation run by the caller )
+                  keep_start = False ):
         self.step              = step
         self.linear_solver     = linear_solver
         self.amg_variant       = amg_variant
@@ -119,9 +123,26 @@ class Tuning:
         self.residual_power    = residual_power
         self.residual_switch   = residual_switch
         self.aggregation_margin = aggregation_margin
+        self.keep_start        = bool( keep_start )
         self.accelerator       = accelerator
         self.memory            = memory
         self.scratch_capacity  = scratch_capacity
+
+
+class OtNotConverged( RuntimeError ):
+    """The iterative solve ended WITHOUT meeting its tolerance ( `Iterative( on_failure = "raise" )`, the default ). `solution` is the
+    `SdotPlanNd` it got to, whose `stats` say why ( `status`, `residual`, `start`, `min_start_mass` ... ) and which can be
+    used all the same -- or `Iterative( on_failure = "ignore" )` asks for it without the exception."""
+
+    def __init__( self, solution ):
+        st = solution.stats
+        hint = ""
+        if st[ "min_start_mass" ] <= 0:
+            hint = ( " -- the start already had an EMPTY cell ( the target has no mass where a seed starts ): the density may be zero over "
+                     "much of its domain; the target's `inscribed_box` ( where the start packs the seeds ) may be missing or too small" )
+        super().__init__( f"the transport did not converge: status '{ st[ 'status' ] }', residual {st[ 'residual' ]:.3e} after "
+                          f"{ st[ 'nb_iter' ] } iterations, start '{ st[ 'start' ] }'{ hint }" )
+        self.solution = solution
 
 
 class Iterative:
@@ -169,15 +190,31 @@ class Iterative:
     what is left of the full problem ( the floor of the doubles ). Nothing changes, and nothing is paid, on a cloud whose
     pairs the doubles separate. `SdotPlanNd.clusters` says which seeds were merged.
 
+    `on_failure` : what a solve that did not converge does -- `"raise"` ( the default: an `OtNotConverged`, carrying the solution
+    it reached ) or `"ignore"` ( the caller reads `converged` / `stats`; for a descent that tolerates an approximate plan ). Not
+    checked under `jax.jit`, where the status is a tracer.
+
     `keep_weights` : keep the weights of EVERY step in `history`, to replay the descent ( an
     array `[ step, n ]`, which one does not always want ).
+
+    `differentiable` : whether the OUTPUTS of the solution ( `weights`, `cell_masses`, `cost`, `barycenters` ) carry their derivative
+    with respect to the INPUTS ( the positions and the masses of the diracs, the parameters of the target ). `"auto"`: when an input
+    is traced ( `jax.grad`, `jax.jit` ) -- the solve itself is not differentiated: it runs on detached inputs, and the derivative is
+    the one of the implicit function theorem ( `SdotPlanNd._attach_derivatives` ), which costs one more diagram and one linear
+    solve with the laplacian. `False` to skip it under a trace that does not differentiate; `True` to insist.
     """
 
     regime = "iterative"
 
     def __init__( self, tol = 1e-8, max_iter = 100, ot_plan = None, weights0 = None,
                   continuation = "auto", precision = "auto", aggregate = True, keep_weights = False,
-                  tuning = None ):
+                  tuning = None, on_failure = "raise", differentiable = "auto" ):
+        if on_failure not in ( "raise", "ignore" ):
+            raise ValueError( f"unknown on_failure : { on_failure !r } ( 'raise' or 'ignore' )" )
+        if differentiable not in ( "auto", True, False ):
+            raise ValueError( f"unknown differentiable : { differentiable !r } ( 'auto', True or False )" )
+        self.on_failure   = on_failure
+        self.differentiable = differentiable
         if precision not in _PRECISIONS:
             raise ValueError( f"unknown precision : { precision !r } ( { ', '.join( _PRECISIONS ) } )" )
         if continuation not in ( "auto", "always", "never" ):
@@ -266,9 +303,9 @@ class OtProblem:
             raise ValueError( "OtProblem : a target is needed -- it is what gives the domain" )
         # evaluated when the target is concrete, even under a trace ( `jax.jit` ): its values stay readable on the host,
         # which is how a solver knows a constant density ( `PowerDiagram_Bsp._card_density` ); traced values stay traced
-        from loom.drivers.driver import driver
-        with driver.concrete_eval():
-            self._target = target.normalized_version()
+        import loom
+        with loom.concrete_eval():
+            self._target = target.normalized_version( nb_dims = None if self._source is None else int( self._source.nb_dims.value ) )
 
     # -- what can be READ off the inputs ------------------------------------------------------
 
@@ -300,6 +337,16 @@ class OtProblem:
         raise ValueError( "OtProblem : the support of the target does not bound the domain "
                           "( `bounding_half_spaces` ) -- it is up to the target to declare it "
                           "( `SumOfGaussians( support_sigmas = ... )` )" )
+
+    def _detached( self ):
+        """THE SAME PROBLEM, its inputs detached from the gradient tape: what the solver itself runs on ( it is not
+        differentiated, see `SdotPlanNd._attach_derivatives` ). Not a problem to pose again: it only exists for one solve."""
+        from loom import stop_gradient
+        res = copy.copy( self )
+        res._source = stop_gradient( self._source )
+        res._target = stop_gradient( self._target )
+        res._is_detached = True
+        return res
 
     # -- solving -------------------------------------------------------------------------------
 

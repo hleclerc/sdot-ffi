@@ -6,7 +6,8 @@
 //
 //   * `DensConst`  a constant ( `Problem::rho` ): the cells' own closed forms, the code of before -- nothing here;
 //   * `DensImage`  a piecewise-constant image on a regular grid ( `Image` with a diagonal frame and uniform knots );
-//   * `DensGauss`  a sum of isotropic gaussians ( `SumOfGaussians`, 2D ), possibly convolved ( the width continuation ).
+//   * `DensGauss`  a sum of isotropic gaussians ( `SumOfGaussians`, 2D ), possibly convolved ( the width continuation );
+//   * `DensMesh`   a continuous piecewise linear density on a triangle mesh ( `Mesh`, 2D ).
 //
 // Everything is a CIRCULATION on the boundary of the cell, so a cell is never cut ( the old campaigns: `gpu_des_familles`
 // doc/08, `solvers_des_familles` § 9 and § 12 ). The sums are accumulated as if the polygon were counterclockwise; the
@@ -55,6 +56,19 @@ struct DensImage {
 struct DensGauss {
     SI            nb;
     const double *cx, *cy, *s, *w;
+};
+
+/// a piecewise linear density on a triangle mesh ( `Mesh`, DG1 ): the nodes, the values at the corners, the triangles ( node indices ),
+/// the gradients of their barycentric coordinates, and the bounding volume hierarchy that finds the triangles a region meets
+/// ( `distributions/Mesh.py` ). Everything in doubles.
+struct DensMesh {
+    SI            nt = 0, nb = 0;                        ///< triangles, hierarchy nodes
+    const double *px = nullptr, *py = nullptr;           ///< the nodes
+    const double *val = nullptr;                         ///< `val[ 3 e + i ]`: the value of triangle `e` at its corner `i`
+    const int    *tri = nullptr;                         ///< `tri[ 3 e + i ]`: the node of corner `i` of triangle `e`
+    const double *grad = nullptr;                        ///< `grad[ 6 e + 2 i + c ]`: component `c` of the gradient of `lambda_i`
+    const double *blo = nullptr, *bhi = nullptr;         ///< `[ nb, 2 ]`: the boxes of the hierarchy
+    const int    *links = nullptr;                       ///< `[ nb, 4 ]`: left, right, begin, end ( a leaf: left < 0 )
 };
 
 /// what a cell accumulates, counterclockwise: the mass, and for the moments `int ( x - p ) rho`, `int |x - p|^2 rho` ( `p`
@@ -261,11 +275,194 @@ __device__ __forceinline__ void gauss_cell( const DensGauss &g, double ox, doubl
     }
 }
 
+// ---- the mesh ( `Mesh.h`, the same formulas ) ------------------------------------------------------------------------------
+
+/// `lambda_i( x, y )` of triangle `e`
+__device__ __forceinline__ double mesh_lambda( const DensMesh &m, SI e, int i, double x, double y ) {
+    const int n0 = m.tri[ 3 * e ];
+    return ( i == 0 ? 1.0 : 0.0 ) + m.grad[ 6 * e + 2 * i ] * ( x - m.px[ n0 ] ) + m.grad[ 6 * e + 2 * i + 1 ] * ( y - m.py[ n0 ] );
+}
+
+/// the pieces `T INTERSECT triangle e` of the polygon `( qx, qy )` ( `nq` vertices, counterclockwise, GLOBAL coordinates ) and
+/// their integrals, with the moments about the seed `( ox, oy )` for `MOM`: each convex piece is cut by the three half-planes
+/// of the triangle, then split in a fan whose triangles integrate the affine density in closed form
+template<bool MOM>
+__device__ __forceinline__ void mesh_element( const DensMesh &m, SI e, const double *qx0, const double *qy0, int nq0, double ox, double oy, double sgn, DensSums &acc ) {
+    double ax[ 8 ], ay[ 8 ], bx[ 8 ], by[ 8 ];
+    int nq = nq0;
+    for ( int j = 0; j < nq; ++j ) { ax[ j ] = qx0[ j ]; ay[ j ] = qy0[ j ]; }
+    for ( int i = 0; i < 3 && nq >= 3; ++i ) {
+        int nn = 0;
+        double sj = mesh_lambda( m, e, i, ax[ 0 ], ay[ 0 ] );
+        for ( int j = 0; j < nq; ++j ) {
+            const int k = j + 1 < nq ? j + 1 : 0;
+            const double sk = mesh_lambda( m, e, i, ax[ k ], ay[ k ] );
+            if ( sj >= 0 ) { bx[ nn ] = ax[ j ]; by[ nn ] = ay[ j ]; ++nn; }
+            if ( ( sj >= 0 ) != ( sk >= 0 ) ) {
+                const double t = sj / ( sj - sk );
+                bx[ nn ] = ax[ j ] + t * ( ax[ k ] - ax[ j ] );
+                by[ nn ] = ay[ j ] + t * ( ay[ k ] - ay[ j ] );
+                ++nn;
+            }
+            sj = sk;
+        }
+        nq = nn;
+        for ( int j = 0; j < nq; ++j ) { ax[ j ] = bx[ j ]; ay[ j ] = by[ j ]; }
+    }
+    if ( nq < 3 )
+        return;
+
+    // the density: `f( x ) = v_0 + grad f . ( x - x_0 )`, `grad f = sum_i v_i G_i`
+    const int *t = m.tri + 3 * e;
+    const double x0 = m.px[ t[ 0 ] ], y0 = m.py[ t[ 0 ] ], v0 = m.val[ 3 * e ];
+    double gfx = 0, gfy = 0;
+    for ( int i = 0; i < 3; ++i ) {
+        gfx += m.val[ 3 * e + i ] * m.grad[ 6 * e + 2 * i ];
+        gfy += m.val[ 3 * e + i ] * m.grad[ 6 * e + 2 * i + 1 ];
+    }
+    for ( int j = 1; j + 1 < nq; ++j ) {
+        const int id[ 3 ] = { 0, j, j + 1 };
+        double X[ 3 ], Y[ 3 ], f[ 3 ];
+        for ( int c = 0; c < 3; ++c ) {
+            X[ c ] = ax[ id[ c ] ] - ox;
+            Y[ c ] = ay[ id[ c ] ] - oy;
+            f[ c ] = v0 + gfx * ( ax[ id[ c ] ] - x0 ) + gfy * ( ay[ id[ c ] ] - y0 );
+        }
+        const double T = sgn * 0.5 * ( ( X[ 1 ] - X[ 0 ] ) * ( Y[ 2 ] - Y[ 0 ] ) - ( X[ 2 ] - X[ 0 ] ) * ( Y[ 1 ] - Y[ 0 ] ) );
+        const double sf = f[ 0 ] + f[ 1 ] + f[ 2 ];
+        acc.m += T * sf / 3;
+        if constexpr ( MOM ) {
+            // `int lambda_i lambda_j = ( 1 + [ i == j ] ) |T| / 12`, `int lambda_i lambda_j lambda_k = ( 6, 2, 1 ) |T| / 60`
+            for ( int a = 0; a < 3; ++a ) {
+                acc.mx += T / 12 * X[ a ] * ( sf + f[ a ] );
+                acc.my += T / 12 * Y[ a ] * ( sf + f[ a ] );
+            }
+            double s2 = 0;
+            for ( int a = 0; a < 3; ++a )
+                for ( int b = 0; b < 3; ++b ) {
+                    const double ab = X[ a ] * X[ b ] + Y[ a ] * Y[ b ];
+                    for ( int c = 0; c < 3; ++c ) {
+                        const int same = ( a == b ) + ( b == c ) + ( a == c );
+                        s2 += ab * f[ c ] * ( same == 3 ? 6.0 : same == 1 ? 2.0 : 1.0 );
+                    }
+                }
+            acc.m2 += T / 60 * s2;
+        }
+    }
+}
+
+/// the hierarchy walked with the box `[ lo, hi ]`: `body( e )` for each triangle in a leaf it meets
+template<class F>
+__device__ __forceinline__ void mesh_walk( const DensMesh &m, double lox, double loy, double hix, double hiy, F &&body ) {
+    if ( m.nb == 0 )
+        return;
+    // the box a little WIDER: a triangle that only touches the region -- along a side it may own ( `mesh_owns` ) -- must not be
+    // lost to a rounding of the region's coordinates
+    const double mx = 1e-9 * ( hix - lox ) + 1e-12 * fmax( fabs( lox ), fabs( hix ) ), my = 1e-9 * ( hiy - loy ) + 1e-12 * fmax( fabs( loy ), fabs( hiy ) );
+    lox -= mx; hix += mx; loy -= my; hiy += my;
+    SI stack[ 64 ];
+    int top = 0;
+    stack[ top++ ] = 0;
+    while ( top ) {
+        const SI n = stack[ --top ];
+        if ( m.bhi[ 2 * n ] < lox || m.blo[ 2 * n ] > hix || m.bhi[ 2 * n + 1 ] < loy || m.blo[ 2 * n + 1 ] > hiy )
+            continue;
+        const int left = m.links[ 4 * n ];
+        if ( left >= 0 ) {
+            stack[ top++ ] = m.links[ 4 * n + 1 ];
+            stack[ top++ ] = left;
+            continue;
+        }
+        for ( SI e = m.links[ 4 * n + 2 ]; e < m.links[ 4 * n + 3 ]; ++e )
+            body( e );
+    }
+}
+
+/// THE TRIANGLE `( a, b, c )` ( the seed's frame, the seed at `( ox, oy )` ) against the mesh: its SIGNED share of the mass
+/// ( the sign of its orientation ) and, for `MOM`, of the moments about the seed, into `acc`
+template<bool MOM>
+__device__ __forceinline__ void mesh_triangle( const DensMesh &m, double ox, double oy, double Xa, double Ya, double Xb, double Yb, double Xc, double Yc, DensSums &acc ) {
+    double sgn = 1;
+    const double area2 = ( Xb - Xa ) * ( Yc - Ya ) - ( Xc - Xa ) * ( Yb - Ya );
+    if ( ! ( area2 != 0 ) )
+        return;
+    if ( area2 < 0 ) {
+        const double tx = Xb, ty = Yb;
+        Xb = Xc; Yb = Yc; Xc = tx; Yc = ty;
+        sgn = -1;
+    }
+    const double qx[ 3 ] = { ox + Xa, ox + Xb, ox + Xc }, qy[ 3 ] = { oy + Ya, oy + Yb, oy + Yc };
+    mesh_walk( m, fmin( qx[ 0 ], fmin( qx[ 1 ], qx[ 2 ] ) ), fmin( qy[ 0 ], fmin( qy[ 1 ], qy[ 2 ] ) ),
+                  fmax( qx[ 0 ], fmax( qx[ 1 ], qx[ 2 ] ) ), fmax( qy[ 0 ], fmax( qy[ 1 ], qy[ 2 ] ) ),
+               [&]( SI e ) { mesh_element<MOM>( m, e, qx, qy, 3, ox, oy, sgn, acc ); } );
+}
+
+/// WHO COUNTS AN EDGE THAT LIES ON A SIDE OF TRIANGLE `e` ( `Mesh.h::owns_facet`, the same rule ): the edge is held by the triangle
+/// across that side as well, and is counted once, decided on the NODES with one strict inequality -- a node is outside the edge's line
+/// when `n . x - off > 0`, inside otherwise, the normal in a canonical orientation. The triangle counts the edge iff the line separates
+/// its nodes: 1 or 0, never one half
+__device__ __forceinline__ bool mesh_owns( const DensMesh &m, SI e, double Ax, double Ay, double Bx, double By ) {
+    double nx = By - Ay, ny = Ax - Bx;                   // the normal of the line
+    const double nn = sqrt( nx * nx + ny * ny );
+    const double sg = fabs( nx ) > 1e-9 * nn ? ( nx < 0 ? -1.0 : 1.0 ) : ( ny < 0 ? -1.0 : 1.0 );
+    const double off = nx * Ax + ny * Ay;
+    double s[ 3 ], scale = fabs( off );
+    const int *t = m.tri + 3 * e;
+    for ( int i = 0; i < 3; ++i ) {
+        const double dot = nx * m.px[ t[ i ] ] + ny * m.py[ t[ i ] ];
+        s[ i ] = sg * ( dot - off );
+        scale = fmax( scale, fabs( dot ) );
+    }
+    const double tol = 1e-11 * scale;
+    bool out = false, in = false;
+    for ( int i = 0; i < 3; ++i ) {
+        out = out || s[ i ] > tol;
+        in  = in  || ! ( s[ i ] > tol );
+    }
+    return out && in;
+}
+
+/// `int rho ds` along the edge `a -> b` ( the seed's frame ): the segment cut by each triangle, `f` affine on each piece. An
+/// edge ON the boundary of two triangles ( on a mesh line ) is in both, and counted by one of them ( `mesh_owns` )
+__device__ __forceinline__ double mesh_line( const DensMesh &m, double ox, double oy, double ax, double ay, double bx, double by ) {
+    const double Ax = ox + ax, Ay = oy + ay, Bx = ox + bx, By = oy + by;
+    const double L = sqrt( ( bx - ax ) * ( bx - ax ) + ( by - ay ) * ( by - ay ) );
+    if ( ! ( L > 0 ) )
+        return 0;
+    const double eps = 1e-10;
+    double res = 0;
+    mesh_walk( m, fmin( Ax, Bx ), fmin( Ay, By ), fmax( Ax, Bx ), fmax( Ay, By ), [&]( SI e ) {
+        double t0 = 0, t1 = 1, w = 1;
+        for ( int i = 0; i < 3 && t0 < t1; ++i ) {
+            const double sa = mesh_lambda( m, e, i, Ax, Ay ), sb = mesh_lambda( m, e, i, Bx, By );
+            if ( sa < 0 && sb < 0 ) { t1 = t0; break; }
+            if ( fabs( sa ) < eps && fabs( sb ) < eps ) w = mesh_owns( m, e, Ax, Ay, Bx, By ) ? 1.0 : 0.0;   // the segment is on this side
+            else if ( sa < 0 )  t0 = fmax( t0, sa / ( sa - sb ) );
+            else if ( sb < 0 )  t1 = fmin( t1, sa / ( sa - sb ) );
+        }
+        if ( ! ( t1 > t0 ) )
+            return;
+        const int *t = m.tri + 3 * e;
+        const double x0 = m.px[ t[ 0 ] ], y0 = m.py[ t[ 0 ] ];
+        double gfx = 0, gfy = 0;
+        for ( int i = 0; i < 3; ++i ) {
+            gfx += m.val[ 3 * e + i ] * m.grad[ 6 * e + 2 * i ];
+            gfy += m.val[ 3 * e + i ] * m.grad[ 6 * e + 2 * i + 1 ];
+        }
+        const double fa = m.val[ 3 * e ] + gfx * ( Ax + t0 * ( Bx - Ax ) - x0 ) + gfy * ( Ay + t0 * ( By - Ay ) - y0 );
+        const double fb = m.val[ 3 * e ] + gfx * ( Ax + t1 * ( Bx - Ax ) - x0 ) + gfy * ( Ay + t1 * ( By - Ay ) - y0 );
+        res += w * L * ( t1 - t0 ) * 0.5 * ( fa + fb );
+    } );
+    return res;
+}
+
 // ---- the dispatch: one edge of a cell, whatever the density ------------------------------------------------------------
 
 /// what a cell keeps from one edge to the next ( the image's references )
 template<class D> struct DensState {};
 template<> struct DensState<DensImage> { ImageRefs ref; };
+/// the mesh: the first vertex of the cell, the apex of the fan of triangles that its mass is made of
+template<> struct DensState<DensMesh> { double x0 = 0, y0 = 0; bool set = false; };
 
 /// ONE EDGE of a FROZEN cell ( the step ) of the seed `( ox, oy )`, `a -> b` in the seed's frame: its SIGNED share of the mass
 /// ( counterclockwise positive: a cell that turns inside out weighs less than nothing )
@@ -275,6 +472,9 @@ __device__ __forceinline__ void density_edge_mass( const D &dens, DensState<D> &
     if constexpr ( std::is_same_v<D,DensImage> ) {
         const double Ox = ox - dens.x0, Oy = oy - dens.y0;
         image_edge<false>( dens, st.ref, Ox + ax, Oy + ay, Ox + bx, Oy + by, acc );
+    } else if constexpr ( std::is_same_v<D,DensMesh> ) {
+        if ( ! st.set ) { st.x0 = ax; st.y0 = ay; st.set = true; }
+        mesh_triangle<false>( dens, ox, oy, st.x0, st.y0, ax, ay, bx, by, acc );
     } else
         acc.m += gauss_corners( dens, ox, oy, ax, ay, bx, by );
 }

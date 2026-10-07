@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <stdexcept>
 #include <tuple>
 
 #if __has_include( <amgcl/make_solver.hpp> )
@@ -155,9 +156,18 @@ struct Amg : LinearSolver {
         using SaSpai = amgcl::make_solver<amgcl::amg<Back, amgcl::coarsening::smoothed_aggregation, amgcl::relaxation::spai0>, amgcl::solver::cg<Back>>;
         using SaGs   = amgcl::make_solver<amgcl::amg<Back, amgcl::coarsening::smoothed_aggregation, amgcl::relaxation::gauss_seidel>, amgcl::solver::cg<Back>>;
         using RsGs   = amgcl::make_solver<amgcl::amg<Back, amgcl::coarsening::ruge_stuben, amgcl::relaxation::gauss_seidel>, amgcl::solver::cg<Back>>;
-        if      ( variant == SA_GS ) launch( std::type_identity<SaGs>{} );
-        else if ( variant == RS_GS ) launch( std::type_identity<RsGs>{} );
-        else                          launch( std::type_identity<SaSpai>{} );
+        // AMGCL THROWS where the others say `false`: a singular system ( a facet graph split into components, each one
+        // without the gauge being a singular block -- a kept start that empties cells of a density zero on most of its
+        // domain ) reaches the direct solver of the coarsest level, whose LU stops on a zero pivot ( `precondition`,
+        // "Zero sum in skyline_lu factorization" ). Through the FFI call it would be a crash instead of a status.
+        try {
+            if      ( variant == SA_GS ) launch( std::type_identity<SaGs>{} );
+            else if ( variant == RS_GS ) launch( std::type_identity<RsGs>{} );
+            else                          launch( std::type_identity<SaSpai>{} );
+        } catch ( const std::exception & ) {
+            st.t_res += now() - t1;
+            return false;
+        }
         st.nb_iter += it;
         st.worst = std::max( st.worst, err );
 

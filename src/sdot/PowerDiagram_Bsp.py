@@ -28,7 +28,7 @@ ordinary path at compile time.
 import numpy as np
 
 import loom
-from loom.drivers.driver import driver
+import loom
 from loom.compilation.FfiCode import FfiCode
 from loom.tensor import Axis, IntTensor, RealTensor, ShapeVar
 from loom.util import Aggregate
@@ -95,7 +95,7 @@ class PowerDiagram_Bsp( PowerDiagram ):
         if produced is None:
             return
         nbrs, counts = produced
-        if driver.is_traced( counts.raw ):          # under a trace: keep the previous memories
+        if loom.is_traced( counts.raw ):          # under a trace: keep the previous memories
             return
         self.memo_nbrs = nbrs.raw
         self.memo_counts = counts.raw
@@ -142,7 +142,15 @@ class PowerDiagram_Bsp( PowerDiagram ):
         if self.distribution is None:
             return 1.0
         from .distributions.Image import Image
+        from .distributions.Polytope import Polytope
         dist = self.distribution
+        if isinstance( dist, Polytope ):
+            # a constant on the polytope, which the domain of this diagram already is ( its support is added to the boundaries ):
+            # the cells are inside it, and the card integrates a constant
+            try:
+                return float( np.asarray( dist.density ).reshape( -1 )[ 0 ] )
+            except ( TypeError, ValueError, RuntimeError ):     # a traced density: the generic path
+                return None
         if not isinstance( dist, Image ):
             return None
         try:
@@ -171,9 +179,10 @@ class PowerDiagram_Bsp( PowerDiagram ):
             return False
         if self.dim_count not in ( 2, 3 ) or self.memo_counts.is_defined:
             return False
-        if not getattr( driver.device, "is_cuda_gpu", False ):
+        if not getattr( loom.resolved_device(), "is_cuda_gpu", False ):
             return False
-        return self.box_min.is_defined and not self.bnd_directions.is_defined
+        # a box, and other half-spaces ( a convex polygon or polyhedron: `Cuts` of `gpu/Cell2D.cuh`, `gpu/Cell3D.cuh` )
+        return self.box_min.is_defined
 
     def _card_variant( self ):
         """`( C++ variant, density )` of the dedicated kernel for this diagram, or `None` ( the generic path ) --
@@ -202,7 +211,19 @@ class PowerDiagram_Bsp( PowerDiagram ):
         rho = self._card_density()
         dist = self.distribution
         from .distributions.Image import Image
+        from .distributions.Mesh import Mesh
         from .distributions.SumOfGaussians import SumOfGaussians
+        if isinstance( dist, Mesh ):
+            # a triangle mesh in 2D, a tetrahedral one in 3D: the card clips the cells' triangles ( `Density2D.cuh::DensMesh` ) or the
+            # tetrahedra of their fans ( `Density3D.cuh::DensMesh3` ) against its elements; nothing to convolve. The tensors are the
+            # backend's, traced or not
+            d = self.dim_count
+            if d not in ( 2, 3 ) or int( dist.simplices.shape[ 1 ] ) != d + 1 or dist.batch_axes:
+                return None
+            E = int( dist.simplices.shape[ 0 ] )
+            return dict( kind = "mesh", conv_possible = False, min_scale = 0.0, nodes = dist.nodes.raw, values = dist.values.raw,
+                         tri = dist.simplices.raw, grad = dist.grads.raw.reshape( E, d * ( d + 1 ) ), lo = dist.bvh_lo.raw, hi = dist.bvh_hi.raw,
+                         links = dist.bvh_links.raw )
         if rho is not None:
             res = dict( kind = "const", rho = rho, conv_possible = isinstance( dist, Image ), min_scale = 0.0 )
             if isinstance( dist, Image ):
@@ -374,7 +395,7 @@ class PowerDiagram_Bsp( PowerDiagram ):
         return ( expr + " )", { n: loom.out( t ) for n, t in args.items() }, args )
 
     def _solver_weights_after( self, produced ):
-        # the TENSORS, whose storage is adopted as it is ( a buffer would go through `driver.array`, which brings a concrete
+        # the TENSORS, whose storage is adopted as it is ( a buffer would go through `loom.array`, which brings a concrete
         # device array back to the host )
         self.sorted_weights = produced[ "sorted_weights_out" ]
         self.tree.node_wa = produced[ "node_wa_out" ]
@@ -394,7 +415,7 @@ def card_cells_enabled( flag = True ):
     import os
     if not flag or os.environ.get( "SDOT_CARD_CELLS", "1" ).lower() in ( "0", "no", "false", "off" ):
         return False
-    return bool( getattr( driver.device, "is_cuda_gpu", False ) )
+    return bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
 
 
 def card_variant_for( kernel_fp_size, nb_seeds, nb_nodes, dim = 2 ):

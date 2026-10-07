@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING, cast, overload
 
+import numpy as np
 from loom.tensor import CtShapeVar
 from loom.tensor import ShapeVar
 from loom.tensor import AxisList
@@ -34,7 +35,12 @@ class SumOfDiracs( Distribution ):
     def __init__( self, positions, weights = None, target_mass = 1.0, **kwargs ):
         self.__base_init__( positions = positions, weights = weights, target_mass = target_mass, **kwargs )
 
-    def normalized_version( self ):
+    def add_to_viz( self, viz, color = "#d62728", **kwargs ):
+        """The diracs, as points."""
+        viz.add_points( np.asarray( self.positions ), color = color )
+        return viz
+
+    def normalized_version( self, nb_dims = None ):
         # update mass
         mass = self.mass
 

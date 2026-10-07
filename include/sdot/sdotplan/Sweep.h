@@ -32,6 +32,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 #include <vector>
 
 namespace sdot {
@@ -75,25 +78,45 @@ bool measure_and_facets( const PD &pd, SI k, Local &c, Local &piece, const auto 
     // by piece ( a piece carries the same identifiers, plus those of its box )
     c.tidy();
     const int nc = c.nb_cuts();
-    double vals[ 512 ];
-    if ( nc > 512 )
-        return false;
+    // a cell can have MANY neighbours ( the seed off a line of 1000 collinear seeds has one facet per seed of the line ): the
+    // stack covers the usual ones, the heap the others. It must NOT be reported as a scratch overflow: more room would not
+    // help, and `measures` would double the scratch for ever
+    double stack_vals[ 512 ];
+    std::vector<double> heap_vals;
+    double *vals = stack_vals;
+    if ( nc > 512 ) {
+        heap_vals.resize( nc );
+        vals = heap_vals.data();
+    }
     for ( int q = 0; q < nc; ++q )
         vals[ q ] = 0;
     PieceWorkspace<Local> ws{ piece };
-    dist.for_each_piece( c, ws, [&]( const auto &pc, const auto &dens ) {
-        pc.template for_each_facet<TF>( [&]( int cut, TF mes ) {
-            const int id = pc.cid[ cut ];
-            if ( id < 0 )
-                return;                                  // the domain, or a box edge : immobile
-            const double val = density_facet_mass( dens, pc, cut, double( mes ) );
-            for ( int q = 0; q < nc; ++q )
-                if ( c.cid[ q ] == id ) {
-                    vals[ q ] += val;
-                    break;
-                }
+    auto plane_of = [&]( int q, auto *dir, auto &off ) {
+        typename PD::TF d[ D ], o;
+        diagram::plane_of( pd, c, k, q, d, o );
+        for ( int i = 0; i < D; ++i )
+            dir[ i ] = d[ i ];
+        off = o;
+    };
+    if constexpr ( requires { DECAYED_TYPE_OF( dist )::cuts_facets; } ) {
+        // a density that cuts the FACETS of the cell itself ( `Mesh` ): what the pieces would miss -- an element on the far side of
+        // a facet that lies on its side -- is not lost
+        dist.for_each_facet_mass( c, plane_of, [&]( int cut, auto part ) { vals[ cut ] += double( part ); } );
+    } else {
+        dist.for_each_piece( c, ws, [&]( const auto &pc, const auto &dens ) {
+            pc.template for_each_facet<TF>( [&]( int cut, TF mes ) {
+                const int id = pc.cid[ cut ];
+                if ( id < 0 )
+                    return;                                  // the domain, or a box edge : immobile
+                const double val = density_facet_mass( dens, pc, cut, double( mes ) );
+                for ( int q = 0; q < nc; ++q )
+                    if ( c.cid[ q ] == id ) {
+                        vals[ q ] += val;
+                        break;
+                    }
+            } );
         } );
-    } );
+    }
     if ( ws.overflow )
         return false;
 
@@ -168,6 +191,21 @@ struct Sweep {
             s.assign( size_t( words ) + 16, 0 );
     }
 
+    /// `resize_scratch` after a doubling of `cap` -- which has to end: a cell that fails for another reason than the room
+    /// would otherwise double the scratch until the memory of the machine is gone, with nothing said ( the trace
+    /// included, since it would never reach the first stage ). The limit is the machine's: half of its physical memory.
+    void grow_scratch() {
+        resize_scratch();
+        const double bytes = double( words ) * 4.0 * double( scratch.size() );
+        const double ram = double( sysconf( _SC_PHYS_PAGES ) ) * double( sysconf( _SC_PAGESIZE ) );
+        if ( ram > 0 && bytes > 0.5 * ram ) {
+            std::fprintf( stderr, "sdotplan: the scratch of the cells reached %.1f GiB ( %lld vertices per cell ), more than half of the "
+                                  "memory of the machine, and a cell still does not fit -- giving up\n",
+                          bytes / double( 1 << 30 ), ( long long ) cap );
+            std::abort();
+        }
+    }
+
     /// one contiguous slice of `[ 0, n )` per thread
     static void thread_range( SI n, int t, int nt, SI &b, SI &e ) {
         b = SI( ( long long ) t * n / nt );
@@ -240,7 +278,7 @@ struct Sweep {
             if ( ! overflowed )
                 break;
             cap *= 2;
-            resize_scratch();
+            grow_scratch();
             ++nb_overflowed;
         }
         if ( fa ) {
@@ -311,7 +349,7 @@ struct Sweep {
             if ( ! overflowed )
                 break;
             cap *= 2;
-            resize_scratch();
+            grow_scratch();
             ++nb_overflowed;
         }
         cost = 0;

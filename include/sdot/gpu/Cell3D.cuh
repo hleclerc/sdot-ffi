@@ -61,6 +61,7 @@
 // =====================================================================================
 
 #include "Laplacian2D.cuh"
+#include "Density3D.cuh"
 #include <climits>
 
 namespace sdot::gpu3d {
@@ -71,11 +72,13 @@ using gpu2d::Strided;
 using gpu2d::StridedOut;
 using gpu2d::strided;
 using gpu2d::strided_out;
+using gpu2d::Cuts;
 using gpu2d::take;
 using gpu2d::blocks_for;
 using gpu2d::TFOf;
 using gpu2d::TIOf;
 using gpu2d::ERROR_KIND_FAILURE;
+using gpu2d::DensConst;
 
 /// the variant, the same parameters as in 2D ( `PowerDiagram_Bsp.card_variant_for` )
 template<class TK,class TR,class TN,int MAX_HEIGHT> using Variant = gpu2d::Variant<TK,TR,TN,MAX_HEIGHT>;
@@ -257,16 +260,20 @@ __device__ __forceinline__ float proximity( const Box &b, const SeedF &f ) {
 
 // ---- what a kernel receives ---------------------------------------------------------------------------------------
 
-/// EVERYTHING A CELL READS AND WRITES, by value ( kernel parameters )
-template<class _V,class TF,class TI,bool _W,unsigned _OUT>
+/// EVERYTHING A CELL READS AND WRITES, by value ( kernel parameters ). `D`: the density, `DensConst` ( `rho` ) or a tetrahedral
+/// mesh ( `Density3D.cuh::DensMesh3` )
+template<class _V,class TF,class TI,bool _W,unsigned _OUT,class _D = DensConst>
 struct Problem {
     using V     = _V;
     using TK    = typename V::TK;
     using TR    = typename V::TR;
     using TN    = typename V::TN;
     using SeedT = Seed<TK>;
+    using D     = _D;
     static constexpr bool     W   = _W;
     static constexpr unsigned OUT = _OUT;
+    static constexpr bool     CONST_DENSITY = std::is_same_v<D,DensConst>;
+    static_assert( CONST_DENSITY || ! ( OUT & VJP ), "the adjoint of the card's 3D cells is written for a constant density" );
 
     // ---- the diagram
     const Node<W,TR> *nodes;                             ///< in float for both kernels
@@ -274,11 +281,13 @@ struct Problem {
     Strided<TF,2>     pos64;                             ///< the seeds as given, `[ n, 3 ]`, tree order
     Strided<TF,1>     w64;                               ///< the weights as given ( W only )
     Strided<TF,1>     box_min, box_max;                  ///< the domain
+    Cuts<TF>          cuts;                              ///< ... and its other half-spaces ( a convex polytope ), identifiers `-7 - j`
     Strided<TI,1>     ids;                               ///< rank -> the user's index
     TR                n;
     int               depth;
     double            rho;                               ///< the ( constant ) density, if `rho_dev` is null
     const TF         *rho_dev;                           ///< ... or read on the card
+    [[no_unique_address]] D dens;                        ///< ... or a density ( `Density3D.cuh` ), integrated on the fans
     bool              user_order;                        ///< per-cell outputs at the user's index ( else at the rank )
     bool              only_global;                       ///< every cell through the global pass ( `SDOT_CARD_GLOBAL_ONLY=1`, a test )
 
@@ -438,6 +447,32 @@ struct RegCell {
             x[ s ] = y[ s ] = z[ s ] = TK( 0 );
             k[ s ] = nn[ s ] = 0;
             cid[ s ] = TR( 0 );
+        }
+    }
+
+    /// THE START POLYHEDRON of the domain ( `Cuts`: `StartCell.py` ) instead of the box: vertex `v` on lane `v % 32` of slot
+    /// `v / 32`, its three facets and three neighbours as the box gives them, facet `f` the cut `-7 - f`. More than the
+    /// registers hold: `state = CUT_OVERFLOW`, the later passes have room
+    template<class Cu>
+    __device__ __forceinline__ void init_start( const Cu &cuts, double px, double py, double pz ) {
+        const int m = cuts.nsv, nf = cuts.nb;
+        nv = m;
+        nc = nf;
+        if ( m > CAP || nf > CAP ) {
+            state = CUT_OVERFLOW;
+            return;
+        }
+#pragma unroll
+        for ( int s = 0; s < S; ++s ) {
+            const int v = s * 32 + lane;
+            const bool in = v < m;
+            const int u = in ? v : 0;
+            x[ s ] = in ? TK( double( cuts.sv( u, 0 ) ) - px ) : TK( 0 );
+            y[ s ] = in ? TK( double( cuts.sv( u, 1 ) ) - py ) : TK( 0 );
+            z[ s ] = in ? TK( double( cuts.sv( u, 2 ) ) - pz ) : TK( 0 );
+            k[ s ] = in ? word3( int( cuts.topo( u, 0 ) ), int( cuts.topo( u, 1 ) ), int( cuts.topo( u, 2 ) ) ) : 0u;
+            nn[ s ] = in ? word3( int( cuts.topo( u, 3 ) ), int( cuts.topo( u, 4 ) ), int( cuts.topo( u, 5 ) ) ) : 0u;
+            cid[ s ] = v < nf ? TR( -7 - v ) : TR( 0 );
         }
     }
 
@@ -751,6 +786,31 @@ struct MemCell {
         __syncwarp();
     }
 
+    /// the start polyhedron ( see `RegCell::init_start` ); more than the slot holds: `state = CUT_OVERFLOW`
+    template<class Cu>
+    __device__ __forceinline__ void init_start( const Cu &cuts, double px, double py, double pz ) {
+        const int m = cuts.nsv, nf = cuts.nb;
+        nv = m;
+        nc = nf;
+        if ( m > capv || nf > capc ) {
+            state = CUT_OVERFLOW;
+            __syncwarp();
+            return;
+        }
+        for ( int v = lane; v < m; v += 32 ) {
+            X[ 0 ][ v ] = TK( double( cuts.sv( v, 0 ) ) - px );
+            Y[ 0 ][ v ] = TK( double( cuts.sv( v, 1 ) ) - py );
+            Z[ 0 ][ v ] = TK( double( cuts.sv( v, 2 ) ) - pz );
+            for ( int j = 0; j < 3; ++j ) {
+                K[ 0 ][ 3 * v + j ] = int( cuts.topo( v, j ) );
+                N[ 0 ][ 3 * v + j ] = int( cuts.topo( v, 3 + j ) );
+            }
+        }
+        for ( int f = lane; f < nf; f += 32 )
+            cid[ f ] = TR( -7 - f );
+        __syncwarp();
+    }
+
     template<bool W>
     __device__ __forceinline__ bool may_be_cut_by( const CBox &B ) const {
         bool res = false;
@@ -1042,6 +1102,14 @@ __device__ __forceinline__ void plane64( const Pb &pb, const Origin &o, typename
         pl[ 0 ] = nx; pl[ 1 ] = ny; pl[ 2 ] = nz; pl[ 3 ] = off;
         return;
     }
+    if ( cid <= typename Pb::TR( -7 ) ) {                // a cut of the domain ( `Cuts` )
+        const int j = int( -7 - cid );
+        pl[ 0 ] = double( pb.cuts.dir( j, 0 ) );
+        pl[ 1 ] = double( pb.cuts.dir( j, 1 ) );
+        pl[ 2 ] = double( pb.cuts.dir( j, 2 ) );
+        pl[ 3 ] = double( pb.cuts.off( j ) ) - pl[ 0 ] * o.x - pl[ 1 ] * o.y - pl[ 2 ] * o.z;
+        return;
+    }
     const int f = int( -1 - cid ), ax = f >> 1, hi = f & 1;
     pl[ 0 ] = ax == 0 ? ( hi ? 1.0 : -1.0 ) : 0.0;
     pl[ 1 ] = ax == 1 ? ( hi ? 1.0 : -1.0 ) : 0.0;
@@ -1116,7 +1184,8 @@ __device__ __forceinline__ void finish_warp( const Pb &pb, typename Pb::TR k, co
     using TF = std::remove_reference_t<decltype( pb.res( 0 ) )>;
     constexpr unsigned OUT = Pb::OUT;
     constexpr bool FAC = OUT & FACETS, ADJ = OUT & VJP, MOM = OUT & MOMENTS;
-    const double rho = pb.density();
+    constexpr bool DENS = ! Pb::CONST_DENSITY;
+    const double rho = DENS ? 1.0 : pb.density();
 
     double gx = 0, gy = 0, gz = 0;
     for ( int i = lane; i < c.nv; i += 32 ) { gx += c.vx[ i ]; gy += c.vy[ i ]; gz += c.vz[ i ]; }
@@ -1171,6 +1240,93 @@ __device__ __forceinline__ void finish_warp( const Pb &pb, typename Pb::TR k, co
     }
 
     double vol = 0, m1x = 0, m1y = 0, m1z = 0, m2 = 0, gw = 0, gpx = 0, gpy = 0, gpz = 0;
+    // A DENSITY ( `Density3D.cuh` ): the elements near the cell, shared by the lanes, give the cell's sums ( mass, moments about
+    // the seed ) and the integrals on its planes -- reduced over the warp, the plane `j` kept by the lane `j % 32` for its facet
+    gpu3d::DensSums3 dtot;
+    constexpr int FL = DENS && FAC ? 128 : 32;           ///< the planes whose facets take a density ( more: a cell of the global pass )
+    double fmine[ FL / 32 ] = {};
+    if constexpr ( DENS ) {
+        double lo[ 3 ] = { 1e300, 1e300, 1e300 }, hi[ 3 ] = { -1e300, -1e300, -1e300 };
+        for ( int i = lane; i < c.nv; i += 32 ) {
+            lo[ 0 ] = fmin( lo[ 0 ], c.vx[ i ] ); hi[ 0 ] = fmax( hi[ 0 ], c.vx[ i ] );
+            lo[ 1 ] = fmin( lo[ 1 ], c.vy[ i ] ); hi[ 1 ] = fmax( hi[ 1 ], c.vy[ i ] );
+            lo[ 2 ] = fmin( lo[ 2 ], c.vz[ i ] ); hi[ 2 ] = fmax( hi[ 2 ], c.vz[ i ] );
+        }
+#pragma unroll
+        for ( int d = 16; d; d >>= 1 )
+            for ( int a = 0; a < 3; ++a ) {
+                lo[ a ] = fmin( lo[ a ], __shfl_xor_sync( FULL, lo[ a ], d ) );
+                hi[ a ] = fmax( hi[ a ], __shfl_xor_sync( FULL, hi[ a ], d ) );
+            }
+        const int nfl = c.nc < FL ? c.nc : FL;
+        // the planes that carry a face ( a bit per plane, the same on every lane; past `32 FM` planes, all of them )
+        constexpr int FM = 8;
+        unsigned fmask[ FM ];
+        for ( int q = 0; q < FM; ++q ) {
+            bool has = false;
+            const int f = 32 * q + lane;
+            if ( f < c.nc ) {
+                int v0, cnt;
+                face_of( f, v0, cnt );
+                has = v0 != INT_MAX;
+            }
+            fmask[ q ] = __ballot_sync( FULL, has );
+        }
+        auto has_face = [&]( int j ) { return j >= 32 * FM || ( ( fmask[ j >> 5 ] >> ( j & 31 ) ) & 1u ); };
+        double fl[ FAC ? FL : 1 ];
+        if constexpr ( FAC )
+            for ( int j = 0; j < nfl; ++j ) fl[ j ] = 0;
+        if ( c.nv > 0 ) {
+            const double O[ 3 ] = { o.x, o.y, o.z }, G[ 3 ] = { gx, gy, gz };
+            const double L = fmax( hi[ 0 ] - lo[ 0 ], fmax( hi[ 1 ] - lo[ 1 ], hi[ 2 ] - lo[ 2 ] ) );
+            // the face `f` of the cell as one polygon, outward ( `false`: several cycles, or too many vertices )
+            auto face = [&]( int f, auto &P ) {
+                P.n = 0;
+                int v0, cnt;
+                face_of( f, v0, cnt );
+                if ( v0 == INT_MAX )
+                    return true;                         // ( no face: nothing on that plane )
+                if ( cnt > 28 )
+                    return false;
+                const int io = cut_slot( c.topo, v0, f );
+                int prev = v0, at = c.topo.nbr( v0, io == 0 ? 1 : 0 ), seen = 2;
+                P.push( c.vx[ v0 ], c.vy[ v0 ], c.vz[ v0 ] );
+                P.push( c.vx[ at ], c.vy[ at ], c.vz[ at ] );
+                for ( int step = 0; step < c.nv; ++step ) {
+                    const int i1 = cut_slot( c.topo, at, f ), e = nbr_slot( c.topo, at, prev );
+                    const int nxt = c.topo.nbr( at, 3 - i1 - e );
+                    if ( nxt == v0 )
+                        break;
+                    P.push( c.vx[ nxt ], c.vy[ nxt ], c.vz[ nxt ] );
+                    ++seen;
+                    prev = at;
+                    at = nxt;
+                }
+                if ( seen != cnt )
+                    return false;
+                // outward: the normal of the polygon ( Newell ) along the plane's
+                double nn = 0;
+                for ( int a = 0; a < P.n; ++a ) {
+                    const int b = a + 1 < P.n ? a + 1 : 0;
+                    nn += c.pl[ 4 * f ] * ( P.y[ a ] - P.y[ b ] ) * ( P.z[ a ] + P.z[ b ] ) + c.pl[ 4 * f + 1 ] * ( P.z[ a ] - P.z[ b ] ) * ( P.x[ a ] + P.x[ b ] )
+                        + c.pl[ 4 * f + 2 ] * ( P.x[ a ] - P.x[ b ] ) * ( P.y[ a ] + P.y[ b ] );
+                }
+                if ( nn < 0 )
+                    for ( int a = 1, b = P.n - 1; a < b; ++a, --b ) {
+                        const double tx = P.x[ a ], ty = P.y[ a ], tz = P.z[ a ];
+                        P.x[ a ] = P.x[ b ]; P.y[ a ] = P.y[ b ]; P.z[ a ] = P.z[ b ];
+                        P.x[ b ] = tx; P.y[ b ] = ty; P.z[ b ] = tz;
+                    }
+                return true;
+            };
+            gpu3d::mesh3_cell<MOM,FAC,FAC ? FL : 0>( pb.dens, O, G, c.pl, c.nc, lo, hi, L, lane, dtot, fl, face, has_face );
+        }
+        if constexpr ( FAC )
+            for ( int j = 0; j < nfl; ++j ) {
+                const double v = warp_sum( fl[ j ] );
+                if ( ( j & 31 ) == lane ) fmine[ j >> 5 ] = v;
+            }
+    }
     unsigned t = 0;
     for ( int f = lane; f < c.nc; f += 32 ) {
         int v0, cntf;
@@ -1251,7 +1407,8 @@ __device__ __forceinline__ void finish_warp( const Pb &pb, typename Pb::TR k, co
             const TR j = c.cid[ f ];
             if ( j >= 0 ) {
                 const double n2 = nx * nx + ny * ny + nz * nz;
-                const double coef = n2 > 0 ? rho * fabs( fw ) / ( 4 * n2 ) : 0.0;   // rho |facet| / ( 2 |p_k - p_j| )
+                // rho |facet| / ( 2 |p_k - p_j| ), or with a density `int rho dA / ( 2 |p_k - p_j| )`
+                const double coef = ! ( n2 > 0 ) ? 0.0 : DENS ? ( f < FL ? fabs( fmine[ f >> 5 ] ) : 0.0 ) / ( 2 * sqrt( n2 ) ) : rho * fabs( fw ) / ( 4 * n2 );
                 if constexpr ( FAC ) {
                     if ( j > k && fok ) {
                         const unsigned long long q = fbase + t++;
@@ -1276,6 +1433,14 @@ __device__ __forceinline__ void finish_warp( const Pb &pb, typename Pb::TR k, co
     if constexpr ( MOM ) {
         m1x = warp_sum( m1x ) / 24; m1y = warp_sum( m1y ) / 24; m1z = warp_sum( m1z ) / 24;
         m2 = warp_sum( m2 ) / 60;
+    }
+    if constexpr ( DENS ) {
+        // the density's sums take the place of the constant's: the mass, `int ( x - p ) rho` ( the barycentre ), the cost
+        vol = warp_sum( dtot.m );
+        if constexpr ( MOM ) {
+            m1x = warp_sum( dtot.mx ); m1y = warp_sum( dtot.my ); m1z = warp_sum( dtot.mz );
+            m2 = warp_sum( dtot.m2 );
+        }
     }
     if constexpr ( ADJ ) {
         gw = warp_sum( gw );
@@ -1422,6 +1587,41 @@ __device__ __forceinline__ void start3( const Pb &pb, typename Pb::TR k, typenam
     }
 }
 
+/// THE DOMAIN'S OTHER CUTS ( `Cuts` ), before the walk: the box is cut by each half-space, identifier `-7 - j`. `false` when the cell
+/// is empty or overflowed past them ( `state` says which; nothing to walk )
+template<class Pb,class Cell>
+__device__ __forceinline__ bool domain_cuts3( const Pb &pb, typename Pb::TR k, Cell &cell ) {
+    using TK = typename Pb::TK;
+    using TR = typename Pb::TR;
+    const double px = double( pb.pos64( k, 0 ) ), py = double( pb.pos64( k, 1 ) ), pz = double( pb.pos64( k, 2 ) );
+    for ( int j = 0; j < pb.cuts.nb; ++j ) {
+        const double nx = double( pb.cuts.dir( j, 0 ) ), ny = double( pb.cuts.dir( j, 1 ) ), nz = double( pb.cuts.dir( j, 2 ) );
+        Plane<TK> P;
+        P.dx = TK( nx );
+        P.dy = TK( ny );
+        P.dz = TK( nz );
+        P.off = TK( double( pb.cuts.off( j ) ) - nx * px - ny * py - nz * pz );
+        widen( P, cell.L );
+        const int r = cell.cut( P, TR( -7 - j ) );
+        if ( r == CUT_EMPTY || r == CUT_OVERFLOW || r == CUT_BROKEN ) {
+            cell.state = r;
+            return false;
+        }
+    }
+    return true;
+}
+
+/// THE DOMAIN, after the box `init`: the polyhedron that starts the cells, if there is one, else the cuts on the box.
+/// `false` when there is nothing to walk ( `state` says why )
+template<class Pb,class Cell>
+__device__ __forceinline__ bool start_or_cut3( const Pb &pb, typename Pb::TR k, Cell &cell ) {
+    if ( pb.cuts.nsv > 0 ) {
+        cell.init_start( pb.cuts, double( pb.pos64( k, 0 ) ), double( pb.pos64( k, 1 ) ), double( pb.pos64( k, 2 ) ) );
+        return cell.state != CUT_OVERFLOW;
+    }
+    return domain_cuts3( pb, k, cell );
+}
+
 /// a register pass: the cells `list[ i ]` ( or `i` without a list ), `i < count`, one per warp, the warps striding;
 /// a cell that overflows `32 S` vertices goes to `ovf`
 template<class Pb,int S>
@@ -1443,7 +1643,8 @@ __device__ __forceinline__ void reg_cells( const Pb &pb, const typename Pb::TR *
         start3( pb, k, b );
         RegCell<TK,TR,S> cell;
         cell.init( lane, b );
-        walk3( pb, f, cell );
+        if ( start_or_cut3( pb, k, cell ) )
+            walk3( pb, f, cell );
         if ( cell.state == CUT_OVERFLOW ) {
             if ( lane == 0 )
                 ovf[ atomicAdd( &pb.counters->ovf[ ovf_counter ], 1ull ) ] = k;
@@ -1489,7 +1690,8 @@ __global__ void __launch_bounds__( BLOCK ) third_pass( Pb pb, const typename Pb:
         MemCell<TK,TR> cell;
         cell.attach( mine, capv, capc );
         cell.init( lane, b );
-        walk3( pb, f, cell );
+        if ( start_or_cut3( pb, k, cell ) )
+            walk3( pb, f, cell );
         if ( cell.state == CUT_OVERFLOW || cell.state == CUT_BROKEN ) {
             if ( lane == 0 ) {
                 failed3( pb, k );
@@ -1606,9 +1808,9 @@ struct CardShare3 {
 /// THE DIAGRAM ON THE CARD, for one call: the kernel's tree and seeds, the lists and counters of the passes, the slots of
 /// the third pass. `prepare` takes it all from the call's allocator and fills the tree and the seeds; `run` launches the
 /// passes ( everything `pb` points to as outputs is the caller's ). Nothing is read back ( but with `SDOT_CARD_STATS=1` ).
-template<class V,bool W,unsigned OUT,class TF,class TI>
+template<class V,bool W,unsigned OUT,class TF,class TI,class D = DensConst>
 struct Card {
-    using Pb    = Problem<V,TF,TI,W,OUT>;
+    using Pb    = Problem<V,TF,TI,W,OUT,D>;
     using TK    = typename V::TK;
     using TR    = typename V::TR;
     using SeedT = typename Pb::SeedT;
@@ -1621,7 +1823,7 @@ struct Card {
 
     /// `false`: the pool said no ( `allocator.failed` is reported )
     bool prepare( const CudaQueue &queue, const auto &pd, auto &allocator, int max_vertices, int overflow_warps ) {
-        return prepare( queue, pd, allocator, Slots::sized( SI( pd.nb_seeds() ), overflow_warps, max_vertices ) );
+        return prepare( queue, pd, allocator, Slots::sized( SI( pd.nb_seeds() ) + gpu2d::start_count( pd ), overflow_warps, max_vertices ) );
     }
 
     /// `slots_`: the third pass's slots, already taken ( shared with another card of the call: they must hold this card's
@@ -1657,6 +1859,7 @@ struct Card {
             pb.w64 = strided( pd.sorted_weights );
         pb.box_min = strided( pd.box_min );
         pb.box_max = strided( pd.box_max );
+        gpu2d::fill_cuts( pb.cuts, pd );
         pb.ids     = strided( pd.tree.seed_indices );
         pb.n       = TR( n );
         pb.depth   = depth;

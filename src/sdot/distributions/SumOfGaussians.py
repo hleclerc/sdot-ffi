@@ -77,7 +77,7 @@ class SumOfGaussians( Distribution ):
             # without a branch (unlike the `weights` of a `PowerDiagram`, where absence has a meaning).
             self.weights = RealTensor[ *self.batch_axes, self.num_gaussian ].full( 1.0 )
 
-    def normalized_version( self ):
+    def normalized_version( self, nb_dims = None ):
         mass = self.mass
         if not self.target_mass.is_defined:
             return self
@@ -97,6 +97,11 @@ class SumOfGaussians( Distribution ):
             support_sigmas = self.support_sigmas,
             support_box = self.support_box,
         )
+
+    def add_to_viz( self, viz, color = "#d62728", **kwargs ):
+        """The centres of the gaussians, as points."""
+        viz.add_points( numpy.asarray( self.positions ), color = color )
+        return viz
 
     def bounding_half_spaces( self ):
         """the box `[ c_i - k s_i, c_i + k s_i ]` united over the gaussians ( see the class

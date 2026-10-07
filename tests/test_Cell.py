@@ -1,18 +1,19 @@
-import numpy
 
 from errand import Param, experiment, test
-from loom.testing import need
-from loom.testing import check_grad
 
-from loom import driver, new_batch_axis
-from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
 
 # Geometry is cut in FP32 by default ( see `Cell.py` ): the CORRECTNESS tests run with the
 # kernel in double, and the `float` kernel has its own tests ( "the_float_kernel_*" ).
-set_kernel_dtype( "FP64" )
 
 
 if test( "basic" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 2, 0 ], [ 0, 1 ] ] )
     assert c.measure == 2
 
@@ -24,6 +25,13 @@ if test( "basic" ):
 
 if test( "basic_1D" ):
     # 1D: the cell is a SEGMENT ( `Cell_1` ) -- two ends, one cut per end
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     from sdot import Cell_1
     c = Cell.make_hypercube( 1, [ 0.5 ], [ [ 2 ] ] )
     assert isinstance( c, Cell_1 )
@@ -37,6 +45,13 @@ if test( "basic_1D" ):
     assert int( c.nb_vertices.value ) == 0 and float( c.measure ) == 0
 
 if test( "unbounded_1D" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = Cell.make_unbounded( 1 )
     assert float( c.measure ) > 1e300 and not c.is_bounded
     c.cut( [ 1 ], 3.0 )
@@ -45,6 +60,13 @@ if test( "unbounded_1D" ):
     assert c.is_bounded and abs( float( c.measure ) - 4 ) < 1e-12
 
 if test( "batch" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 2, 0 ], [ 0, 1 ] ], batch_axes = [ new_batch_axis( 2 ) ] )
     assert tuple( c.measure.value ) == ( 2, 2 )
     assert c.nb_items == 2 and numpy.allclose( c.vertices( 1 ), c.vertices( 0 ) )
@@ -61,15 +83,29 @@ def _cell_with_coords( d, coords, cut_ids, vertex_cuts = None, vertex_nbrs = Non
     return c
 
 if test( "grad_measure" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     need( "grad" )
     # the adjoint of the shoelace formula, checked by finite differences on the coordinates themselves
     c = Cell.make_hypercube( 2, [ 0.3, -0.2 ], [ [ 2.0, 0.1 ], [ -0.3, 1.0 ] ] )
     c.cut( [ 1, 1 ], 1.5 )
-    coords = driver.array( numpy.asarray( c.vertex_positions.value ) )
+    coords = loom.array( numpy.asarray( c.vertex_positions.value ) )
     ids = numpy.asarray( c.cut_ids.value )
     check_grad( lambda x: _cell_with_coords( 2, x, ids ).measure, coords )
 
 if p := test( "cut" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 1, 0 ], [ 0, 1 ] ] )
     c.cut( [ 1, 0 ], 0.1 )
 
@@ -85,6 +121,13 @@ if test( "cut_keeps_the_edge_to_cut_correspondence" ):
     # The 2D invariant `Local2` lives on: cut i carries the edge [ v_i, v_i+1 ], hence
     # `nb_cuts == nb_vertices`. We cut a corner off the unit square and check it edge by edge --
     # BOTH ends of edge i must be on plane i, read back from the geometry.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 1, 0 ], [ 0, 1 ] ] )
     c.cut( [ 1, 1 ], 1.5 )
 
@@ -106,6 +149,13 @@ if test( "cut_direction_is_not_normalized" ):
     # `offset` is the dot product as is, so ( 2n, 2o ) is the SAME half-space as
     # ( n, o ): a direction three times longer with an offset three times larger must
     # return exactly the same cell.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     a = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 1, 0 ], [ 0, 1 ] ] )
     b = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 1, 0 ], [ 0, 1 ] ] )
     a.cut( [ 1, 1 ], 1.5 )
@@ -118,6 +168,13 @@ if test( "cut_direction_is_not_normalized" ):
 if test( "cut_degenerate" ):
     # two degeneracies. A cut that cuts nothing must add NOTHING; a cut that excludes
     # everything must empty the cell cleanly ( 0 vertices, 0 cuts, zero measure ).
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 1, 0 ], [ 0, 1 ] ] )
 
     c.cut( [ 1, 0 ], 5 )
@@ -132,6 +189,13 @@ if test( "cut_capacity_is_exact" ):
     # The room a cut asks for is BOUNDED in advance ( `Cell_2._cut_capacities`: at most one vertex
     # more ), so a `cut` never has to make a second pass: the allocated capacity follows the
     # count one notch per cut, and a cut that adds nothing does not make it grow either.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 1, 0 ], [ 0, 1 ] ] )
     for k in range( 12 ):                                   # an inscribed dodecagon: 12 vertices
         t = 2 * numpy.pi * ( k + 0.5 ) / 12
@@ -145,6 +209,13 @@ if test( "cut_capacity_is_exact" ):
 if test( "cut_tangent" ):
     # The two tangencies, those where a vertex falls on the cutting plane. The clip only asks
     # one question, `s > 0`, and a vertex within epsilon of the plane answers like an inside vertex.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 1, 0 ], [ 0, 1 ] ] )
     c.cut( [ 1, 0 ], 1 )
     assert int( c.nb_vertices.value ) == 4 and int( c.nb_cuts.value ) == 4
@@ -175,6 +246,13 @@ if test( "cut_unbounded_becomes_bounded" ):
     # offsets, and a cut would rank them according to the arbitrary scale of that simplex.
     # `cut` first pushes them back ( `Local2::grow_for` ) until the ranking is the one
     # it would be at infinity. The fake planes are eaten one by one and the unit square remains.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = Cell.make_unbounded( 2 )
     assert not c.is_bounded
 
@@ -191,6 +269,13 @@ if test( "cut_unbounded_becomes_bounded" ):
 if test( "cut_unbounded_triangle" ):
     # off the axes and with an arbitrary order of cuts: three half-planes cut out their
     # triangle in the whole plane. The push must find the RIGHT configuration.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     corners = ( ( 0, 0 ), ( 4, 1 ), ( 1, 3 ) )
     exact = 5.5
 
@@ -207,6 +292,13 @@ if test( "cut_unbounded_triangle" ):
 if test( "cut_unbounded_far_from_the_origin" ):
     # The fake simplex is built at the ORIGIN and at scale 1: for a faraway cell, it has
     # to be pushed all the way there, and the result is correct to the precision of THOSE coordinates.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     shift = numpy.array( [ 1000.0, -500.0 ] )
     corners = [ tuple( numpy.array( p, float ) + shift ) for p in ( ( 0, 0 ), ( 4, 1 ), ( 1, 3 ) ) ]
 
@@ -220,6 +312,13 @@ if test( "cut_unbounded_far_from_the_origin" ):
 
 if test( "cut_batched" ):
     # a whole batch is cut in a single call, one item per work-item, each on its own stack
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     nb_items = 64
     c = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 1, 0 ], [ 0, 1 ] ], batch_axes = [ new_batch_axis( nb_items ) ] )
     c.cut( [ 1, 1 ], 1.5 )
@@ -230,6 +329,13 @@ if test( "cut_batched" ):
 
 if test( "the_float_kernel_cuts_the_same_cells" ):
     # the default kernel is `float32`: same combinatorics, geometry to within 1e-6
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     corners = ( ( 0.1, 0.2 ), ( 0.9, 0.15 ), ( 0.8, 0.9 ), ( 0.2, 0.7 ) )
     for kd in ( "FP32", None ):
         a = Cell.make_hypercube( 2, [ 0, 0 ], [ [ 1, 0 ], [ 0, 1 ] ], kernel_dtype = kd )
@@ -377,6 +483,13 @@ def _unit_cube( d ):
 
 if test( "basic_3D" ):
     # above 2D, the lattice EXISTS: the d cuts and the d neighbors of each vertex
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = _unit_cube( 3 )
     assert c.vertex_cuts.is_defined
     assert c.vertex_nbrs.is_defined
@@ -388,6 +501,13 @@ if test( "basic_3D" ):
 
 if test( "cut_3D" ):
     # a sequence of generic cuts on the unit cube, each one fully rechecked
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     for extra in ( [ ( [ 1, 1, 1 ], 2.5 ) ],
                    [ ( [ 1, 1, 1 ], 2.5 ), ( [ -1, -1, -1 ], -0.4 ) ],
                    [ ( [ 1, 1, 1 ], 2.5 ), ( [ 1, -1, 0.5 ], 0.6 ), ( [ -0.3, 1, 0.7 ], 0.9 ) ],
@@ -405,6 +525,13 @@ if test( "cut_3D" ):
 
 if test( "cut_3D_random" ):
     # arbitrary planes, in series: the combinatorics one would not write by hand
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     rng = numpy.random.default_rng( 12345 )
     for d in ( 3, 4 ):
         for trial in range( 12 ):
@@ -422,6 +549,13 @@ if test( "cut_through_existing_vertices" ):
     # THE degenerate case: planes that go EXACTLY through vertices. The clip never tests
     # `s == 0`: what comes out has coincident vertices and zero-length edges, but it is
     # a COHERENT cell.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     for d in ( 3, 4 ):
         for n, o in ( ( [ 1, 1 ] + [ 0 ] * ( d - 2 ), 1.0 ),      # through an entire 2-face
                       ( [ 1 ] * d, float( d - 1 ) ),              # through an edge
@@ -434,6 +568,13 @@ if test( "cut_through_existing_vertices" ):
 
 if test( "cut_through_a_vertex_2D" ):
     # the same trap in 2D, on a cell whose coordinates do not come out round
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     origin, axes = [ 0.13, -0.27 ], [ [ 1.7, 0.29 ], [ -0.41, 1.13 ] ]
     o, a0, a1 = ( numpy.asarray( v, float ) for v in ( origin, axes[ 0 ], axes[ 1 ] ) )
     corners = ( o, o + a0, o + a0 + a1, o + a1 )
@@ -465,6 +606,13 @@ if test( "cut_through_a_vertex_2D" ):
 
 if test( "cut_5D" ):
     # nothing 3D-specific in the clip: the same loop holds in 5D
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c, planes = _unit_cube( 5 ), _cube_planes( 5 )
     for n, o in ( ( [ 1, 1, 1, 1, 1 ], 4.5 ), ( [ 1, -0.4, 0.3, 0.2, 0.1 ], 0.75 ) ):
         c.cut( n, o )
@@ -472,6 +620,13 @@ if test( "cut_5D" ):
         _check_against_reference( c, planes, "cube 5D" )
 
 if test( "cut_nd_empty" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = _unit_cube( 3 )
     c.cut( [ 1, 1, 1 ], -1.0 )
     assert ( int( c.nb_vertices.value ), int( c.nb_cuts.value ) ) == ( 0, 0 )
@@ -480,6 +635,13 @@ if test( "cut_nd_empty" ):
 if test( "cut_nd_unbounded" ):
     # the fake simplex pushed back until the cut ranks it the way it would at
     # infinity -- in nD the push solves the same system as the vertex ( `LocalN::growth_rate` ).
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     for d in ( 3, 4 ):
         c, planes = Cell.make_unbounded( d ), []
         for n, o in _cube_planes( d ):
@@ -492,6 +654,13 @@ if test( "cut_nd_unbounded" ):
 if test( "cut_nd_capacity_is_exact" ):
     # in 3D the bound comes from Euler on a simple polytope ( `V = 2 F - 4` ): one more cut, and
     # as many vertices as such a polytope can have with those faces. Never a second pass.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = _unit_cube( 3 )
     cap_c = c.nb_cuts.allocated_capacity()
     for n, o in ( ( [ 1, 1, 1 ], 2.5 ), ( [ 1, -1, 0.5 ], 0.6 ), ( [ -0.3, 1, 0.7 ], 0.9 ) ):
@@ -501,6 +670,13 @@ if test( "cut_nd_capacity_is_exact" ):
     assert c.nb_vertices.allocated_capacity() == 2 * ( cap_c + 3 ) - 4
 
 if test( "cut_nd_batched" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     nb_items = 64
     c = Cell.make_hypercube( 3, [ 0, 0, 0 ], numpy.eye( 3 ).tolist(),
                              batch_axes = [ new_batch_axis( nb_items ) ] )
@@ -580,6 +756,13 @@ def _reference_volume( dirs, offs ):
 
 
 if test( "measure_3D" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = _unit_cube( 3 )
     assert float( c.measure ) == 1
 
@@ -587,6 +770,13 @@ if test( "measure_3D" ):
     assert abs( float( c.measure ) - ( 1 - 0.5 ** 3 / 6 ) ) < 1e-15
 
 if test( "measure_5D" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = _unit_cube( 5 )
     assert float( c.measure ) == 1
 
@@ -594,6 +784,13 @@ if test( "measure_5D" ):
     assert abs( float( c.measure ) - ( 1 - 0.5 ** 5 / 120 ) ) < 1e-15
 
 if test( "measure_nd_vs_reference" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     rng = numpy.random.default_rng( 7 )
     for d in ( 3, 4 ):
         for trial in range( 8 ):
@@ -609,6 +806,13 @@ if test( "measure_nd_vs_reference" ):
                     f"d={ d } t={ trial } s={ step }: { got } != { exp }"
 
 if test( "measure_nd_is_additive" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     rng = numpy.random.default_rng( 3 )
     for d in ( 3, 4 ):
         for _ in range( 6 ):
@@ -619,6 +823,13 @@ if test( "measure_nd_is_additive" ):
             assert abs( float( a.measure ) + float( b.measure ) - 1 ) < 1e-12
 
 if test( "measure_nd_degenerate" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     for d in ( 3, 4 ):
         for n, o in ( ( [ 1, 1 ] + [ 0 ] * ( d - 2 ), 1.0 ),
                       ( [ 1 ] * d, float( d - 1 ) ),
@@ -630,12 +841,26 @@ if test( "measure_nd_degenerate" ):
             assert abs( float( c.measure ) - exp ) < 1e-11, f"d={ d } n={ n }"
 
 if test( "measure_nd_unbounded_and_empty" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     assert float( Cell.make_unbounded( 3 ).measure ) > 1e300
     c = _unit_cube( 3 )
     c.cut( [ 1, 1, 1 ], -1.0 )
     assert float( c.measure ) == 0
 
 if test( "grad_measure_nd" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     need( "grad" )
     # the adjoint of the splitting: the triangulation is COMBINATORIAL ( it does not move under a
     # small perturbation ), so the backward replays the same traversal and only differentiates the
@@ -643,12 +868,19 @@ if test( "grad_measure_nd" ):
     for d in ( 3, 4 ):
         c = Cell.make_hypercube( d, numpy.zeros( d ), numpy.eye( d ) + 0.07 * numpy.arange( d * d ).reshape( d, d ) / ( d * d ) )
         c.cut( numpy.linspace( 0.8, 1.3, d ).tolist(), float( d ) - 0.7 )
-        coords = driver.array( numpy.asarray( c.vertex_positions.value ) )
+        coords = loom.array( numpy.asarray( c.vertex_positions.value ) )
         ids = numpy.asarray( c.cut_ids.value )
         vc, vn = numpy.asarray( c.vertex_cuts.value ), numpy.asarray( c.vertex_nbrs.value )
         check_grad( lambda x: _cell_with_coords( d, x, ids, vc, vn ).measure, coords )
 
 if test( "measure_nd_batched" ):
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     nb_items = 48
     c = Cell.make_hypercube( 3, [ 0, 0, 0 ], numpy.eye( 3 ).tolist(),
                              batch_axes = [ new_batch_axis( nb_items ) ] )
@@ -667,6 +899,13 @@ if test( "viz_drops_the_infinite_planes" ):
     # the walls of the fake simplex are not faces of the cell -- they have neither the right
     # position (their offset is an invention that the cuts push back) nor any existence. What
     # goes out is exactly the set of requested half-spaces, and nothing else.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     asked = ( ( [ 1.0, 0.0 ], 1.0 ), ( [ 0.0, 1.0 ], 1.0 ), ( [ 0.0, -1.0 ], 0.0 ) )
     c = Cell.make_unbounded( 2 )
     for n, o in asked:
@@ -691,6 +930,13 @@ if test( "viz_dashes_what_runs_off_and_hides_what_is_made_up" ):
     # - `y = 0` and `y = 1`: one real end, the other on a fake wall -> dashed, hence a
     #   bundle of small segments (7 dashes, cf. `Visualizer.add_edges( dashed = True )`);
     # - the closure of the fake simplex -> nothing at all.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = Cell.make_unbounded( 2 )
     for n, o in ( ( [ 1, 0 ], 1.0 ), ( [ 0, 1 ], 1.0 ), ( [ 0, -1 ], 0.0 ) ):
         c.cut( n, o )
@@ -720,6 +966,13 @@ if test( "viz_the_clipping_box_is_not_geometry" ):
     # means of seeing it, not a part of it -- so it closes the face through which it leaves the field,
     # but it gives NO edge. Otherwise the box draws itself, and ends up
     # alone on screen as soon as the faces are unchecked.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     from sdot.viz.polytope import polytope_mesh
 
     lim = 2.0
@@ -740,6 +993,13 @@ if test( "viz_the_clipping_box_is_not_geometry" ):
 if test( "viz_of_a_bounded_cell_is_untouched" ):
     # no fake cut on a bounded cell: nothing to remove, nothing to dash. The unit
     # square must come out as ONE face of 4 vertices and 4 solid edges, as before.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     v = Visualizer()
     Cell.make_hypercube( 2, [ 0, 0 ], [ [ 1, 0 ], [ 0, 1 ] ] ).add_to_viz( v )
     assert len( v.polytopes ) == 0
@@ -750,6 +1010,13 @@ if test( "viz_of_a_batch_uses_each_item_own_counts" ):
     # two cells of DIFFERENT SIZES in the same batch: the arrays are dense to the largest,
     # so drawing the small one on the large one's count would make it drag along slots
     # it does not use. This is the usual case of a Voronoi diagram.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     from sdot import Voronoi
     pos = numpy.array( [ [ 0.2, 0.5 ], [ 0.55, 0.5 ], [ 0.9, 0.2 ], [ 0.9, 0.8 ] ] )
     cs = Voronoi( pos, boundaries = box_half_spaces( [ 0, 0 ], [ 1, 1 ] ) ).cells
@@ -765,6 +1032,13 @@ if test( "viz_colors_are_the_seed_and_nothing_else" ):
     # already drawn -- and the proof is an EMPTY cell: the middle seed, dominated by a low weight,
     # has nothing left to show, and the other two must keep EXACTLY the color they
     # had without it. With a call counter, the third one inherited the second one's.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     from sdot import PowerDiagram
     from sdot.viz.Visualizer import scale_color
 
@@ -788,6 +1062,13 @@ if test( "viz_colors_do_not_drift_from_one_frame_to_the_next" ):
     # the same diagram, redrawn frame after frame: each seed must get ITS color back.
     # This is what the per-frame reset buys -- without it, frame `k` started where the
     # previous one had stopped and the whole animation flickered.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     from sdot import Voronoi
     pos = numpy.array( [ [ 0.2, 0.2 ], [ 0.75, 0.3 ], [ 0.45, 0.8 ], [ 0.9, 0.85 ] ] )
     n, nb_frames = len( pos ), 3
@@ -827,6 +1108,13 @@ def _write_both( p, viz, stem ):
 if p := experiment( "viz 2D" ):
     # the 2D regime: `vertex_coords` IS the polygon, in cyclic order -- one face and its ring
     # of edges, nothing to rebuild. Two cells to see the automatic palette at work.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     v = Visualizer( title = "Cell 2D" )
     for shift, normal in ( ( 0.0, [ 1, 1 ] ), ( 1.3, [ -1, 2 ] ) ):
         c = Cell.make_hypercube( 2, [ shift, 0 ], [ [ 1, 0 ], [ 0, 1 ] ] )
@@ -837,6 +1125,13 @@ if p := experiment( "viz 2D" ):
 if p := experiment( "viz 3D" ):
     # the 3D regime: the faces are read back from the lattice ( `Cell.faces` ). This is THE case where the page has something to hide -- solid faces,
     # back edges -- and the one you open in ParaView to turn around it.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = _unit_cube( 3 )
     c.cut( [ 1, 1, 1 ], 2.5 )
     v = Visualizer( title = "Cube 3D, one corner sliced off" )
@@ -848,6 +1143,13 @@ if p := experiment( "viz 5D" ):
     # the page shows a 3D SLICE of it ( cutting half-spaces gives half-spaces again ) and adds
     # the PROJECTED wireframe to it. On the VTK side, the coordinates beyond the 3rd go out as point data,
     # and it is up to ParaView to make its own cuts.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     c = _unit_cube( 5 )
     c.cut( [ 1, 1, 1, 1, 1 ], 4.5 )
     c.cut( [ 1, -0.4, 0.3, 0.2, 0.1 ], 0.75 )
@@ -859,6 +1161,13 @@ if p := experiment( "viz unbounded" ):
     # an UNBOUNDED cell has no vertices to show -- the fake simplex of
     # `init_as_unbounded` has some, but they are those of a stand-in, not of the cell. So it is the
     # H-representation that goes out, and it is the visualizer that closes it on the scene's box.
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     v = Visualizer( title = "Unbounded cells" )
     c = Cell.make_unbounded( 3 )
     for n, o in ( ( [ -1, 0, 0 ], 0 ), ( [ 0, -1, 0 ], 0 ), ( [ 0, 0, -1 ], 0 ) ):
@@ -877,6 +1186,13 @@ if p := experiment( "viz cut by cut",
     # We start from the cube, bounded, and not from the infinite cell: the scene's framing is
     # COMMON to all the images, so a first image as large as the world would crush all the
     # following ones into a line ( `viz unbounded` is what shows that regime ).
+    import numpy
+    from loom.testing import need
+    from loom.testing import check_grad
+    import loom
+    from loom import new_batch_axis
+    from sdot import Cell, Visualizer, box_half_spaces, set_kernel_dtype
+    set_kernel_dtype( "FP64" )
     d   = p.dim
     rng = numpy.random.default_rng( p.seed )
     c   = _unit_cube( d )

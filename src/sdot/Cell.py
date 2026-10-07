@@ -21,16 +21,19 @@ import os
 import numpy as np
 import loom
 from loom.compilation.FfiCode import FfiCode
-from loom.drivers.driver import driver
+import loom
 from loom.tensor import Axis, RealTensor, ShapeVar, Tensor
 from loom.util import Aggregate
 
 from .CellScratch import CellScratch, fp_size
 from . import cell_viz
+from .viz.Displayable import Displayable
 
 # the cut identifiers that do not designate a seed -- see `cell/Ids.h`, which is authoritative
 INFINITE = -2 ** 31          # a wall of the replacement simplex of an unbounded cell
 PIECE    = -2 ** 31 + 1      # a cutting plane added by a distribution
+SEAM     = -2 ** 31 + 2      # the wall of a tile, with mass behind it: an inner seam, not drawn
+SUPPORT  = -2 ** 31 + 3      # the wall of a tile, without mass behind it: the edge of the support
 BOUNDARY = -1                # "not a seed", with no further precision ( = `domain_id( 0 )` )
 
 # THE KERNEL FLOAT. The geometry is cut in `float32` by default -- this is what fits eight
@@ -73,7 +76,7 @@ class Item:
         return len( self.vp )
 
 
-class Cell( Aggregate ):
+class Cell( Aggregate, Displayable ):
     # ---- what a regime must provide ---------------------------------------------------------------
     #
     #   default_nb_dims      the dimension when the class is built without being given one
@@ -189,7 +192,7 @@ class Cell( Aggregate ):
         """Intersects the cell with the half-space `direction . x <= offset`, IN PLACE.
 
         `direction` need not be normalized : `offset` is the dot product it is
-        compared against as is. Since the inputs and outputs of a `driver.call` are disjoint, the
+        compared against as is. Since the inputs and outputs of a `loom.ffi_call` are disjoint, the
         kernel writes into a NEW cell and the in-place update is only a rebinding. The
         room the cut requires is BOUNDED in advance ( `_cut_capacities` ) : no second pass.
         """
@@ -319,8 +322,11 @@ class Cell( Aggregate ):
 
     # ---- display ----------------------------------------------------------------------------------
 
-    def add_to_viz( self, viz, color = None, opacity = 1.0, faces = True, edges = True, points = False ):
+    def add_to_viz( self, viz, color = None, opacity = 1.0, faces = True, edges = True, points = False,
+                    owners = None, nb_colors = None ):
         """Draws itself into a `Visualizer` ( see `sdot.viz.Visualizer`, and `cell_viz` for what an
         unbounded cell drops ). Each item takes its color from its RANK IN THE BATCH,
-        on a block reserved in advance : the color of a cell of a diagram says WHICH seed."""
-        return cell_viz.add_to_viz( self, viz, color, opacity, faces, edges, points )
+        on a block reserved in advance : the color of a cell of a diagram says WHICH seed.
+        `owners`: the rank to take the color from, per item, on a block of `nb_colors` -- the
+        pieces of one cell ( `PowerDiagram.support_pieces` ) have its color."""
+        return cell_viz.add_to_viz( self, viz, color, opacity, faces, edges, points, owners, nb_colors )

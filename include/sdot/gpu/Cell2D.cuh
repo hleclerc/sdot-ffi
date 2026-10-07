@@ -292,6 +292,59 @@ Strided<std::remove_const_t<typename View::TF>,View::ct_rank> strided( const Vie
     return res;
 }
 
+/// THE DOMAIN'S OTHER HALF-SPACES, besides its box: `dir( j ) . x <= off( j )` ( `dir` unit vectors ), identified by `-5 - j` --
+/// the sides of the box are `-1 .. -4`. A convex polygon is its bounding box and these: a cell starts from the box and is cut by
+/// them before the seeds' bisectors, and they are read back from their identifiers wherever a side of the box is.
+///
+/// Or, when the domain is a polygon that starts the cells ( `StartCell.py` ): `nsv > 0` vertices `sv`, counterclockwise, and the
+/// `nsv` edges' lines in `dir` / `off` -- edge `i`, from vertex `i` to `i + 1`, is the cut `-5 - i`. The cell is laid down
+/// as it is, no box and no cut.
+template<class TF>
+struct Cuts {
+    Strided<TF,2> dir;
+    Strided<TF,1> off;
+    int           nb = 0;
+    Strided<TF,2> sv;
+    int           nsv = 0;
+    Strided<int,2>      topo;                               ///< 3D: the topology of the start vertices ( `StartCell.py` ): `k` then `nn`, three each
+};
+
+/// the vertices of the polygon that starts the cells ( 0: a box ), to size the slots of the cells of any number of vertices
+template<class PD>
+SI start_count( const PD &pd ) {
+    if constexpr ( requires { pd.start_vertices.data().raw; } ) return SI( pd.start_vertices.shape( 0 ) );
+    else return 0;
+}
+
+/// the start cell and the domain's cuts into the problem's `Cuts`, from the diagram ( `bnd_*`, `start_vertices` )
+template<class TF,class PD>
+void fill_cuts( Cuts<TF> &cuts, const PD &pd ) {
+    if constexpr ( requires { pd.bnd_directions.data().raw; } ) {
+        cuts.dir = strided( pd.bnd_directions );
+        cuts.off = strided( pd.bnd_offsets );
+        cuts.nb  = int( pd.bnd_directions.shape( 0 ) );
+    }
+    if constexpr ( requires { pd.start_vertices.data().raw; } ) {
+        cuts.sv  = strided( pd.start_vertices );
+        cuts.nsv = int( pd.start_vertices.shape( 0 ) );
+        if constexpr ( requires { pd.start_topo.data().raw; } )
+            cuts.topo = strided( pd.start_topo );
+    }
+}
+
+/// the plane of the domain's cut `cid` ( `<= -5` ) in the seed's frame, `( px, py )` the seed
+template<class TK,class Pb>
+__device__ __forceinline__ Plane<TK,typename Pb::TR> domain_plane( const Pb &pb, typename Pb::TR cid, double px, double py ) {
+    const int j = int( -5 - cid );
+    const double nx = double( pb.cuts.dir( j, 0 ) ), ny = double( pb.cuts.dir( j, 1 ) );
+    Plane<TK,typename Pb::TR> e;
+    e.dx = TK( nx );
+    e.dy = TK( ny );
+    e.off = TK( double( pb.cuts.off( j ) ) - nx * px - ny * py );
+    e.id = cid;
+    return e;
+}
+
 /// a writable view of an output, or nothing ( an unbound gradient: `NoneTensor` )
 template<class T,int N,class View>
 StridedOut<T,N> strided_out( const View &v ) {
@@ -337,6 +390,7 @@ struct Problem {
     Strided<TF,2>     pos64;                             ///< the seeds as given, `[ n, 2 ]`, tree order
     Strided<TF,1>     w64;                               ///< the weights as given ( W only )
     Strided<TF,1>     box_min, box_max;                  ///< the domain
+    Cuts<TF>          cuts;                              ///< ... and its other half-spaces ( a convex polygon )
     Strided<TI,1>     ids;                               ///< rank -> the user's index
     TR                n;
     int               depth;
@@ -406,6 +460,21 @@ struct RegCell {
             c[ i ] = i < 4 ? TR( -1 - i ) : TR( 0 );
         }
         nb = 4;
+    }
+
+    /// THE POLYGON of the start cell ( `Cuts` ) instead of the box, `( px, py )` the seed: more vertices than the registers
+    /// hold is an overflow ( `nb == -1`, the later passes have room )
+    template<class Cu>
+    __device__ __forceinline__ void init_polygon( const Cu &cuts, double px, double py ) {
+        const int m = cuts.nsv;
+#pragma unroll
+        for ( int i = 0; i < R; ++i ) {
+            const bool in = i < m;
+            x[ i ] = in ? TK( double( cuts.sv( i, 0 ) ) - px ) : TK( 0 );
+            y[ i ] = in ? TK( double( cuts.sv( i, 1 ) ) - py ) : TK( 0 );
+            c[ i ] = in ? TR( -5 - i ) : TR( 0 );
+        }
+        nb = m <= R ? m : -1;
     }
 
     template<bool W>
@@ -632,6 +701,25 @@ struct WarpCell {
             c[ 0 ][ lane ] = TR( -1 - lane );
         }
         nb = 4;
+        __syncwarp();
+    }
+
+    /// the start polygon ( see `RegCell::init_polygon` ); more vertices than the slot holds: `nb == -1`, a failure
+    template<class Cu>
+    __device__ __forceinline__ void init_polygon( const Cu &cuts, double px, double py ) {
+        cur = 0;
+        const int m = cuts.nsv;
+        if ( m > cap ) {
+            nb = -1;
+            __syncwarp();
+            return;
+        }
+        for ( int i = lane; i < m; i += 32 ) {
+            x[ 0 ][ i ] = TK( double( cuts.sv( i, 0 ) ) - px );
+            y[ 0 ][ i ] = TK( double( cuts.sv( i, 1 ) ) - py );
+            c[ 0 ][ i ] = TR( -5 - i );
+        }
+        nb = m;
         __syncwarp();
     }
 
@@ -866,6 +954,14 @@ __device__ __forceinline__ void plane64( const Pb &pb, const Origin &o, typename
             off += 0.5 * ( o.w - double( pb.w64( cid ) ) );
         return;
     }
+    if ( cid <= typename Pb::TR( -5 ) ) {                // a cut of the domain
+        const int j = int( -5 - cid );
+        nx  = double( pb.cuts.dir( j, 0 ) );
+        ny  = double( pb.cuts.dir( j, 1 ) );
+        e   = nx * nx + ny * ny;
+        off = double( pb.cuts.off( j ) ) - nx * o.x - ny * o.y;
+        return;
+    }
     const int f = int( -1 - cid );                       // 0 bottom, 1 right, 2 top, 3 left
     const bool vert = f & 1;
     nx  = vert ? 1.0 : 0.0;
@@ -1015,6 +1111,11 @@ __device__ __forceinline__ void finish_cell( const Pb &pb, typename Pb::TR k, co
             if constexpr ( std::is_same_v<D,DensImage> ) {
                 const double Ox = o.x - pb.dens.x0, Oy = o.y - pb.dens.y0;
                 line = image_edge<MOM>( pb.dens, st.ref, Ox + ax, Oy + ay, Ox + bx, Oy + by, acc );
+            } else if constexpr ( std::is_same_v<D,DensMesh> ) {
+                // the cell as a fan of triangles from its first vertex, each against the mesh; the edge against it for the facets
+                if ( ! st.set ) { st.x0 = ax; st.y0 = ay; st.set = true; }
+                mesh_triangle<MOM>( pb.dens, o.x, o.y, st.x0, st.y0, ax, ay, bx, by, acc );
+                line = bool( OUT & FACETS ) ? mesh_line( pb.dens, o.x, o.y, ax, ay, bx, by ) : 0.0;
             } else {
                 if ( nv < VB ) { vbx[ nv ] = ax; vby[ nv ] = ay; }
                 ++nv;
@@ -1033,7 +1134,9 @@ __device__ __forceinline__ void finish_cell( const Pb &pb, typename Pb::TR k, co
         DensSums r;
         if constexpr ( std::is_same_v<D,DensImage> )
             r = image_finish( pb.dens, acc, sg, o.x, o.y );
-        else {
+        else if constexpr ( std::is_same_v<D,DensMesh> ) {
+            r.m = sg * acc.m; r.mx = sg * acc.mx; r.my = sg * acc.my; r.m2 = sg * acc.m2;
+        } else {
             r.mx = sg * acc.mx; r.my = sg * acc.my; r.m2 = sg * acc.m2;
             if ( nv <= VB )
                 gauss_cell<MOM>( pb.dens, o.x, o.y, [&]( auto &&f ) { for ( int i = 0; i < nv; ++i ) f( vbx[ i ], vby[ i ], vbx[ i + 1 < nv ? i + 1 : 0 ], vby[ i + 1 < nv ? i + 1 : 0 ] ); }, r );
@@ -1153,11 +1256,14 @@ __device__ __forceinline__ bool cell_in_registers( const Pb &pb, typename Pb::TR
     start_of( pb, k, f, b );
     RegCell<TK,TR,R> cell;
     cell.init( b[ 0 ], b[ 1 ], b[ 2 ], b[ 3 ] );
-    // the plane of an edge: a bisector re-read from its seed, or a side of the box ( `-1` bottom, `-2` right,
-    // `-3` top, `-4` left )
+    const double px = double( pb.pos64( k, 0 ) ), py = double( pb.pos64( k, 1 ) );
+    // the plane of an edge: a bisector re-read from its seed, a side of the box ( `-1` bottom, `-2` right,
+    // `-3` top, `-4` left ) or a cut of the domain ( `-5 - j` )
     auto edge_plane = [&]( TR cid ) {
         if ( cid >= 0 )
             return bisector<Pb::W>( f, pb.pos[ cid ], pb.weight( cid ), cid );
+        if ( cid <= TR( -5 ) )
+            return domain_plane<TK>( pb, cid, px, py );
         const int s = int( -1 - cid );
         Plane<TK,TR> e;
         e.dx = s & 1 ? TK( 1 ) : TK( 0 );
@@ -1166,10 +1272,24 @@ __device__ __forceinline__ bool cell_in_registers( const Pb &pb, typename Pb::TR
         e.id = cid;
         return e;
     };
-    if constexpr ( EXACT_VERTICES )
-        walk( pb, f, cell, edge_plane );
-    else
-        walk( pb, f, cell );
+    // the domain's other cuts first ( the cell is empty or overflowed past them: `nb <= 0`, nothing to walk )
+    bool alive = true;
+    if ( pb.cuts.nsv > 0 ) {                             // the polygon is the cell itself
+        cell.init_polygon( pb.cuts, px, py );
+        alive = cell.nb > 0;
+    } else {
+        for ( int j = 0; j < pb.cuts.nb && alive; ++j ) {
+            const Plane<TK,TR> dp = domain_plane<TK>( pb, TR( -5 - j ), px, py );
+            if constexpr ( EXACT_VERTICES ) alive = cell.cut( dp, edge_plane );
+            else                            alive = cell.cut( dp );
+        }
+    }
+    if ( alive ) {
+        if constexpr ( EXACT_VERTICES )
+            walk( pb, f, cell, edge_plane );
+        else
+            walk( pb, f, cell );
+    }
     if ( deferred ) {
         if constexpr ( std::is_same_v<TK,float> ) {
             if ( cell.nb > RD )                          // more than the finish holds: a later pass
@@ -1310,7 +1430,17 @@ __global__ void __launch_bounds__( BLOCK ) warp_pass( Pb pb, const typename Pb::
         cell.attach( mine, cap );
         cell.lane = lane;
         cell.init( b[ 0 ], b[ 1 ], b[ 2 ], b[ 3 ] );
-        walk( pb, f, cell );
+        const double px = double( pb.pos64( k, 0 ) ), py = double( pb.pos64( k, 1 ) );
+        bool alive = true;
+        if ( pb.cuts.nsv > 0 ) {
+            cell.init_polygon( pb.cuts, px, py );
+            alive = cell.nb > 0;
+        } else {
+            for ( int j = 0; j < pb.cuts.nb && alive; ++j )
+                alive = cell.cut( domain_plane<TK>( pb, TR( -5 - j ), px, py ) );
+        }
+        if ( alive )
+            walk( pb, f, cell );
         if ( lane == 0 ) {
             if ( cell.nb >= 0 )
                 finish_cell( pb, k, cell );
@@ -1538,6 +1668,7 @@ struct Card {
             pb.w64 = strided( pd.sorted_weights );
         pb.box_min = strided( pd.box_min );
         pb.box_max = strided( pd.box_max );
+        fill_cuts( pb.cuts, pd );
         pb.ids     = strided( pd.tree.seed_indices );
         pb.n       = TR( n );
         pb.depth   = depth;
@@ -1672,7 +1803,7 @@ void measures( const CudaQueue &queue, const auto &pd, auto &&res, const auto &e
                int max_vertices, int overflow_warps ) {
     using PD = std::decay_t<decltype( pd )>;
     Card<V,PD::has_weights,MEASURES,TFOf<PD>,TIOf<PD>> card;
-    if ( ! card.prepare( queue, pd, allocator, Overflow::sized( SI( pd.nb_seeds() ), overflow_warps, max_vertices ) ) )
+    if ( ! card.prepare( queue, pd, allocator, Overflow::sized( SI( pd.nb_seeds() ) + start_count( pd ), overflow_warps, max_vertices ) ) )
         return;                                          // the pool said no: `allocator.failed` is reported
     set_density( card.pb, rho );
     card.pb.res = strided_out<TFOf<PD>,1>( res );
@@ -1696,7 +1827,7 @@ void measures_vjp( const CudaQueue &queue, const auto &pd, const auto &grad_res,
         if constexpr ( has_gw ) zero_fill( queue, const_cast<void *>( ( const void * ) grad_w.data().raw ), SI( sizeof( TF ) ) * SI( pd.nb_seeds() ) );
     } else {
         Card<V,W,VJP,TF,TIOf<PD>> card;
-        if ( ! card.prepare( queue, pd, allocator, Overflow::sized( SI( pd.nb_seeds() ), overflow_warps, max_vertices ) ) )
+        if ( ! card.prepare( queue, pd, allocator, Overflow::sized( SI( pd.nb_seeds() ) + start_count( pd ), overflow_warps, max_vertices ) ) )
             return;
         set_density( card.pb, rho );
         card.pb.g        = strided( grad_res );

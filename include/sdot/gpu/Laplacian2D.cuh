@@ -263,7 +263,7 @@ void cells( const CudaQueue &queue, const auto &pd, auto &&res, auto &&lap, auto
     using CardT = Card<V,PD::has_weights,OUT | MEASURES,TF,TIOf<PD>>;
     using TR = typename CardT::TR;
     CardT card;
-    if ( ! card.prepare( queue, pd, allocator, Overflow::sized( SI( pd.nb_seeds() ), overflow_warps, max_vertices ) ) )
+    if ( ! card.prepare( queue, pd, allocator, Overflow::sized( SI( pd.nb_seeds() ) + start_count( pd ), overflow_warps, max_vertices ) ) )
         return;
     set_density( card.pb, rho );
     card.pb.res = strided_out<TF,1>( res );

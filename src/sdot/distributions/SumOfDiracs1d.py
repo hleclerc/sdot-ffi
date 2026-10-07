@@ -29,7 +29,7 @@ class SumOfDiracs1d( Distribution ):
     def __init__( self, positions, weights = None, **kwargs ):
         self.__base_init__( positions = positions, weights = weights, nb_dims = 1, **kwargs )
 
-    def normalized_version( self ):
+    def normalized_version( self, nb_dims = None ):
         dim = Axis[ self.nb_dims ]()
         return SumOfDiracs(
             positions = self.positions.append_axis( dim ),

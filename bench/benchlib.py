@@ -81,8 +81,8 @@ def ratio( new, old ):
 
 def driver_line():
     """the loom framework and device in use ( import loom late: call it AFTER `set_threads` )"""
-    from loom.drivers.driver import driver
-    return f"driver { driver.framework }, device { driver.device }"
+    import loom
+    return f"driver { loom.resolved_framework() }, device { loom.resolved_device() }"
 
 
 # -- GPU ------------------------------------------------------------------------------------------------

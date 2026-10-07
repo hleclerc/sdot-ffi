@@ -183,6 +183,12 @@ struct PointwiseDensity {
         return res;
     }
 
+    /// the mass of a facet, when the wrapped density knows it ( `SumOfGaussians` in 3D: it does not know its simplices, but its
+    /// facets reduce to the 2D case ) -- what the laplacian of a transport reads ( `sdotplan/Sweep.h` )
+    HD TF facet_mass( const auto &pc, int cut ) const requires requires { dens.facet_mass( pc, cut ); } {
+        return dens.facet_mass( pc, cut );
+    }
+
     /// the moments of order 0, 1, 2 of the density over the simplex, ACCUMULATED into `m` / `mx` / `m2`
     /// -- the same rule, on the same leaves, each node weighing `vol / ( d + 1 ) * rho( x )`.
     HD void integrate_moments_over_simplex( const auto &pts, TF &m, auto &mx, TF &m2 ) const {

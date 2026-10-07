@@ -142,9 +142,9 @@ def card_pool():
     """`( limit, in_use )`: the bytes of XLA's pool on the current card, and those in use ( `None` if they cannot be read: not
     jax, or a pool without statistics )"""
     try:
-        from loom.drivers.driver import driver
+        import loom
         import jax
-        dev_id = int( getattr( driver.device, "device_id", 0 ) or 0 )
+        dev_id = int( getattr( loom.resolved_device(), "device_id", 0 ) or 0 )
         devs = [ d for d in jax.devices() if d.platform == "gpu" ]
         dev = next( ( d for d in devs if d.id == dev_id ), devs[ 0 ] if devs else None )
         st = dev.memory_stats() if dev is not None else None

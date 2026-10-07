@@ -26,7 +26,7 @@ UTP HD auto DTP::kernel_at( SI i, const auto &x ) const {
     const TF s = sigma_of( i );
     TF r2 = 0;
     for ( PI c = 0; c < ct_dim; ++c ) {
-        const TF e = TF( x[ c ] ) - TF( positions( i, c ) );
+        const TF e = TF( x[ c ] ) - center_of( i, c );
         r2 += e * e;
     }
 
@@ -43,38 +43,38 @@ UTP HD auto DTP::kernel_at( SI i, const auto &x ) const {
 }
 
 UTP HD typename DTP::TF DTP::value_at( const auto &x ) const {
-    const SI n = nb_gaussians;
+    const SI n = nb_terms();
     TF res = 0;
     for ( SI i = 0; i < n; ++i )
-        res += TF( weights( i ) ) * kernel_at( i, x ).phi;
+        res += weight_of( i ) * kernel_at( i, x ).phi;
     return res;
 }
 
 UTP HD auto DTP::gradient_at( const auto &x ) const {
     // `d/dx exp( -r^2 / 2s^2 ) = - ( x - c ) / s^2 * ...`: the gradient of a gaussian points towards
     // its center, with the factor `1 / s^2`.
-    const SI n = nb_gaussians;
+    const SI n = nb_terms();
     auto res = Vector<TF,ct_dim>::zeros();
     for ( SI i = 0; i < n; ++i ) {
         const auto k = kernel_at( i, x );
-        const TF f = TF( weights( i ) ) * k.phi / ( k.s * k.s );
+        const TF f = weight_of( i ) * k.phi / ( k.s * k.s );
         for ( PI c = 0; c < ct_dim; ++c )
-            res[ c ] -= f * ( TF( x[ c ] ) - TF( positions( i, c ) ) );
+            res[ c ] -= f * ( TF( x[ c ] ) - center_of( i, c ) );
     }
     return res;
 }
 
 UTP HD void DTP::add_value_grad_at( auto &&grad_dist, const auto &x, TF g ) const {
     auto add_to = []( auto &&dst, TF v ) {
-        if constexpr ( ! dst.surely_null )
+        if constexpr ( ! DECAYED_TYPE_OF( dst )::surely_null )
             atomic_add( dst.ref(), v );
     };
 
     // nothing requested: not a read, not an exponential. The test is at COMPILE time, so
     // a pure forward does not pay for the existence of this block.
-    if constexpr ( grad_dist.weights.surely_null
-                && grad_dist.positions.surely_null
-                && grad_dist.sigmas.surely_null ) {
+    if constexpr ( DECAYED_TYPE_OF( grad_dist.weights )::surely_null
+                && DECAYED_TYPE_OF( grad_dist.positions )::surely_null
+                && DECAYED_TYPE_OF( grad_dist.sigmas )::surely_null ) {
         return;
     } else {
         const SI n = nb_gaussians;
@@ -86,7 +86,7 @@ UTP HD void DTP::add_value_grad_at( auto &&grad_dist, const auto &x, TF g ) cons
             add_to( grad_dist.weights( i ), g * k.phi );
 
             // d rho / d c_i = w_i * phi * ( x - c_i ) / s^2   ( the gradient AT x, sign flipped )
-            if constexpr ( ! grad_dist.positions.surely_null ) {
+            if constexpr ( ! DECAYED_TYPE_OF( grad_dist.positions )::surely_null ) {
                 const TF f = g * w * k.phi / ( k.s * k.s );
                 for ( PI c = 0; c < ct_dim; ++c )
                     add_to( grad_dist.positions( i, c ), f * ( TF( x[ c ] ) - TF( positions( i, c ) ) ) );
@@ -117,8 +117,14 @@ namespace detail {
     }
 }
 
-UTP HD typename DTP::TF DTP::facet_mass( const auto &pc, int cut ) const {
-    static_assert( ct_dim == 2, "facet_mass: 2D only ( an edge )" );
+UTP HD typename DTP::TF DTP::facet_mass( const auto &pc, int cut ) const requires ( ct_dim == 2 || ct_dim == 3 ) {
+    if constexpr ( ct_dim == 2 )
+        return facet_mass_2d( pc, cut );
+    else
+        return facet_mass_3d( pc, cut );
+}
+
+UTP HD typename DTP::TF DTP::facet_mass_2d( const auto &pc, int cut ) const {
     const int nb = pc.nb_vertices();
     const int j = cut + 1 < nb ? cut + 1 : 0;
     const TF ax = TF( pc.coord( cut, 0 ) ), ay = TF( pc.coord( cut, 1 ) );
@@ -129,10 +135,10 @@ UTP HD typename DTP::TF DTP::facet_mass( const auto &pc, int cut ) const {
     const TF ux = ex / L, uy = ey / L;                    // the tangent, and a normal
     const TF nx = -uy, ny = ux;
     TF res = 0;
-    const SI ng = SI( sigmas.shape( 0 ) );
+    const SI ng = nb_terms();
     for ( SI i = 0; i < ng; ++i ) {
-        const TF s = sigma_of( i ), m = TF( weights( i ) );
-        const TF px = ax - TF( positions( i, 0 ) ), py = ay - TF( positions( i, 1 ) );
+        const TF s = sigma_of( i ), m = weight_of( i );
+        const TF px = ax - center_of( i, 0 ), py = ay - center_of( i, 1 );
         const TF d = px * nx + py * ny;                   // the signed distance from the center to the line
         const TF t0 = px * ux + py * uy, t1 = t0 + L;
         const TF q = d * d / ( 2 * s * s );
@@ -145,8 +151,63 @@ UTP HD typename DTP::TF DTP::facet_mass( const auto &pc, int cut ) const {
     return res;
 }
 
+UTP HD typename DTP::TF DTP::facet_mass_3d( const auto &pc, int cut ) const {
+    // the unit normal of the face: the sum of the cross products of its fan, all of the same orientation ( a convex face )
+    const auto pt = [&]( int i ) { return Vector<TF,3>( Function(), [&]( PI c ) { return TF( pc.coord( i, int( c ) ) ); } ); };
+    TF N[ 3 ] = { 0, 0, 0 };
+    int o0 = -1;                                         // a vertex of the face: the distance to its plane is read there
+    pc.for_each_facet_triangle( cut, [&]( int o, int a, int b ) {
+        o0 = o;
+        const auto O = pt( o ), A = pt( a ), B = pt( b );
+        const TF ax = A[ 0 ] - O[ 0 ], ay = A[ 1 ] - O[ 1 ], az = A[ 2 ] - O[ 2 ];
+        const TF bx = B[ 0 ] - O[ 0 ], by = B[ 1 ] - O[ 1 ], bz = B[ 2 ] - O[ 2 ];
+        TF cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
+        if ( N[ 0 ] * cx + N[ 1 ] * cy + N[ 2 ] * cz < 0 ) { cx = -cx; cy = -cy; cz = -cz; }
+        N[ 0 ] += cx; N[ 1 ] += cy; N[ 2 ] += cz;
+    } );
+    const TF nn = sdot::sqrt( N[ 0 ] * N[ 0 ] + N[ 1 ] * N[ 1 ] + N[ 2 ] * N[ 2 ] );
+    if ( ! ( nn > 0 ) )
+        return 0;
+    const TF n[ 3 ] = { N[ 0 ] / nn, N[ 1 ] / nn, N[ 2 ] / nn };
+
+    // an orthonormal frame `( u, w )` of the plane: `u` from the axis `n` is the least aligned with
+    const TF an[ 3 ] = { sdot::fabs( n[ 0 ] ), sdot::fabs( n[ 1 ] ), sdot::fabs( n[ 2 ] ) };
+    const int k = an[ 0 ] < an[ 1 ] ? ( an[ 0 ] < an[ 2 ] ? 0 : 2 ) : ( an[ 1 ] < an[ 2 ] ? 1 : 2 );
+    TF u[ 3 ] = { -n[ k ] * n[ 0 ], -n[ k ] * n[ 1 ], -n[ k ] * n[ 2 ] };
+    u[ k ] += 1;
+    const TF nu = sdot::sqrt( u[ 0 ] * u[ 0 ] + u[ 1 ] * u[ 1 ] + u[ 2 ] * u[ 2 ] );
+    for ( int c = 0; c < 3; ++c )
+        u[ c ] /= nu;
+    const TF w[ 3 ] = { n[ 1 ] * u[ 2 ] - n[ 2 ] * u[ 1 ], n[ 2 ] * u[ 0 ] - n[ 0 ] * u[ 2 ], n[ 0 ] * u[ 1 ] - n[ 1 ] * u[ 0 ] };
+
+    // `rho = w_i * phi_1( d / s ) / s * phi_2( y / s ) / s^2`: the 1D factor across the plane, times the 2D standard measure of
+    // the face in the scaled in-plane coordinates -- the sum over the fan, each triangle positive
+    const auto P0 = pt( o0 );
+    TF res = 0;
+    const SI ng = nb_terms();
+    for ( SI i = 0; i < ng; ++i ) {
+        const TF s = sigma_of( i );
+        const TF c[ 3 ] = { center_of( i, 0 ), center_of( i, 1 ), center_of( i, 2 ) };
+        const TF d = ( P0[ 0 ] - c[ 0 ] ) * n[ 0 ] + ( P0[ 1 ] - c[ 1 ] ) * n[ 1 ] + ( P0[ 2 ] - c[ 2 ] ) * n[ 2 ];
+        const TF q = d * d / ( 2 * s * s );
+        if ( q > TF( 700 ) )
+            continue;                                    // nothing, up to rounding
+        const auto proj = [&]( int v ) {
+            const auto P = pt( v );
+            const TF e[ 3 ] = { P[ 0 ] - c[ 0 ], P[ 1 ] - c[ 1 ], P[ 2 ] - c[ 2 ] };
+            return Vector<TF,2>( Values(), ( e[ 0 ] * u[ 0 ] + e[ 1 ] * u[ 1 ] + e[ 2 ] * u[ 2 ] ) / s,
+                                           ( e[ 0 ] * w[ 0 ] + e[ 1 ] * w[ 1 ] + e[ 2 ] * w[ 2 ] ) / s );
+        };
+        TF acc = 0;
+        pc.for_each_facet_triangle( cut, [&]( int o, int a, int b ) {
+            acc += std_triangle_measure( Vector<Vector<TF,2>,3>( Values(), proj( o ), proj( a ), proj( b ) ) );
+        } );
+        res += weight_of( i ) * sdot::exp( -q ) * acc / ( s * TF( 2.50662827463100050242 ) );   // `sqrt( 2 pi )`
+    }
+    return res;
+}
+
 UTP HD typename DTP::TF DTP::wedge_measure( const auto &P, const auto &Q ) const {
-    static_assert( ct_dim == 2, "the polar corner is the 2D reduction (see SumOfGaussians.h)" );
     const TF two_pi = TF( 6.283185307179586476925286766559 );
 
     const TF dx = Q[ 0 ] - P[ 0 ], dy = Q[ 1 ] - P[ 1 ];
@@ -255,23 +316,57 @@ UTP HD typename DTP::EdgeInfo DTP::edge_info( const auto &A, const auto &B, cons
 UTP HD typename DTP::TF DTP::integrate_over_simplex( const auto &pts ) const {
     static_assert( ct_dim == 2, "the exact path is 2D; beyond that we go through PointwiseDensity" );
 
-    const SI n = nb_gaussians;
+    // the diameter of the triangle, for the choice of the rule ( during a continuation only: at `s = 0` the integral is exact )
+    TF diam2 = 0;
+    if ( terms && conv_s > 0 )
+        for ( int a = 0; a < 3; ++a )
+            for ( int b = a + 1; b < 3; ++b ) {
+                const TF dx = pts[ a ][ 0 ] - pts[ b ][ 0 ], dy = pts[ a ][ 1 ] - pts[ b ][ 1 ];
+                diam2 = sdot::fmax( diam2, dx * dx + dy * dy );
+            }
+
+    const SI n = nb_terms();
     TF res = 0;
     for ( SI i = 0; i < n; ++i ) {
         const TF s = sigma_of( i );
+        if ( diam2 > 0 && s * s > quadrature_ratio * quadrature_ratio * diam2 ) {
+            res += quadrature_term( i, pts );
+            continue;
+        }
         const auto ys = Vector<Vector<TF,2>,3>( Function(), [&]( PI k ) {
-            return Vector<TF,2>( Function(), [&]( PI c ) { return ( pts[ k ][ c ] - TF( positions( i, c ) ) ) / s; } );
+            return Vector<TF,2>( Function(), [&]( PI c ) { return ( pts[ k ][ c ] - center_of( i, c ) ) / s; } );
         } );
-        res += TF( weights( i ) ) * std_triangle_measure( ys );
+        res += weight_of( i ) * std_triangle_measure( ys );
     }
     return res;
+}
+
+UTP HD typename DTP::TF DTP::quadrature_term( SI i, const auto &pts ) const {
+    // Dunavant's degree 5 rule: the centroid, and two orbits of three points ( barycentric `( a, b, b )` )
+    const TF ax = pts[ 1 ][ 0 ] - pts[ 0 ][ 0 ], ay = pts[ 1 ][ 1 ] - pts[ 0 ][ 1 ];
+    const TF bx = pts[ 2 ][ 0 ] - pts[ 0 ][ 0 ], by = pts[ 2 ][ 1 ] - pts[ 0 ][ 1 ];
+    TF area = ( ax * by - ay * bx ) / 2;
+    area = area < 0 ? -area : area;
+    const TF s = sigma_of( i );
+    const TF cx = center_of( i, 0 ), cy = center_of( i, 1 );
+    auto f = [&]( TF l0, TF l1, TF l2 ) {
+        const TF x = l0 * pts[ 0 ][ 0 ] + l1 * pts[ 1 ][ 0 ] + l2 * pts[ 2 ][ 0 ] - cx;
+        const TF y = l0 * pts[ 0 ][ 1 ] + l1 * pts[ 1 ][ 1 ] + l2 * pts[ 2 ][ 1 ] - cy;
+        return sdot::exp( - ( x * x + y * y ) / ( 2 * s * s ) );
+    };
+    const TF a1 = TF( 0.059715871789770 ), b1 = TF( 0.470142064105115 );
+    const TF a2 = TF( 0.797426985353087 ), b2 = TF( 0.101286507323456 );
+    const TF acc = TF( 0.225 ) * f( TF( 1 ) / 3, TF( 1 ) / 3, TF( 1 ) / 3 )
+                 + TF( 0.132394152788506 ) * ( f( a1, b1, b1 ) + f( b1, a1, b1 ) + f( b1, b1, a1 ) )
+                 + TF( 0.125939180544827 ) * ( f( a2, b2, b2 ) + f( b2, a2, b2 ) + f( b2, b2, a2 ) );
+    return weight_of( i ) * area * acc / ( TF( 6.283185307179586476925286766559 ) * s * s );
 }
 
 UTP HD void DTP::integrate_over_simplex_bwd( const auto &pts, TF g, auto &&grad_pts, auto &&grad_dist ) const {
     static_assert( ct_dim == 2, "the exact path is 2D; beyond that we go through PointwiseDensity" );
 
     auto add_to = []( auto &&dst, TF v ) {
-        if constexpr ( ! dst.surely_null )
+        if constexpr ( ! DECAYED_TYPE_OF( dst )::surely_null )
             atomic_add( dst.ref(), v );
     };
 
@@ -308,7 +403,7 @@ UTP HD void DTP::integrate_over_simplex_bwd( const auto &pts, TF g, auto &&grad_
             }
         }
 
-        if constexpr ( ! grad_dist.positions.surely_null )
+        if constexpr ( ! DECAYED_TYPE_OF( grad_dist.positions )::surely_null )
             for ( PI c = 0; c < 2; ++c )
                 add_to( grad_dist.positions( i, c ), dc[ c ] );
 

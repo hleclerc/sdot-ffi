@@ -18,6 +18,9 @@ namespace sdot {
 //                        by a cut that faces no seed when there is nothing more precise
 //                        to say -- a `Cell.cut` made from Python, a wall of a box
 //   PIECE                a SPLITTING plane added by a distribution (`Image::for_each_piece`)
+//   SEAM / SUPPORT       the wall of a block of the support of a density, for DISPLAY only (`Distribution.display_blocks`):
+//                        SEAM when the block on the other side has mass too -- an inner seam of the
+//                        cell, that is not drawn --, SUPPORT when it faces a region without mass
 //   INFINITE             a wall of the replacement simplex of an UNBOUNDED cell: it
 //                        does not exist, its offsets are made up and pushed back as cuts come in
 //                        (see `Local2::grow_for`), and it disappears the day no vertex
@@ -29,12 +32,14 @@ namespace cell_ids {
     enum : int {
         INFINITE = INT_MIN,
         PIECE    = INT_MIN + 1,
+        SEAM     = INT_MIN + 2,
+        SUPPORT  = INT_MIN + 3,
         BOUNDARY = -1,
     };
 
     HD constexpr int  domain_id ( int k  ) { return -1 - k; }
     HD constexpr bool is_seed   ( int id ) { return id >= 0; }
-    HD constexpr bool is_domain ( int id ) { return id < 0 && id > PIECE; }
+    HD constexpr bool is_domain ( int id ) { return id < 0 && id > SUPPORT; }
     HD constexpr int  domain_num( int id ) { return -1 - id; }
 }
 

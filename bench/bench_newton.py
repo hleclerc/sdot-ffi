@@ -154,8 +154,8 @@ if p := bench( "newton",
     m = min( n, 2000 )
     OtProblem( SumOfDiracs( pos[ :m ] ), target() ).solve( settings( m, 3 ) )
 
-    from loom.drivers.driver import driver
-    on_card = bool( getattr( driver.device, "is_cuda_gpu", False ) )
+    import loom
+    on_card = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     kt = benchlib.KernelTiming() if on_card else None
     # THE TREE alone ( on the card: one call, `gpu/Bsp2D.cuh`; waited for, min of `reps` ), kernel-only next to the wall
     from sdot import AaBsp

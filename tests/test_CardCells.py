@@ -19,15 +19,10 @@ variant, which is pure Python.
 THE 3D CELLS ( `include/sdot/gpu/Cell3D.cuh`, the last section ): a warp per cell, the same outputs, the same four
 properties, checked the same way against the generic double path ( or the plain storage where the cell is large ).
 """
-import numpy
 
-from loom import driver
 from errand import test, skip
 
-from sdot import AaBsp, PowerDiagram, box_half_spaces
-from sdot.PowerDiagram_Bsp import card_variant_for
 
-_GPU = bool( getattr( driver.device, "is_cuda_gpu", False ) )
 _NO_GPU = "the dedicated cell kernels only exist on a CUDA device"
 
 
@@ -110,6 +105,11 @@ def _clouds( rng ):
 # ---- the measures ------------------------------------------------------------------------------------------------
 
 if test( "the_card_cells_are_the_generic_cells_voronoi" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -122,6 +122,11 @@ if test( "the_card_cells_are_the_generic_cells_voronoi" ):
         _check( rng.uniform( [ -3, 2 ], [ 5, 2.5 ], size = ( 3000, 2 ) ), mi = ( -3, 2 ), ma = ( 5, 2.5 ), label = "off-centre box" )
 
 if test( "the_card_cells_are_the_generic_cells_with_weights" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -138,6 +143,11 @@ if test( "the_card_cells_are_the_generic_cells_with_weights" ):
         _check( pos, rng.uniform( -3, 3, n ) / n, label = "w ~ 3 h^2 ( empty cells )" )
 
 if test( "the_card_cells_overflow_into_the_later_passes" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -154,6 +164,11 @@ if test( "the_card_cells_overflow_into_the_later_passes" ):
         _check( pos, w, label = "heavy centre" )
 
 if test( "the_card_cells_small_and_degenerate_clouds" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -171,6 +186,11 @@ if test( "the_card_cells_small_and_degenerate_clouds" ):
         _check( pos, w, label = "outside + duplicates" )
 
 if test( "the_card_cells_follow_the_weights" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -188,6 +208,11 @@ if test( "the_card_cells_follow_the_weights" ):
             assert numpy.median( r ) < 1e-9 and r.max() < 1e-4, ( s, numpy.median( r ), r.max() )
 
 if test( "the_card_takes_a_constant_density" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -232,6 +257,11 @@ def _card_laplacian( out, n ):
 
 
 if test( "the_card_laplacian_is_the_generic_one" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -282,6 +312,11 @@ if test( "the_card_laplacian_is_the_generic_one" ):
                        f"{ len( extra ) } extra ), rel. gap median { numpy.median( err ) :.1e} max { err.max() :.1e}" )
 
 if test( "the_card_moments_are_the_generic_ones" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -320,6 +355,11 @@ def _measures_fn( pos, w, tree, kernel, card, wrt ):
 
 
 if test( "the_card_adjoint_is_the_generic_one" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -332,16 +372,21 @@ if test( "the_card_adjoint_is_the_generic_one" ):
             tree = AaBsp( pos, w )
             g = rng.normal( size = n )
             for wrt, x in ( ( "weights", w ), ( "positions", pos ) ):
-                _, pb = driver.vjp( _measures_fn( pos, w, tree, "FP64", False, wrt ), x )
+                _, pb = loom.vjp( _measures_fn( pos, w, tree, "FP64", False, wrt ), x )
                 ref = numpy.asarray( pb( g )[ 0 ] )
                 for kernel in ( "FP64", "FP32" ):
-                    _, pb = driver.vjp( _measures_fn( pos, w, tree, kernel, True, wrt ), x )
+                    _, pb = loom.vjp( _measures_fn( pos, w, tree, kernel, True, wrt ), x )
                     got = numpy.asarray( pb( g )[ 0 ] )
                     err = numpy.abs( got - ref ).max() / numpy.abs( ref ).max()
                     assert err < ( 1e-9 if kernel == "FP64" else 1e-5 ), ( label, wrt, kernel, err )
                     print( f"  { label } d/d{ wrt } { kernel }: max gap { err :.1e} of the largest entry" )
 
 if test( "the_card_adjoint_is_the_finite_difference" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -359,6 +404,11 @@ if test( "the_card_adjoint_is_the_finite_difference" ):
         check_grad( f, pos, w, seed = 13 )
 
 if test( "the_card_runs_under_jit" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -460,6 +510,11 @@ def _tied_clouds( rng ):
 
 
 if test( "the_card_tree_is_the_host_tree" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -477,6 +532,11 @@ if test( "the_card_tree_is_the_host_tree" ):
             print( f"  { label }: the host's tree" )
 
 if test( "the_card_tree_follows_the_rule_on_ties" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -499,6 +559,11 @@ if test( "the_card_tree_follows_the_rule_on_ties" ):
         _check( g, label = "grid" )
 
 if test( "the_card_tree_majorants_bound_the_weights" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -523,6 +588,11 @@ if test( "the_card_tree_majorants_bound_the_weights" ):
             print( f"  { label }: { int( ( numpy.abs( wa ).sum( axis = 1 ) > 0 ).sum() ) } affine nodes of { len( wb ) }" )
 
 if test( "the_card_tree_is_built_under_jit_from_traced_positions" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -562,6 +632,11 @@ if test( "the_card_tree_is_built_under_jit_from_traced_positions" ):
 # ---- capacities, limits, variants ----------------------------------------------------------------------------------
 
 if test( "the_card_fourth_pass_works_in_batches" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -595,7 +670,7 @@ if test( "the_card_fourth_pass_works_in_batches" ):
                     assert numpy.abs( ref[ :len( centres ) ] / ( k * apothem ** 2 * numpy.tan( numpy.pi / k ) ) - 1 ).max() < 0.05
                 for kernel in ( "FP64", "FP32" ):
                     m = _m( _pd( pos, w, kernel, True, tree = tree ) )
-                    _, pb = driver.vjp( _measures_fn( pos, w, tree, kernel, True, "weights" ), w )
+                    _, pb = loom.vjp( _measures_fn( pos, w, tree, kernel, True, "weights" ), w )
                     got[ warps, kernel ] = ( m, numpy.asarray( pb( g )[ 0 ] ) )
         finally:
             bsp.PowerDiagram_Bsp.card_overflow_warps = original
@@ -605,6 +680,11 @@ if test( "the_card_fourth_pass_works_in_batches" ):
             assert numpy.abs( got[ 4, kernel ][ 1 ] ).max() > 0, kernel
 
 if test( "the_card_raises_past_the_vertex_limit" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -648,6 +728,11 @@ if test( "the_card_raises_past_the_vertex_limit" ):
 
 if test( "the_card_variant_follows_the_inputs" ):
     # pure Python: the variant chosen from the seeds and the tree, synthetic sizes past 32-bit indices and depth 32
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     assert card_variant_for( 32, 10 ** 6, 2 ** 18 - 1 ) == "sdot::gpu2d::Variant<float, int, int, 32>"
     assert card_variant_for( 32, 10 ** 6, 2 ** 18 - 1, 3 ) == "sdot::gpu3d::Variant<float, int, int, 32>"
     assert card_variant_for( 64, 10 ** 11, 2 ** 40 - 1, 3 ) == "sdot::gpu3d::Variant<double, long long, long long, 64>"
@@ -665,6 +750,11 @@ if test( "the_card_variant_follows_the_inputs" ):
         pass
 
 if test( "the_wide_card_variant_computes_the_same_cells" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -678,13 +768,13 @@ if test( "the_wide_card_variant_computes_the_same_cells" ):
         tree = AaBsp( pos, w, max_seeds_per_leaf = 2 )
         narrow = _pd( pos, w, "FP32", True, tree = tree )._card_cells( facets = True )
         g = rng.normal( size = len( pos ) )
-        _, pb = driver.vjp( _measures_fn( pos, w, tree, "FP32", True, "weights" ), w )
+        _, pb = loom.vjp( _measures_fn( pos, w, tree, "FP32", True, "weights" ), w )
         gn = numpy.asarray( pb( g )[ 0 ] )
         original = bsp.card_variant_for
         try:
             bsp.card_variant_for = lambda fp, n, nodes, dim = 2: f"sdot::gpu2d::Variant<{ 'float' if fp == 32 else 'double' }, long long, long long, 64>"
             wide = _pd( pos, w, "FP32", True, tree = tree )._card_cells( facets = True )
-            _, pb = driver.vjp( _measures_fn( pos, w, tree, "FP32", True, "weights" ), w )
+            _, pb = loom.vjp( _measures_fn( pos, w, tree, "FP32", True, "weights" ), w )
             gw = numpy.asarray( pb( g )[ 0 ] )
         finally:
             bsp.card_variant_for = original
@@ -756,6 +846,11 @@ def _sphere3( k, rng, n_back = 1500, r = 0.2 ):
 
 
 if test( "the_card_cells_3d_are_the_generic_cells_voronoi" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -765,6 +860,11 @@ if test( "the_card_cells_3d_are_the_generic_cells_voronoi" ):
         _check3( rng.uniform( [ -3, 2, 0 ], [ 5, 2.5, 1 ], size = ( 3000, 3 ) ), mi = ( -3, 2, 0 ), ma = ( 5, 2.5, 1 ), label = "off-centre box" )
 
 if test( "the_card_cells_3d_are_the_generic_cells_with_weights" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -779,6 +879,11 @@ if test( "the_card_cells_3d_are_the_generic_cells_with_weights" ):
             _check3( p, w, label = label )
 
 if test( "the_card_cells_3d_overflow_into_the_later_passes" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -793,6 +898,11 @@ if test( "the_card_cells_3d_overflow_into_the_later_passes" ):
         _check3( pos, w, label = "heavy centre", plain = True )
 
 if test( "the_card_cells_3d_small_and_degenerate_clouds" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -830,6 +940,11 @@ if test( "the_card_cells_3d_small_and_degenerate_clouds" ):
         _check3( pos, w, label = "outside + duplicates" )
 
 if test( "the_card_cells_3d_follow_the_weights" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -847,6 +962,11 @@ if test( "the_card_cells_3d_follow_the_weights" ):
             assert numpy.median( r ) < 1e-9 and r.max() < 1e-4, ( s, numpy.median( r ), r.max() )
 
 if test( "the_card_laplacian_3d_is_the_generic_one" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -894,6 +1014,11 @@ if test( "the_card_laplacian_3d_is_the_generic_one" ):
                        f"{ len( extra ) } extra ), rel. gap median { numpy.median( err ) :.1e} max { err.max() :.1e}" )
 
 if test( "the_card_moments_3d_are_the_generic_ones" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -932,6 +1057,11 @@ def _measures_fn3( pos, w, tree, kernel, card, wrt ):
 
 
 if test( "the_card_adjoint_3d_is_the_generic_one" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -942,16 +1072,21 @@ if test( "the_card_adjoint_3d_is_the_generic_one" ):
             tree = AaBsp( pos, w )
             g = rng.normal( size = n )
             for wrt, x in ( ( "weights", w ), ( "positions", pos ) ):
-                _, pb = driver.vjp( _measures_fn3( pos, w, tree, "FP64", False, wrt ), x )
+                _, pb = loom.vjp( _measures_fn3( pos, w, tree, "FP64", False, wrt ), x )
                 ref = numpy.asarray( pb( g )[ 0 ] )
                 for kernel in ( "FP64", "FP32" ):
-                    _, pb = driver.vjp( _measures_fn3( pos, w, tree, kernel, True, wrt ), x )
+                    _, pb = loom.vjp( _measures_fn3( pos, w, tree, kernel, True, wrt ), x )
                     got = numpy.asarray( pb( g )[ 0 ] )
                     err = numpy.abs( got - ref ).max() / numpy.abs( ref ).max()
                     assert err < ( 1e-9 if kernel == "FP64" else 1e-5 ), ( label, wrt, kernel, err )
                     print( f"  { label } d/d{ wrt } { kernel }: max gap { err :.1e} of the largest entry" )
 
 if test( "the_card_adjoint_3d_is_the_finite_difference" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -974,6 +1109,11 @@ if test( "the_card_adjoint_3d_is_the_finite_difference" ):
         check_grad( f, pos, w, seed = 39 )
 
 if test( "the_card_3d_runs_under_jit" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -1005,6 +1145,11 @@ if test( "the_card_3d_runs_under_jit" ):
         assert numpy.array_equal( me, mj )
 
 if test( "the_card_tree_3d_is_the_host_tree" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -1032,6 +1177,11 @@ if test( "the_card_tree_3d_is_the_host_tree" ):
             print( f"  { label }: { int( ( numpy.abs( wa ).sum( axis = 1 ) > 0 ).sum() ) } affine nodes of { len( wb ) }" )
 
 if test( "the_card_3d_third_pass_works_in_batches" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:
@@ -1060,7 +1210,7 @@ if test( "the_card_3d_third_pass_works_in_batches" ):
                     _check3( pos, w, label = "8 spheres of 150, 4 slots", plain = True )
                 for kernel in ( "FP64", "FP32" ):
                     m = _m( _pd( pos, w, kernel, True, *_BOX3, tree = tree ) )
-                    _, pb = driver.vjp( _measures_fn3( pos, w, tree, kernel, True, "weights" ), w )
+                    _, pb = loom.vjp( _measures_fn3( pos, w, tree, kernel, True, "weights" ), w )
                     got[ warps, kernel ] = ( m, numpy.asarray( pb( g )[ 0 ] ) )
         finally:
             bsp.PowerDiagram_Bsp.card_overflow_warps = original
@@ -1069,6 +1219,11 @@ if test( "the_card_3d_third_pass_works_in_batches" ):
                 assert numpy.isfinite( a ).all() and numpy.array_equal( a, b ), kernel
 
 if test( "the_card_3d_raises_past_the_vertex_limit" ):
+    import numpy
+    import loom
+    from sdot import AaBsp, PowerDiagram, box_half_spaces
+    from sdot.PowerDiagram_Bsp import card_variant_for
+    _GPU = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
     if not _GPU:
         skip( _NO_GPU )
     else:

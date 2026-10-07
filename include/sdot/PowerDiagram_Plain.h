@@ -25,7 +25,7 @@ struct PowerDiagram_Plain {
     /// the same diagram, the weights read ELSEWHERE ( see `PowerDiagram_Bsp::with_weights` ); the order
     /// of the members is that of `PowerDiagram.py` + `PowerDiagram_Plain.py`
     HD auto with_weights( auto &&weights_ ) const {
-        return ::sdot::PowerDiagram_Plain{ box_min, box_max, bnd_directions, bnd_offsets, nb_points, nb_boundaries, nb_dims, positions, weights_ };
+        return ::sdot::PowerDiagram_Plain{ box_min, box_max, bnd_directions, bnd_offsets, start_vertices, start_topo, nb_starts, nb_topo, nb_points, nb_boundaries, nb_dims, positions, weights_ };
     }
 };
 

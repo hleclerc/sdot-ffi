@@ -42,14 +42,14 @@ struct PowerDiagram_Bsp {
     HD auto with_weights( auto &&sorted_weights_, auto &&node_wa_, auto &&node_wb_ ) const {
         auto tree_ = ::sdot::AaBsp{ tree.seed_indices, tree.node_left, tree.node_right, tree.node_begin, tree.node_end,
                                     tree.node_box, node_wa_, node_wb_, tree.nb_bsp_seeds, tree.nb_bsp_nodes, tree.nb_lohi, tree.nb_dims };
-        return ::sdot::PowerDiagram_Bsp{ box_min, box_max, bnd_directions, bnd_offsets, nb_points, nb_boundaries, nb_dims,
+        return ::sdot::PowerDiagram_Bsp{ box_min, box_max, bnd_directions, bnd_offsets, start_vertices, start_topo, nb_starts, nb_topo, nb_points, nb_boundaries, nb_dims,
                                          tree_, sorted_positions, sorted_weights_, memo_nbrs, memo_counts, nb_memo };
     }
     /// ... and the memory also read elsewhere ( the solver writes it at each sweep )
     HD auto with_weights( auto &&sorted_weights_, auto &&node_wa_, auto &&node_wb_, auto &&memo_nbrs_, auto &&memo_counts_ ) const {
         auto tree_ = ::sdot::AaBsp{ tree.seed_indices, tree.node_left, tree.node_right, tree.node_begin, tree.node_end,
                                     tree.node_box, node_wa_, node_wb_, tree.nb_bsp_seeds, tree.nb_bsp_nodes, tree.nb_lohi, tree.nb_dims };
-        return ::sdot::PowerDiagram_Bsp{ box_min, box_max, bnd_directions, bnd_offsets, nb_points, nb_boundaries, nb_dims,
+        return ::sdot::PowerDiagram_Bsp{ box_min, box_max, bnd_directions, bnd_offsets, start_vertices, start_topo, nb_starts, nb_topo, nb_points, nb_boundaries, nb_dims,
                                          tree_, sorted_positions, sorted_weights_, memo_nbrs_, memo_counts_, nb_memo };
     }
 

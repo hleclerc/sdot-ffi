@@ -21,6 +21,7 @@
 // =====================================================================================
 
 #include "Reduce.cuh"
+#include "Density3D.cuh"
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -41,6 +42,22 @@ struct GaussIn { const P &pos; const S &sigma; const M &mass; };
 template<class P,class S,class M>
 GaussIn<P,S,M> gauss_in( const P &pos, const S &sigma, const M &mass ) { return { pos, sigma, mass }; }
 
+/// a mesh: nodes `[ nn, 2 ]`, values `[ ne, 3 ]` ( DG1, per corner ), triangles `[ ne, 3 ]`, gradients `[ ne, 6 ]`, the hierarchy `[ nb, 2 ]` twice and `[ nb, 4 ]`
+template<class N,class V,class T,class G,class L,class H,class K>
+struct MeshIn { const N &nodes; const V &values; const T &tri; const G &grad; const L &lo; const H &hi; const K &links; };
+template<class N,class V,class T,class G,class L,class H,class K>
+MeshIn<N,V,T,G,L,H,K> mesh_in( const N &nodes, const V &values, const T &tri, const G &grad, const L &lo, const H &hi, const K &links ) {
+    return { nodes, values, tri, grad, lo, hi, links };
+}
+
+/// a tetrahedral mesh ( 3D, `Density3D.cuh::DensMesh3` ): the same tensors, `[ ne, 4 ]`, gradients `[ ne, 12 ]`, boxes `[ nb, 3 ]`
+template<class N,class V,class T,class G,class L,class H,class K>
+struct Mesh3In { const N &nodes; const V &values; const T &tet; const G &grad; const L &lo; const H &hi; const K &links; };
+template<class N,class V,class T,class G,class L,class H,class K>
+Mesh3In<N,V,T,G,L,H,K> mesh3_in( const N &nodes, const V &values, const T &tet, const G &grad, const L &lo, const H &hi, const K &links ) {
+    return { nodes, values, tet, grad, lo, hi, links };
+}
+
 template<class T> struct IsImageIn : std::false_type {};
 template<class V> struct IsImageIn<ImageIn<V>> : std::true_type {};
 template<class T> struct IsGaussIn : std::false_type {};
@@ -52,6 +69,20 @@ template<class TF>
 __global__ void __launch_bounds__( BLOCK ) gather_doubles( SI n, Strided<TF,1> src, double *dst ) {
     const SI k = SI( blockIdx.x ) * BLOCK + threadIdx.x;
     if ( k < n ) dst[ k ] = double( src( k ) );
+}
+
+/// any strided matrix `[ rows, cols ]` as a flat buffer of `T`, row by row
+template<class TS,class T>
+__global__ void __launch_bounds__( BLOCK ) gather_matrix( SI rows, SI cols, Strided<TS,2> src, T *dst ) {
+    const SI k = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( k < rows * cols ) dst[ k ] = T( src( k / cols, k % cols ) );
+}
+
+/// ... and the two columns of a matrix `[ rows, 2 ]` apart
+template<class TS>
+__global__ void __launch_bounds__( BLOCK ) gather_columns2( SI rows, Strided<TS,2> src, double *c0, double *c1 ) {
+    const SI k = SI( blockIdx.x ) * BLOCK + threadIdx.x;
+    if ( k < rows ) { c0[ k ] = double( src( k, 0 ) ); c1[ k ] = double( src( k, 1 ) ); }
 }
 
 template<class TF>
@@ -260,9 +291,86 @@ struct GaussDensityHost {
     }
 };
 
+/// a mesh ( see the header ): the call's tensors gathered as doubles and ints. No continuation ( `possible` is false: a mesh is
+/// already as smooth as a piecewise linear density gets, and the CPU does not convolve it either )
+struct MeshDensityHost {
+    using Dev = DensMesh;
+    Dev     dev{};
+    static constexpr bool possible = false;
+
+    template<class In>
+    bool prepare( const CudaQueue &queue, auto &allocator, const In &in, const double * ) {
+        const SI nn = SI( in.nodes.shape( 0 ) ), ne = SI( in.tri.shape( 0 ) ), nb = SI( in.lo.shape( 0 ) );
+        auto vec = [&]( SI m ) { return static_cast<double *>( take( allocator, SI( sizeof( double ) ) * std::max<SI>( m, 1 ) ) ); };
+        auto ivec = [&]( SI m ) { return static_cast<int *>( take( allocator, SI( sizeof( int ) ) * std::max<SI>( m, 1 ) ) ); };
+        double *px = vec( nn ), *py = vec( nn ), *val = vec( 3 * ne ), *grad = vec( 6 * ne ), *blo = vec( 2 * nb ), *bhi = vec( 2 * nb );
+        int *tri = ivec( 3 * ne ), *links = ivec( 4 * nb );
+        if ( ! px || ! py || ! val || ! grad || ! blo || ! bhi || ! tri || ! links )
+            return false;
+        using TN = std::remove_const_t<typename std::decay_t<decltype( in.nodes )>::TF>;
+        using TV = std::remove_const_t<typename std::decay_t<decltype( in.values )>::TF>;
+        using TT = std::remove_const_t<typename std::decay_t<decltype( in.tri )>::TF>;
+        using TG = std::remove_const_t<typename std::decay_t<decltype( in.grad )>::TF>;
+        using TL = std::remove_const_t<typename std::decay_t<decltype( in.lo )>::TF>;
+        using TH = std::remove_const_t<typename std::decay_t<decltype( in.hi )>::TF>;
+        using TK = std::remove_const_t<typename std::decay_t<decltype( in.links )>::TF>;
+        launch_kernel( queue, &gather_columns2<TN>, blocks_for( nn ), BLOCK, 0, nn, strided( in.nodes ), px, py );
+        launch_kernel( queue, &gather_matrix<TV,double>, blocks_for( 3 * ne ), BLOCK, 0, ne, SI( 3 ), strided( in.values ), val );
+        launch_kernel( queue, &gather_matrix<TT,int>, blocks_for( 3 * ne ), BLOCK, 0, ne, SI( 3 ), strided( in.tri ), tri );
+        launch_kernel( queue, &gather_matrix<TG,double>, blocks_for( 6 * ne ), BLOCK, 0, ne, SI( 6 ), strided( in.grad ), grad );
+        launch_kernel( queue, &gather_matrix<TL,double>, blocks_for( 2 * nb ), BLOCK, 0, nb, SI( 2 ), strided( in.lo ), blo );
+        launch_kernel( queue, &gather_matrix<TH,double>, blocks_for( 2 * nb ), BLOCK, 0, nb, SI( 2 ), strided( in.hi ), bhi );
+        launch_kernel( queue, &gather_matrix<TK,int>, blocks_for( 4 * nb ), BLOCK, 0, nb, SI( 4 ), strided( in.links ), links );
+        dev = DensMesh{ ne, nb, px, py, val, tri, grad, blo, bhi, links };
+        return true;
+    }
+
+    double min_scale( const CudaQueue & ) const { return 0; }
+    void   at( const CudaQueue &, double, bool ) {}
+};
+
+/// a tetrahedral mesh: the call's tensors gathered as doubles and ints, flat ( no continuation, as `MeshDensityHost` )
+struct Mesh3DensityHost {
+    using Dev = gpu3d::DensMesh3;
+    Dev     dev{};
+    static constexpr bool possible = false;
+
+    template<class In>
+    bool prepare( const CudaQueue &queue, auto &allocator, const In &in, const double * ) {
+        const SI nn = SI( in.nodes.shape( 0 ) ), ne = SI( in.tet.shape( 0 ) ), nb = SI( in.lo.shape( 0 ) );
+        auto vec = [&]( SI m ) { return static_cast<double *>( take( allocator, SI( sizeof( double ) ) * std::max<SI>( m, 1 ) ) ); };
+        auto ivec = [&]( SI m ) { return static_cast<int *>( take( allocator, SI( sizeof( int ) ) * std::max<SI>( m, 1 ) ) ); };
+        double *pn = vec( 3 * nn ), *val = vec( 4 * ne ), *grad = vec( 12 * ne ), *blo = vec( 3 * nb ), *bhi = vec( 3 * nb );
+        int *tet = ivec( 4 * ne ), *links = ivec( 4 * nb );
+        if ( ! pn || ! val || ! grad || ! blo || ! bhi || ! tet || ! links )
+            return false;
+        using TN = std::remove_const_t<typename std::decay_t<decltype( in.nodes )>::TF>;
+        using TV = std::remove_const_t<typename std::decay_t<decltype( in.values )>::TF>;
+        using TT = std::remove_const_t<typename std::decay_t<decltype( in.tet )>::TF>;
+        using TG = std::remove_const_t<typename std::decay_t<decltype( in.grad )>::TF>;
+        using TL = std::remove_const_t<typename std::decay_t<decltype( in.lo )>::TF>;
+        using TH = std::remove_const_t<typename std::decay_t<decltype( in.hi )>::TF>;
+        using TK = std::remove_const_t<typename std::decay_t<decltype( in.links )>::TF>;
+        launch_kernel( queue, &gather_matrix<TN,double>, blocks_for( 3 * nn ), BLOCK, 0, nn, SI( 3 ), strided( in.nodes ), pn );
+        launch_kernel( queue, &gather_matrix<TV,double>, blocks_for( 4 * ne ), BLOCK, 0, ne, SI( 4 ), strided( in.values ), val );
+        launch_kernel( queue, &gather_matrix<TT,int>, blocks_for( 4 * ne ), BLOCK, 0, ne, SI( 4 ), strided( in.tet ), tet );
+        launch_kernel( queue, &gather_matrix<TG,double>, blocks_for( 12 * ne ), BLOCK, 0, ne, SI( 12 ), strided( in.grad ), grad );
+        launch_kernel( queue, &gather_matrix<TL,double>, blocks_for( 3 * nb ), BLOCK, 0, nb, SI( 3 ), strided( in.lo ), blo );
+        launch_kernel( queue, &gather_matrix<TH,double>, blocks_for( 3 * nb ), BLOCK, 0, nb, SI( 3 ), strided( in.hi ), bhi );
+        launch_kernel( queue, &gather_matrix<TK,int>, blocks_for( 4 * nb ), BLOCK, 0, nb, SI( 4 ), strided( in.links ), links );
+        dev = Dev{ ne, nb, pn, val, tet, grad, blo, bhi, links };
+        return true;
+    }
+
+    double min_scale( const CudaQueue & ) const { return 0; }
+    void   at( const CudaQueue &, double, bool ) {}
+};
+
 /// the host class of what the call hands over: a 0-d tensor ( or a number ) is a constant
 template<class In> struct DensityHostOf { using type = ConstDensityHost; };
 template<class V> struct DensityHostOf<ImageIn<V>> { using type = ImageDensityHost<std::remove_const_t<typename V::TF>>; };
 template<class P,class S,class M> struct DensityHostOf<GaussIn<P,S,M>> { using type = GaussDensityHost; };
+template<class N,class V,class T,class G,class L,class H,class K> struct DensityHostOf<MeshIn<N,V,T,G,L,H,K>> { using type = MeshDensityHost; };
+template<class N,class V,class T,class G,class L,class H,class K> struct DensityHostOf<Mesh3In<N,V,T,G,L,H,K>> { using type = Mesh3DensityHost; };
 
 } // namespace sdot::gpu2d

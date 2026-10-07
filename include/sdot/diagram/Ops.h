@@ -33,11 +33,13 @@
 #include <loom/support/containers/Matrix.h>
 #include <loom/support/containers/Vector.h>
 #include <loom/support/atomic_add.h>
+#include <limits>
 #include "../cell/Providers.h"
 #include "../cell/Engine.h"
 #include "../cell/Ops.h"
 #include "../PieceWorkspace.h"
 #include "../UnitDensity.h"
+#include "Moments.h"
 
 #include <limits>
 
@@ -312,14 +314,14 @@ template<class PD>
 HD void scatter_cell_grad( const PD &pd, SI k0, const auto &cell, const auto &grad_vp, auto &&grad_positions, auto &&grad_weights ) {
     using TF = typename PD::TF;
     constexpr int D = PD::ct_dim;
-    if constexpr ( grad_positions.surely_null && grad_weights.surely_null ) {
+    if constexpr ( DECAYED_TYPE_OF( grad_positions )::surely_null && DECAYED_TYPE_OF( grad_weights )::surely_null ) {
         return;
     } else {
         if ( ! cell.bounded() || cell.nb_vertices() == 0 )
             return;
 
         auto atomic_add_to = []( auto &&dst, TF v ) {
-            if constexpr ( ! dst.surely_null )
+            if constexpr ( ! DECAYED_TYPE_OF( dst )::surely_null )
                 atomic_add( dst.ref(), v );
         };
 
@@ -454,6 +456,70 @@ HD void build_cell( const PD &pd, SI k, const auto &dom, auto &&res, auto &&scra
     c.store( res );
 }
 
+/// The cell of seed `k` cut to the BLOCK `b` of the support of a density, put into `res` like `build_cell`
+/// -- the cell itself when `b < 0`. What a DISPLAY of the cells restricted to where the density has
+/// mass is made of: one call over the pieces ( `PowerDiagram.support_pieces` ).
+///
+/// A block is a convex polytope given by the distribution, host side ( `Distribution.display_blocks` ):
+/// its walls `dirs( b, f ) . x <= offs( b, f )`, each with the identifier it leaves on the cell -- `SEAM`
+/// or `SUPPORT` ( `cell/Ids.h` ). A wall with a zero direction pads the list. A wall that no vertex
+/// of the cell crosses ( up to the rounding of the kernel float ) is not cut: a cell that lies in its
+/// block is not touched, and a wall that coincides with a side of the domain does not leave a sliver.
+template<class PD>
+HD void build_support_piece( const PD &pd, SI k, SI b, const auto &dirs, const auto &offs, const auto &ids, const auto &dom,
+                             auto &&res, auto &&scratch, SI thread_index ) {
+    using TK    = KernelType<DECAYED_TYPE_OF( scratch )>;
+    using TF    = typename PD::TF;
+    using Local = typename DECAYED_TYPE_OF( dom )::template Local<TK>;
+    constexpr int D = PD::ct_dim;
+    Carver cv = carver_of( scratch, thread_index );
+    Local c = local_on<Local>( scratch, cv );
+    if ( ! make_cell( pd, c, k, dom ) ) {
+        ask_more( scratch, cv );
+        return;
+    }
+    if ( b >= 0 ) {
+        const int nf = int( offs.shape( 1 ) );
+        for ( int f = 0; f < nf && c.nb_vertices(); ++f ) {
+            typename Local::PlaneT p;
+            TF n2 = 0;
+            for ( int d = 0; d < D; ++d ) {
+                const TF x = TF( dirs( b, f, d ) );
+                p.dir[ d ] = TK( x );
+                n2 += x * x;
+            }
+            if ( n2 == 0 )
+                continue;                                // padding
+            p.off = TK( offs( b, f ) );
+            p.id  = int( ids( b, f ) );
+
+            // crossed by a vertex, beyond the rounding of the kernel float ( relative to the size of the coordinates )
+            TF out = 0, amp = TF( p.off < 0 ? -p.off : p.off );
+            for ( int v = 0; v < c.nb_vertices(); ++v ) {
+                TF s = - TF( p.off ), a = 0;
+                for ( int d = 0; d < D; ++d ) {
+                    const TF t = TF( p.dir[ d ] ) * TF( c.coord( v, d ) );
+                    s += t;
+                    a += t < 0 ? -t : t;
+                }
+                out = s > out ? s : out;
+                amp = a > amp ? a : amp;
+            }
+            if ( out <= TF( 64 ) * TF( std::numeric_limits<TK>::epsilon() ) * amp )
+                continue;
+            if ( c.cut( p ) == CutStatus::NO_ROOM ) {
+                ask_more( scratch, cv );
+                return;
+            }
+        }
+    }
+    c.tidy();
+    for ( int q = 0; q < c.nb_cuts(); ++q )
+        if ( c.cid[ q ] >= 0 )
+            c.cid[ q ] = int( pd.user_id( c.cid[ q ] ) );
+    c.store( res );
+}
+
 /// ONE ROW OF THE transport HESSIAN, `d m_k / d w_j` for the neighbors `j` of cell `k`:
 /// the bisector `( k, j )` slides by `dw / ( 2 | p_k - p_j | )` when `w_j` goes up by `dw`, and what
 /// it sweeps is the density integrated over the common FACET. So
@@ -462,8 +528,8 @@ HD void build_cell( const PD &pd, SI k, const auto &dom, auto &&res, auto &&scra
 /// move. `res`: `ids( r )` ( user identifiers ) and `vals( r )` ( the values, POSITIVE ),
 /// `nb_nbrs` the count -- a capacity that loom doubles if it is missing.
 ///
-/// For piecewise-constant density only ( `Image`, Lebesgue ): the facet of a piece is
-/// flat and the density is a number there.
+/// A piecewise-constant density ( `Image`, Lebesgue ): the facet of a piece is flat and the density is a number
+/// there. Otherwise the density integrates itself on the facet ( `facet_mass`: gaussians in 2D, `Mesh` ).
 template<class PD>
 HD void hessian_row( const PD &pd, SI k, const auto &dom, auto &&res, auto &&scratch, SI thread_index, const auto &dist ) {
     using TF    = typename PD::TF;
@@ -495,25 +561,50 @@ HD void hessian_row( const PD &pd, SI k, const auto &dom, auto &&res, auto &&scr
     const auto p0 = pd.point( k );
 
     PieceWorkspace<Local> ws{ piece };
-    dist.for_each_piece( c, ws, [&]( const auto &pc, const auto &dens ) {
-        static_assert( DECAYED_TYPE_OF( dens )::is_constant, "hessian: piecewise-constant density only" );
-        const TF rho = TF( dens.value );
-        pc.template for_each_facet<TF>( [&]( int cut, TF mes ) {
-            const int id = pc.cid[ cut ];
-            if ( id < 0 )
-                return;                                  // the domain, or a tile edge: immobile
-            const auto pj = pd.point( id );
-            TF d2 = 0;
-            for ( int d = 0; d < D; ++d )
-                d2 += ( pj[ d ] - p0[ d ] ) * ( pj[ d ] - p0[ d ] );
-            const TF val = rho * mes / ( 2 * sdot::sqrt( d2 ) );
-            for ( int q = 0; q < nc; ++q )
-                if ( c.cid[ q ] == id ) {
-                    res.vals( q ) += val;
-                    break;
+    auto distance = [&]( int id ) {
+        const auto pj = pd.point( id );
+        TF d2 = 0;
+        for ( int d = 0; d < D; ++d )
+            d2 += ( pj[ d ] - p0[ d ] ) * ( pj[ d ] - p0[ d ] );
+        return sdot::sqrt( d2 );
+    };
+    auto planes = [&]( int q, auto *dir, auto &off ) {
+        TF d[ D ], o;
+        plane_of( pd, c, k, q, d, o );
+        for ( int i = 0; i < D; ++i )
+            dir[ i ] = d[ i ];
+        off = o;
+    };
+    if constexpr ( requires { DECAYED_TYPE_OF( dist )::cuts_facets; } ) {
+        // a density that cuts the FACETS of the cell itself ( `Mesh` ), see `Mesh::for_each_facet_mass`
+        dist.for_each_facet_mass( c, planes, [&]( int cut, auto part ) { res.vals( cut ) += TF( part ) / ( 2 * distance( c.cid[ cut ] ) ); } );
+    } else {
+        dist.for_each_piece( c, ws, [&]( const auto &pc, const auto &dens ) {
+            pc.template for_each_facet<TF>( [&]( int cut, TF mes ) {
+                const int id = pc.cid[ cut ];
+                if ( id < 0 )
+                    return;                                  // the domain, or a tile edge: immobile
+                const auto pj = pd.point( id );
+                TF d2 = 0;
+                for ( int d = 0; d < D; ++d )
+                    d2 += ( pj[ d ] - p0[ d ] ) * ( pj[ d ] - p0[ d ] );
+                // the density on the facet: a number on a piece of constant density, otherwise what the density says of it
+                TF on_facet;
+                if constexpr ( DECAYED_TYPE_OF( dens )::is_constant )
+                    on_facet = TF( dens.value ) * mes;
+                else {
+                    static_assert( requires { dens.facet_mass( pc, cut ); }, "hessian: this density does not know how to integrate itself on a facet ( `facet_mass` )" );
+                    on_facet = TF( dens.facet_mass( pc, cut ) );
                 }
+                const TF val = on_facet / ( 2 * sdot::sqrt( d2 ) );
+                for ( int q = 0; q < nc; ++q )
+                    if ( c.cid[ q ] == id ) {
+                        res.vals( q ) += val;
+                        break;
+                    }
+            } );
         } );
-    } );
+    }
     if ( ws.overflow )
         ask_more( scratch, cv );
 }

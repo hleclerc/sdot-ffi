@@ -34,6 +34,7 @@ from .OtProblem import OtProblem as OtProblem
 from .OtProblem import Direct as Direct
 from .OtProblem import Iterative as Iterative
 from .OtProblem import Tuning as Tuning
+from .OtProblem import OtNotConverged as OtNotConverged
 from .OtProblem import ot_solve as ot_solve
 from .SdotPlan1d import SdotPlan1d as SdotPlan1d
 from .SdotPlanNd import SdotPlanNd as SdotPlanNd
@@ -48,6 +49,11 @@ from .distributions.SumOfDiracs1d import SumOfDiracs1d as SumOfDiracs1d
 from .distributions.SumOfDiracs import SumOfDiracs as SumOfDiracs
 from .distributions.ProjectedSumOfDiracs import ProjectedSumOfDiracs as ProjectedSumOfDiracs
 from .distributions.Image import Image as Image
+from .distributions.Box import Box as Box
+from .distributions.Mesh import Mesh as Mesh
+from .distributions.Polytope import Polytope as Polytope
+from .distributions.Polytope import Polygon as Polygon
+from .distributions.Polytope import Polyhedron as Polyhedron
 from .distributions.SumOfGaussians import SumOfGaussians as SumOfGaussians
 
 from .viz.Visualizer import Visualizer as Visualizer

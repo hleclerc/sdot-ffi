@@ -60,6 +60,7 @@ struct SolverOptions {
     double agg_margin = 0;           ///< the aggregation of near-coincident seeds ( `Aggregation.h` ): `kappa`, 0 to switch it off
     double agg_gap = 0;              ///< ... `w_dup = w_rep - gap` for the exact duplicates
     SI     agg_nb_dups = 0;          ///< ... how many rows of `dups_in` are exact duplicates
+    bool   keep_start = false;       ///< the given weights are kept even if they empty a cell ( a stage of a continuation run by the caller )
 };
 
 /// the weights of the Voronoi of a SIMILITUDE of the cloud that fits it in the box `[ lo, hi ]`: the box
@@ -102,13 +103,14 @@ inline double minimum( const std::vector<double> &v ) {
 }
 
 /// THE SOLVER. `pd` carries WRITABLE weights and majorants ( `with_weights` ); `nu` and `w0`
-/// are in user order. `dups_in` ( `2 k` values, the first `o.agg_nb_dups` pairs ): the exact duplicates, `( dup, rep )`.
+/// are in user order. `start_box_in` ( `2 D + 1` values: a flag, `lo`, `hi` ): a box inside the support of the density, where the
+/// similarity packs the cloud ( flag 0: the box of the domain ). `dups_in` ( `2 k` values, the first `o.agg_nb_dups` pairs ): the exact duplicates, `( dup, rep )`.
 /// `weights` ( user order ), `hist` ( `nb_steps`, `rows [ step,
 /// NB_HIST ]`, `weights [ step, n ]` optional ), `stats`, `masses [ n ]`, `bary [ n, D ]`,
 /// `cost` ( cost ) and `clusters [ n ]` ( the representative of each seed's cluster, itself if alone ) are the outputs.
 template<class TK>
 void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom, const auto &dist, const auto &nu_in, const auto &w0_in,
-            const auto &dups_in, const SolverOptions &o, auto &&weights, auto &&hist, auto &&stats, auto &&masses, auto &&bary, auto &&cost,
+            const auto &dups_in, const auto &start_box_in, const SolverOptions &o, auto &&weights, auto &&hist, auto &&stats, auto &&masses, auto &&bary, auto &&cost,
             auto &&clusters ) {
     using PD = DECAYED_TYPE_OF( pd );
     using Dist = DECAYED_TYPE_OF( dist );
@@ -201,7 +203,7 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
     const double nu_min = minimum( nu );
     // ( the smallest masses below leave the exact duplicates out: their cells are empty by construction )
     auto min_mass = [&]( const std::vector<double> &m ) { return newton.agg.floor_min( m ); };
-    if ( given && min_mass( a ) < 1e-3 * nu_min ) {      // a warm start that empties a cell: the Voronoi, if it does better
+    if ( given && ! o.keep_start && min_mass( a ) < 1e-3 * nu_min ) {      // a warm start that empties a cell: the Voronoi, if it does better
         std::vector<double> w0( n, 0.0 ), a0;
         std::vector<Facet> fa0;
         newton.measures_and_facets( w0, a0, fa0 );
@@ -209,9 +211,11 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
         else newton.bal.set_weights( w );
     }
     if constexpr ( DECAYED_TYPE_OF( pd.box_min )::is_valid ) {
-        if ( min_mass( a ) <= 0 ) {                      // seeds outside the domain: the similarity
+        if ( min_mass( a ) <= 0 && ! ( given && o.keep_start ) ) {   // seeds outside the domain: the similarity
             double lo[ D ], hi[ D ];
             for ( int d = 0; d < D; ++d ) { lo[ d ] = double( pd.box_min( d ) ); hi[ d ] = double( pd.box_max( d ) ); }
+            if ( double( start_box_in( 0 ) ) > 0 )       // the density is not positive on all the domain: its inscribed box
+                for ( int d = 0; d < D; ++d ) { lo[ d ] = double( start_box_in( 1 + d ) ); hi[ d ] = double( start_box_in( 1 + D + d ) ); }
             std::vector<double> w1, a1;
             std::vector<Facet> fa1;
             similarity<D>( pd, lo, hi, w1 );
@@ -231,6 +235,10 @@ void solve( const CpuQueue &queue, auto &pd, const auto &pd_in, const auto &dom,
     }
 
     // ---- the stages
+    // a trace is read WHILE the solve runs ( and above all when it hangs ): the C stdio of a pipe or a file is block-buffered, and
+    // the lines would only come out at the end, if ever
+    if ( o.newton.trace )
+        std::setvbuf( stdout, nullptr, _IOLBF, 0 );
     NewtonStats total;
     double domain_mass = 0;
     for ( PI step = 0; step < scales.size(); ++step ) {

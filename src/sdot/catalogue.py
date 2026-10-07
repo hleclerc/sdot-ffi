@@ -18,9 +18,9 @@ import numpy as np
 
 
 def provoke( device = None ):
-    from loom import driver
+    import loom
     if device:
-        driver.device = device
+        loom.default_device = device
     from sdot import PowerDiagram, Cell, box_half_spaces, Image, SumOfGaussians
 
     rng = np.random.default_rng( 0 )
@@ -55,7 +55,7 @@ def provoke( device = None ):
     # THE TRANSPORT ( `OtProblem.solve` ): one kernel per ( dimension, storage, density ) -- on CPU only,
     # where the solver lives ( `sdot/sdotplan/` ); an image and Gaussians in 2D, an image in 3D
     from sdot import Iterative, OtProblem, SumOfDiracs, Tuning
-    if driver.device.is_cpu:
+    if loom.resolved_device().is_cpu:
         for d in ( 2, 3 ):
             pos = rng.uniform( 0.05, 0.95, size = ( 100, d ) )
             img = Image( values = rng.uniform( 0.5, 1.5, size = ( 8, ) * d ), origin = [ 0.0 ] * d, frame = ( np.eye( d ) / 8 ).tolist() )
@@ -75,12 +75,12 @@ def provoke( device = None ):
 
 def _vjp( f, x ):
     """A backward pass, to trigger the `bwd` kernel of `f` (same path as `check_grad`)."""
-    from loom import driver
+    import loom
     probe = f( x )
     dense_shape = tuple( probe.shape )
     crop = lambda t: t.raw[ tuple( slice( 0, s ) for s in dense_shape ) ]
-    out, pullback = driver.vjp( lambda v: crop( f( v ) ), x )
-    pullback( driver.random( out.shape, seed = 0 ) )
+    out, pullback = loom.vjp( lambda v: crop( f( v ) ), x )
+    pullback( loom.random( out.shape, seed = 0 ) )
 
 
 def main( argv = None ):

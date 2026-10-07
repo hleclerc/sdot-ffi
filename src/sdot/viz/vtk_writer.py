@@ -201,7 +201,7 @@ def _frame_mesh( viz, index, axes ):
     return allv, ( types, conn, offs ), ( rgba * 255 ).astype( np.uint8 ), radii
 
 
-def write_vtk( viz, filename, axes = ( 0, 1, 2 ) ):
+def write_vtk( viz, filename, axes = ( 0, 1, 2 ), pvd = False ):
     """See `Visualizer.write_vtk`."""
     path = Path( filename )
     if viz.nb_dims is None:
@@ -220,7 +220,7 @@ def write_vtk( viz, filename, axes = ( 0, 1, 2 ) ):
         extra = ( allv[ :, rest ] if rest else np.zeros( ( len( allv ), 0 ) ) ).astype( np.float32 )
         return _write_vtu( out, coords, extra, cells, rgba, extra_names, radii )
 
-    if viz.nb_frames == 1:
+    if viz.nb_frames == 1 and not pvd:
         return one( 0, path.with_suffix( ".vtu" ) )
 
     stem = path.with_suffix( "" )
@@ -231,12 +231,12 @@ def write_vtk( viz, filename, axes = ( 0, 1, 2 ) ):
         one( i, out )
         entries.append( ( viz.frame( i )[ "value" ], out.name ) )
 
-    pvd = [ '<?xml version="1.0"?>',
+    lines = [ '<?xml version="1.0"?>',
             '<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">',
             '  <Collection>' ]
-    pvd += [ f'    <DataSet timestep="{ t }" group="" part="0" file="{ name }"/>'
+    lines += [ f'    <DataSet timestep="{ t }" group="" part="0" file="{ name }"/>'
              for t, name in entries ]
-    pvd += [ '  </Collection>', '</VTKFile>', '' ]
+    lines += [ '  </Collection>', '</VTKFile>', '' ]
     out = stem.with_suffix( ".pvd" )
-    out.write_text( "\n".join( pvd ) )
+    out.write_text( "\n".join( lines ) )
     return out

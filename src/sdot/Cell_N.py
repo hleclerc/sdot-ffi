@@ -87,6 +87,13 @@ class Cell_N( Cell ):
     def _faces_of( self, it ):
         """In 3D only: for each cut, the walk from neighbor to neighbor on its face -- from `v`
         we go to `vn[ v, r ]` for the two `r` whose cut `vc[ v, r ]` is NOT the face."""
+        return [ cycle for cycle, _ in self._faces_and_cuts_of( it ) ]
+
+    def _face_cuts_of( self, it ):
+        """the cut ( index into `cut_ids` ) of each face of `_faces_of`"""
+        return [ k for _, k in self._faces_and_cuts_of( it ) ]
+
+    def _faces_and_cuts_of( self, it ):
         nv, d = it.vc.shape
         if d != 3:
             return []
@@ -105,7 +112,7 @@ class Cell_N( Cell ):
                 cycle.append( nxt[ 0 ] )
                 prev, cur = cur, nxt[ 0 ]
             if len( cycle ) >= 3:
-                res.append( cycle )
+                res.append( ( cycle, k ) )
         return res
 
     def _planes_of( self, it ):

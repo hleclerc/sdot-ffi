@@ -2,7 +2,7 @@ import numpy
 
 import loom
 from loom.compilation.FfiCode import FfiCode
-from loom.drivers.driver import driver
+import loom
 from loom.tensor import Axis, AxisList, CtShapeVar, RealTensor, ShapeVar
 from loom.util import ComputedAttribute
 
@@ -90,6 +90,114 @@ class Image( Distribution ):
         return ( numpy.concatenate( [ nrm, -nrm ] ),
                  numpy.concatenate( [ hi + sh, -( lo + sh ) ] ) )
 
+    # ---- the display of the cells where the image has mass ( `PowerDiagram.support_pieces` ) --------------------------------
+
+    def display_blocks( self, threshold = 0.0 ):
+        """`( dirs, offs, ids )`: the tiles that have mass -- a value `> threshold * max( values )` -- gathered into BOXES of the
+        grid ( see `Distribution.display_blocks` ). On each wall of a box, the tiles behind it are ALL with mass ( the wall is a
+        `SEAM` ) or all without ( a `SUPPORT`, the grid's border included ): a wall is never a seam in one place and a border in
+        another. Built from the tiles by merging, along one axis at a time, the boxes that follow each other with the same
+        section and the same walls on the other axes ( `_merge_along` ) -- which is exactly what keeps the walls uniform -- until
+        nothing merges any more. Vectorized: one sort per pass."""
+        return self._display( threshold )[ "blocks" ]
+
+    def blocks_of_cells( self, cells, threshold = 0.0 ):
+        """`( owners, blocks )` for the cells of `cells` ( see `Distribution.blocks_of_cells` ). On the box of each cell, in grid
+        coordinates: a cell whose box only meets tiles with mass is kept whole ( block `-1` ), one that meets none is dropped,
+        and the others are cut to each block their box meets ( a block that the box meets and the cell does not gives an
+        empty piece, which draws nothing )."""
+        from ._display import cell_vertices, boxes_of
+        g = self._display( threshold )
+        d, shape, knots, label = g[ "d" ], g[ "shape" ], g[ "knots" ], g[ "label" ]
+
+        vp, live, nv = cell_vertices( cells )
+        t_lo, t_hi = boxes_of( ( vp - g[ "origin" ] ) @ g[ "nrm" ].T, live )      # in grid coordinates
+
+        # the tiles of the box: `knot_index` of `Image.cxx`, `[ k0, k1 )`
+        n = len( nv )
+        k0 = numpy.zeros( ( n, d ), int )
+        k1 = numpy.zeros( ( n, d ), int )
+        for a in range( d ):
+            k0[ :, a ] = numpy.clip( numpy.searchsorted( knots[ a ], t_lo[ :, a ], side = "right" ) - 1, 0, shape[ a ] - 1 )
+            k1[ :, a ] = numpy.clip( numpy.searchsorted( knots[ a ], t_hi[ :, a ], side = "right" ) - 1, 0, shape[ a ] - 1 ) + 1
+
+        count = _box_count( g[ "sat" ], k0, k1 )
+        volume = numpy.prod( k1 - k0, axis = 1 )
+        whole = ( nv > 0 ) & ( count == volume )
+        mixed = numpy.nonzero( ( nv > 0 ) & ( count > 0 ) & ( count < volume ) )[ 0 ]
+
+        owners = [ numpy.nonzero( whole )[ 0 ] ]
+        blocks = [ numpy.full( len( owners[ 0 ] ), -1 ) ]
+        for i in mixed:
+            box = tuple( slice( k0[ i, a ], k1[ i, a ] ) for a in range( d ) )
+            bs = numpy.unique( label[ box ] )
+            bs = bs[ bs >= 0 ]
+            owners.append( numpy.full( len( bs ), i ) )
+            blocks.append( bs )
+        return numpy.concatenate( owners ), numpy.concatenate( blocks )
+
+    def _display( self, threshold ):
+        """the grid seen by the display, and its blocks -- computed once per `threshold`"""
+        cache = self.__dict__.setdefault( "_display_cache", {} )
+        key = float( threshold )
+        if key in cache:
+            return cache[ key ]
+        from ..Cell import SEAM, SUPPORT
+        from ._display import pack_blocks
+
+        d = int( self.nb_dims.value )
+        values = numpy.asarray( self.values, dtype = float )
+        shape = values.shape[ -d: ]
+        values = values.reshape( shape )
+        full = values > key * float( values.max( initial = 0 ) )
+
+        _, frame, origin, _, _ = self._grid_geometry()
+        if self.knots.is_defined:
+            kn = numpy.asarray( self.knots, dtype = float ).reshape( d, -1 )
+            knots = [ kn[ a, : shape[ a ] + 1 ] for a in range( d ) ]
+        else:
+            knots = [ numpy.arange( shape[ a ] + 1, dtype = float ) for a in range( d ) ]
+        nrm = numpy.linalg.inv( frame ).T                        # row `a` = the normal of axis `a`
+        shift = nrm @ origin
+
+        sat = numpy.zeros( tuple( s + 1 for s in shape ), numpy.int64 )
+        sat[ ( slice( 1, None ), ) * d ] = full
+        for a in range( d ):
+            sat = numpy.cumsum( sat, axis = a )
+
+        # the boxes: the tiles with mass, then merged along each axis while that changes something
+        lo = numpy.argwhere( full )
+        hi = lo + 1
+        pad = numpy.pad( full, 1 )
+        ids = numpy.empty( ( len( lo ), d, 2 ), numpy.int32 )                # [ :, a, 0 ]: the low wall, [ :, a, 1 ]: the high one
+        for a in range( d ):
+            for side, step in ( ( 0, -1 ), ( 1, 1 ) ):
+                nb = lo + 1
+                nb[ :, a ] += step
+                ids[ :, a, side ] = numpy.where( pad[ tuple( nb.T ) ], SEAM, SUPPORT )
+        while True:
+            m = len( lo )
+            for a in range( d ):
+                lo, hi, ids = _merge_along( lo, hi, ids, a )
+            if len( lo ) == m:
+                break
+        label = numpy.full( shape, -1, numpy.int64 )
+        for b in range( len( lo ) ):
+            label[ tuple( slice( lo[ b, a ], hi[ b, a ] ) for a in range( d ) ) ] = b
+
+        # the walls, in PHYSICAL coordinates: `t_a = nrm_a . x - shift_a` is the grid coordinate along axis `a`
+        B = len( lo )
+        dirs = numpy.zeros( ( B, 2 * d, d ) )
+        offs = numpy.zeros( ( B, 2 * d ) )
+        for a in range( d ):
+            dirs[ :, 2 * a ], offs[ :, 2 * a ] = -nrm[ a ], -( knots[ a ][ lo[ :, a ] ] + shift[ a ] )
+            dirs[ :, 2 * a + 1 ], offs[ :, 2 * a + 1 ] = nrm[ a ], knots[ a ][ hi[ :, a ] ] + shift[ a ]
+        blocks = pack_blocks( dirs, offs, ids.reshape( B, 2 * d ) )
+
+        res = cache[ key ] = dict( d = d, shape = shape, knots = knots, nrm = nrm, origin = origin, sat = sat, label = label,
+                                   blocks = blocks, box_lo = lo, box_hi = hi )
+        return res
+
     def extra_cuts_per_piece( self, nb_dims ):
         # a piece is `cell INTERSECT grid block`, and a block is the intersection of 2d
         # half-spaces (see `Image::_for_each_piece`). The cuts of the cell itself are already
@@ -102,7 +210,7 @@ class Image( Distribution ):
         size `cell_cum_mass` (`nb_pieces + 1`, see `_update_cell_cum_mass`)."""
         return self.shape.static_count()
 
-    def normalized_version( self ):
+    def normalized_version( self, nb_dims = None ):
         # update mass
         mass = self.mass
 
@@ -172,11 +280,11 @@ class Image( Distribution ):
         for name in ( "origin", "frame", "knots" ):
             attr = getattr( self, name )
             if attr.is_defined:
-                detached_kwargs[ name ] = driver.stop_gradient( attr.value )
+                detached_kwargs[ name ] = loom.ops().stop_gradient( attr.value )
         detached = Image(
             nb_dims = self.nb_dims.value,
             shape = self.shape.value,
-            values = driver.stop_gradient( self.values.value ),
+            values = loom.ops().stop_gradient( self.values.value ),
             batch_axes = self.batch_axes,
             **detached_kwargs,
         )
@@ -205,10 +313,10 @@ class Image( Distribution ):
 
     def try_update_sdotplan1d( self, plan ):
         """Closed-form, pure-JAX fast path for `SdotPlan1d.update_outputs` when `self` is its
-        1D piecewise-constant target: bypasses `driver.call`/the C++ kernel entirely (ordinary
+        1D piecewise-constant target: bypasses `loom.ffi_call`/the C++ kernel entirely (ordinary
         JAX autodiff differentiates straight through `_pure_jax_cost1d.cost_1d_ot`), evaluated
         ~1.2x-6x faster than the C++ kernel from n=1e6 through 1e8 diracs (see
-        [[pure-jax-otplan1d]]). Declines (returns False, caller falls back to driver.call)
+        [[pure-jax-otplan1d]]). Declines (returns False, caller falls back to loom.ffi_call)
         when: the backend is not JAX (this path uses `jax.lax.map`/`jnp.argsort` directly, not
         the backend-agnostic `Tensor` algebra), `self` is not 1D, more than one batch axis is
         in play (matches today's ONE `num_angle` axis in production; untested beyond that),
@@ -228,7 +336,7 @@ class Image( Distribution ):
             return False
         if len( self.batch_axes ) > 1:
             return False
-        if driver.framework.module_name != "jax":
+        if loom.resolved_framework().module_name != "jax":
             return False
 
         diracs = plan.src_dist.raw_1d_diracs()
@@ -273,3 +381,36 @@ class Image( Distribution ):
 
         plan.cost = cost
         return True
+
+
+def _box_count( sat, lo, hi ):
+    """the number of tiles with mass in each box `[ lo, hi )` ( `[ m, d ]` grid indices ), read on the 2^d corners of a
+    summed-area table"""
+    d = lo.shape[ 1 ]
+    res = numpy.zeros( len( lo ), numpy.int64 )
+    for corner in range( 2 ** d ):
+        up = [ ( corner >> a ) & 1 for a in range( d ) ]
+        idx = tuple( numpy.where( up[ a ], hi[ :, a ], lo[ :, a ] ) for a in range( d ) )
+        res += ( -1 ) ** ( d - sum( up ) ) * sat[ idx ]
+    return res
+
+
+def _merge_along( lo, hi, ids, a ):
+    """the boxes `[ lo, hi )` ( walls `ids [ m, d, 2 ]` ) merged along axis `a`: those with the same extent and the same walls on
+    the other axes, that follow each other along `a`, become one -- the walls of the result on the other axes are those
+    common walls, so they stay uniform, and along `a` they are the first box's low wall and the last one's high wall"""
+    m, d = lo.shape
+    if m < 2:
+        return lo, hi, ids
+    oth = [ b for b in range( d ) if b != a ]
+    key = numpy.concatenate( [ lo[ :, oth ], hi[ :, oth ], ids[ :, oth, : ].reshape( m, -1 ) ], axis = 1 )
+    order = numpy.lexsort( [ lo[ :, a ] ] + [ key[ :, c ] for c in reversed( range( key.shape[ 1 ] ) ) ] )
+    lo, hi, ids, key = lo[ order ], hi[ order ], ids[ order ], key[ order ]
+    start = numpy.ones( m, bool )
+    start[ 1: ] = ( key[ 1: ] != key[ :-1 ] ).any( axis = 1 ) | ( hi[ :-1, a ] != lo[ 1:, a ] )
+    first = numpy.nonzero( start )[ 0 ]
+    last = numpy.append( first[ 1: ], m ) - 1
+    nlo, nhi, nids = lo[ first ].copy(), hi[ first ].copy(), ids[ first ].copy()
+    nhi[ :, a ] = hi[ last, a ]
+    nids[ :, a, 1 ] = ids[ last, a, 1 ]
+    return nlo, nhi, nids

@@ -41,7 +41,7 @@ class ProjectedSumOfDiracs( Distribution ):
         self.__base_init__( points = points, normal = normal, weights = weights,
                             target_mass = target_mass, nb_dims = 1, proj_dims = proj_dims, **kwargs )
 
-    def normalized_version( self ):
+    def normalized_version( self, nb_dims = None ):
         # normalize the WEIGHTS only; the positions stay symbolic (points/normal carried untouched).
         mass = self.mass
         if self.target_mass.is_defined:

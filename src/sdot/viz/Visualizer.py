@@ -615,16 +615,16 @@ class Visualizer:
 
     # ---- sorties ------------------------------------------------------------------------------
 
-    def write_vtk( self, filename, axes = ( 0, 1, 2 ) ):
+    def write_vtk( self, filename, axes = ( 0, 1, 2 ), pvd = False ):
         """Writes the scene for ParaView (compressed binary XML). Returns the path written.
 
         A single frame -> one `.vtu`. Several -> one `.vtu` per frame plus a `.pvd` that
         gathers them with their abscissa on the axis (the `.pvd` is what one opens, and it is what
-        is returned). `axes` chooses the 3 dimensions written as GEOMETRY; beyond 3, the other
+        is returned). `pvd = True` asks for the `.pvd` even for a single frame. `axes` chooses the 3 dimensions written as GEOMETRY; beyond 3, the other
         coordinates go out as point data, so that ParaView does its slices itself.
         """
         from .vtk_writer import write_vtk
-        return write_vtk( self, filename, axes = axes )
+        return write_vtk( self, filename, axes = axes, pvd = pvd )
 
     def write_html( self, filename ):
         """Writes a self-contained HTML page (see the module header). Returns the path written."""
@@ -685,12 +685,22 @@ _HTML = r"""<!DOCTYPE html>
   html, body { margin: 0; padding: 0; overflow: hidden; background: #ffffff; color: #111; }
   canvas { display: block; }
   #controls {
-    position: fixed; top: 10px; left: 10px; z-index: 1;
+    display: none; position: absolute; top: 30px; left: 0;
+    max-height: calc(100vh - 50px); overflow-y: auto;
     background: rgba(255,255,255,0.88); padding: 8px 12px; border-radius: 6px;
     font-family: sans-serif; font-size: 13px; box-shadow: 0 1px 4px rgba(0,0,0,0.3);
     width: 244px; box-sizing: border-box;
   }
   #controls *, #controls { box-sizing: border-box; }
+  #menu { position: fixed; top: 10px; left: 10px; z-index: 1; }
+  #menuBtn {
+    display: block; width: 30px; height: 30px; padding: 0; cursor: pointer; border: none;
+    border-radius: 6px; background: rgba(255,255,255,0.88); color: #333; font-size: 18px; line-height: 1;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+  }
+  #menu:hover #controls, #menu.open #controls { display: block; }
+  #controls a { color: inherit; }
+  body.dark #menuBtn { background: rgba(30,30,30,0.92); color: #ddd; }
   #controls label { display: block; margin: 2px 0; }
   #controls input[type=range] { vertical-align: middle; width: 100%; }
   #controls select { font-size: 12px; }
@@ -728,6 +738,8 @@ _HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body data-theme="light">
+<div id="menu">
+<button id="menuBtn" title="menu">&#9776;</button>
 <div id="controls">
   <div id="counts"></div>
   <div class="sec" id="timeControls" style="display:none">
@@ -758,7 +770,13 @@ _HTML = r"""<!DOCTYPE html>
     views on <select id="axX"></select><select id="axY"></select><select id="axZ"></select>
   </div>
   <div id="slices"></div>
+  <div class="sec">
+    <label><input type="checkbox" id="cbWheel"> wheel moves/zooms the view</label>
+    <label><input type="checkbox" id="cbTouch"> touch drives the view</label>
+    <a id="openFull" href="#" target="_blank" style="display:none">open in a separate page &#8599;</a>
+  </div>
   <div class="hint"><b>?</b>: help · <b>d</b>: <span id="modeLabel">light</span></div>
+</div>
 </div>
 <div id="help">
   <b>Keyboard shortcuts</b>
@@ -1101,6 +1119,7 @@ function buildScene() {
 
   upload();
   pivotDirty = true;                                    // the scene changed: nothing aimed at anymore
+  centerRays.length = 0;
   document.getElementById("counts").textContent =
     PNT.n + " points · " + LIN.n + " edges · " + TRI.n + " triangles";
 }
@@ -1184,7 +1203,7 @@ function resetView() {
   // status: nothing later takes it up as a reference.
   cam.rot = FLAT ? [0, 0, 0, 1]
                  : qNorm(qMul(qAxis([0, 1, 0], 0.6), qAxis([1, 0, 0], -0.35)));
-  cam.pivotZ = cam.dist; pivotDirty = true;
+  cam.pivotZ = cam.dist; pivotDirty = true; centerRays.length = 0;
   draw();
 }
 function camEye() {
@@ -1316,14 +1335,60 @@ function aimAt(sx, sy, z) {                            // the point of the ray l
   return [o[0] + t * r.d[0], o[1] + t * r.d[1], o[2] + t * r.d[2]];
 }
 
-// Depth of the rotation pivot: that of what the scene shows AT THE CENTER OF THE SCREEN. It
-// is only recomputed if the view moved OTHERWISE than by a rotation -- a rotation must
-// above all not redefine its own pivot mid-gesture, it would drift under the hand.
+// Depth of the rotation pivot. The pivot always lies ON the center-of-screen ray; only its depth is
+// in question. It is the best of three estimates:
+//  1. a TRIANGULATION from the center rays recorded at the start of the previous rotations: the user
+//     centers what interests them, rotates, re-centers it from another angle -- the rays then
+//     cross at that very point, in all 3 axes, after a few rotations/moves. Stale rays (the user
+//     moved on to something else) pass far from the candidate and are discounted (IRLS);
+//  2. otherwise what the scene shows at the center of the screen (solid pick);
+//  3. otherwise the previous depth `cam.dist`.
+// It is only recomputed if the view moved OTHERWISE than by a rotation -- a rotation must above
+// all not redefine its own pivot mid-gesture, it would drift under the hand.
+const centerRays = [];                                 // lines { o, d } through the screen center
+const MAX_RAYS = 8;
+function dot3(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+function perp(v, u) { const c = dot3(v, u); return [v[0] - c * u[0], v[1] - c * u[1], v[2] - c * u[2]]; }
+function recordCenterRay(e, f) {
+  const s = sceneSphere(), last = centerRays[centerRays.length - 1];
+  const L = { o: e.slice(), d: f.slice() };
+  if (last && dot3(last.d, f) > 0.99999 &&
+      Math.hypot(...perp([e[0] - last.o[0], e[1] - last.o[1], e[2] - last.o[2]], last.d)) < 1e-3 * s.r)
+    centerRays[centerRays.length - 1] = L;             // same line again: just refresh it
+  else centerRays.push(L);
+  if (centerRays.length > MAX_RAYS) centerRays.shift();
+}
+function triangulateDepth(e, f) {                      // depth along `f` from `e`, or null
+  const n = centerRays.length;
+  if (n === 0) return null;
+  const sigma = 0.03 * sceneSphere().r;
+  const base = centerRays.map((_, i) => Math.pow(0.8, n - 1 - i));   // recent rays count more
+  let w = base.slice(), t = 0;
+  for (let it = 0; it < 4; it++) {
+    let num = 0, den = 0;
+    for (let i = 0; i < n; i++) {
+      const L = centerRays[i], pf = perp(f, L.d);
+      const pw = perp([e[0] - L.o[0], e[1] - L.o[1], e[2] - L.o[2]], L.d);
+      num -= w[i] * dot3(pw, pf); den += w[i] * dot3(pf, pf);
+    }
+    if (den < 0.03) return null;                       // rays (nearly) parallel: no depth information
+    t = num / den;
+    for (let i = 0; i < n; i++) {
+      const L = centerRays[i];
+      const q = perp([e[0] + t * f[0] - L.o[0], e[1] + t * f[1] - L.o[1], e[2] + t * f[2] - L.o[2]], L.d);
+      w[i] = base[i] / (1 + dot3(q, q) / (sigma * sigma));
+    }
+  }
+  return t > 1e-6 && t < 20 * (cam.dist + sceneSphere().r) ? t : null;
+}
 let pivotDirty = true;
-function pivotDepth() {
+function pivotDepth(record) {
   if (pivotDirty) {
     pivotDirty = false;
-    cam.pivotZ = depthAt(canvas.clientWidth / 2, canvas.clientHeight / 2);
+    const e = camEye(), f = camBasis().fwd;
+    const zt = triangulateDepth(e, f);
+    if (record) recordCenterRay(e, f);
+    cam.pivotZ = zt !== null ? zt : depthAt(canvas.clientWidth / 2, canvas.clientHeight / 2);
   }
   return cam.pivotZ;
 }
@@ -1464,7 +1529,11 @@ function draw() {
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
   const s = sceneSphere();
-  const near = Math.max(cam.dist - 4 * s.r, 1e-3 * s.r), far = cam.dist + 4 * s.r;
+  // The clipping planes follow the DEPTH OF THE SCENE, not `cam.dist`: after an orbit (re-pivoting)
+  // or a pan, the target no longer sits at the scene's center, and planes centered on it would cut the scene.
+  const eye = camEye(), fw = camBasis().fwd;
+  const dc = (s.c[0] - eye[0]) * fw[0] + (s.c[1] - eye[1]) * fw[1] + (s.c[2] - eye[2]) * fw[2];
+  const near = Math.max(dc - 1.5 * s.r, 1e-3 * s.r), far = Math.max(dc, 0) + 1.5 * s.r;
   const asp = w / Math.max(h, 1);
   const P = cam.ortho ? ortho(orthoHalfH() * asp, orthoHalfH(), -far, far)
                       : perspective(FOV, asp, near, far);
@@ -1602,7 +1671,7 @@ function orbitBy(dx, dy) {
   // The pivot is at the CENTER OF THE SCREEN, at the depth of what is there -- not at that of the
   // target, which means nothing anymore after a lateral move. `cam.dist` is NOT touched:
   // it carries the zoom level in orthographic, and the re-pivoting must stay invisible.
-  const z = pivotDepth(), e = camEye(), f = camBasis().fwd;
+  const z = pivotDepth(true), e = camEye(), f = camBasis().fwd;
   const pv = [e[0] + z * f[0], e[1] + z * f[1], e[2] + z * f[2]];
 
   // The rotation is expressed in the SCREEN frame, hence POST-multiplied: `dx` turns around
@@ -1644,7 +1713,13 @@ canvas.addEventListener("dblclick", resetView);
 
 // wheel: a touchpad pinch arrives as a `wheel` with ctrlKey (convention
 // shared with a mouse's Ctrl+wheel) -> zoom; otherwise scrolling = move.
+// `?wheel=0` in the URL (e.g. when embedded in an iframe) leaves the wheel to the host page.
+// `?touch=0` does the same for touch gestures. Both can be switched back on from the menu.
+const URL_OPTS = new URLSearchParams(location.search);
+let wheelEnabled = URL_OPTS.get("wheel") !== "0";
+let touchEnabled = URL_OPTS.get("touch") !== "0";
 canvas.addEventListener("wheel", e => {
+  if (!wheelEnabled) return;
   e.preventDefault();
   const [sx, sy] = evPos(e);
   if (e.ctrlKey || e.metaKey) zoomBy(Math.exp(e.deltaY * 0.01), sx, sy);
@@ -1654,6 +1729,7 @@ canvas.addEventListener("wheel", e => {
 
 let touch = null;
 canvas.addEventListener("touchstart", e => {
+  if (!touchEnabled) return;
   e.preventDefault();
   pivotDirty = true;                                   // new gesture: the pivot must be redone
   if (e.touches.length === 1) touch = { mode: "rot", x: e.touches[0].clientX, y: e.touches[0].clientY };
@@ -1667,6 +1743,7 @@ canvas.addEventListener("touchstart", e => {
   }
 }, { passive: false });
 canvas.addEventListener("touchmove", e => {
+  if (!touchEnabled) return;
   e.preventDefault();
   if (!touch) return;
   if (touch.mode === "rot" && e.touches.length === 1) {
@@ -1689,6 +1766,18 @@ canvas.addEventListener("touchend", e => { if (e.touches.length === 0) touch = n
 
 function pick(e, a, b, c) { return (e.ctrlKey || e.metaKey) ? c : (e.shiftKey ? b : a); }
 const helpPanel = document.getElementById("help");
+
+// menu: shown on hover, or toggled by a click (touch screens have no hover)
+const menu = document.getElementById("menu");
+document.getElementById("menuBtn").addEventListener("click", () => menu.classList.toggle("open"));
+const cbWheel = document.getElementById("cbWheel"), cbTouch = document.getElementById("cbTouch");
+cbWheel.checked = wheelEnabled; cbTouch.checked = touchEnabled;
+cbWheel.addEventListener("change", () => { wheelEnabled = cbWheel.checked; });
+cbTouch.addEventListener("change", () => { touchEnabled = cbTouch.checked; });
+if (window.self !== window.top) {                     // embedded: offer the standalone page
+  const a = document.getElementById("openFull");
+  a.href = location.pathname; a.style.display = "block";
+}
 window.addEventListener("keydown", e => {
   if (e.key === "?") { e.preventDefault(); helpPanel.style.display = helpPanel.style.display === "block" ? "none" : "block"; return; }
   if (e.key === "Escape") { helpPanel.style.display = "none"; return; }

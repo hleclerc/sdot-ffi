@@ -7,7 +7,7 @@ import numpy as np
 import loom
 from loom.tensor import Axis, CtShapeVar, IntTensor, RealTensor, ShapeVar, new_batch_axis
 from loom.compilation.FfiCode import FfiCode
-from loom.drivers.driver import driver
+import loom
 from loom.util import Aggregate
 
 from .SpatialAccelerator import SpatialAccelerator
@@ -161,7 +161,7 @@ class AaBsp( SpatialAccelerator ):
         # reads the `mid` back on the host side and has nothing to read on a tracer. Say so HERE rather than
         # letting the backend's error surface fifteen lines later: it is not an accident,
         # it is the accepted limit of the host-side construction (see the class docstring).
-        if driver.is_traced( pos ):
+        if loom.is_traced( pos ):
             raise TypeError( "`AaBsp` is built on the HOST, from concrete positions: it cannot be "
                              "built from a traced array (inside a `jit`). Build it outside, and "
                              "pass it in -- the tree is a constant of the trace, which is also what "
@@ -178,10 +178,10 @@ class AaBsp( SpatialAccelerator ):
         # the tree depends only on the positions. The tree is therefore built without them ( its `mid` remain
         # readable on the host side, even under a `jit` ), and the majorant is redone afterwards, in a kernel
         # that accepts tracers ( `refresh_weight_majorants` )
-        traced_w = w is not None and driver.is_traced( w )
-        # the positions are concrete: the construction is EVALUATED even under a trace ( `driver.concrete_eval`: its calls
+        traced_w = w is not None and loom.is_traced( w )
+        # the positions are concrete: the construction is EVALUATED even under a trace ( `loom.concrete_eval`: its calls
         # read each level back, which a trace cannot do ), so a solve inside `jax.jit` still gets its tree
-        with driver.concrete_eval():
+        with loom.concrete_eval():
             tree = _build_in_kernel( pos, None if traced_w else w, int( max_seeds_per_leaf ) )
 
         # the depth, which is EXACTLY `max_depth_for( n, leaf )`: the tree now has the
@@ -232,7 +232,7 @@ class AaBsp( SpatialAccelerator ):
         if w is not None and int( np.prod( w.shape ) ) != n:
             raise ValueError( "`weights` has to hold one weight per position" )
         leaf = int( max_seeds_per_leaf )
-        # ( the call's TENSORS, not their buffers: a buffer given to a field goes through `driver.array`, which brings a
+        # ( the call's TENSORS, not their buffers: a buffer given to a field goes through `loom.array`, which brings a
         # concrete device array back to the host -- the tensor's storage is adopted as it is )
         tree = _build_on_card( pos, leaf )
         self.max_depth = AaBsp.max_depth_for( n, leaf )
@@ -330,8 +330,8 @@ class AaBsp( SpatialAccelerator ):
             # ON THE CARD: `Majorant2D.cuh`'s ( 3D: `Majorant3D.cuh`'s ) launches over the seeds and the levels ( the per-node kernel below gives the
             # root's million seeds to one thread ); the tree's tensors are read where they are, traced or not
             num_seed = self.num_bsp_seed
-            sp = RealTensor[ num_seed, self.dim ]( driver.stop_gradient( getattr( sorted_positions, "raw", sorted_positions ) ) )
-            sw = RealTensor[ num_seed ]( driver.stop_gradient( getattr( sorted_weights, "raw", sorted_weights ) ).reshape( -1 ) )
+            sp = RealTensor[ num_seed, self.dim ]( loom.ops().stop_gradient( getattr( sorted_positions, "raw", sorted_positions ) ) )
+            sw = RealTensor[ num_seed ]( loom.ops().stop_gradient( getattr( sorted_weights, "raw", sorted_weights ) ).reshape( -1 ) )
             wa = RealTensor[ self.num_bsp_node, self.dim ]()
             wb = RealTensor[ self.num_bsp_node ]()
             tn = "int" if nb_nodes <= 2 ** 31 - 1 else "long long"
@@ -355,11 +355,11 @@ class AaBsp( SpatialAccelerator ):
         num_node = new_batch_axis( nb_nodes, prefix = "bspnode" )
         majorant = _NodeMajorant( nb_dims = int( self.nb_dims.value ), batch_axes = [ num_node ] )
 
-        # the gradient is cut AT THE INPUT: a kernel without an adjoint under `driver.grad` is an
+        # the gradient is cut AT THE INPUT: a kernel without an adjoint under `loom.grad` is an
         # error, and this one has nothing to propagate ( see above )
         cloud = _BspCloud( nb_dims = int( self.nb_dims.value ),
-                           positions = driver.stop_gradient( getattr( sorted_positions, "raw", sorted_positions ) ),
-                           weights = driver.stop_gradient( getattr( sorted_weights, "raw", sorted_weights ) ) )
+                           positions = loom.ops().stop_gradient( getattr( sorted_positions, "raw", sorted_positions ) ),
+                           weights = loom.ops().stop_gradient( getattr( sorted_weights, "raw", sorted_weights ) ) )
 
         # the tree is NOT an argument: its current majorants are what we replace, and under
         # a trace they may be tracers of a closed trace ( see `SdotPlanNd` ). Only the
@@ -454,7 +454,7 @@ class _BspCloud( Aggregate ):
     work-items sweep the whole cloud.
 
     TWO are needed per level, one read and the other written: the inputs and outputs of a call are
-    disjoint (see `driver.call`), and the sort of a level is a permutation, so each cell of
+    disjoint (see `loom.ffi_call`), and the sort of a level is a permutation, so each cell of
     the output is written by the work-item of the node that contains it -- once and only once, with no
     atomic or barrier, because the slices of a level PARTITION `[ 0, n )`.
     """
@@ -586,7 +586,7 @@ def _build_in_kernel( pos, w, leaf_size ):
     # majorant of `_weight_majorant` ); the levels where the nodes are many and small stay in the kernel. The halves of a
     # cut are not ordered the same way as the kernel's selection would order them, which no property of the tree depends on.
     host_levels = 0
-    if getattr( driver.device, "is_cuda_gpu", False ) and not driver.is_traced( pos ) and n > 64 * leaf_size:
+    if getattr( loom.resolved_device(), "is_cuda_gpu", False ) and not loom.is_traced( pos ) and n > 64 * leaf_size:
         host_levels = min( depth, 10 )
     if host_levels:
         P = np.array( np.asarray( pos ), dtype = np.float64 )
@@ -744,7 +744,7 @@ def builds_on_card( x ):
     import os
     if os.environ.get( "SDOT_CARD_TREE", "1" ).lower() in ( "0", "no", "false", "off" ):
         return False
-    return bool( getattr( driver.device, "is_cuda_gpu", False ) ) and len( x.shape ) >= 2 and int( x.shape[ -1 ] ) in ( 2, 3 )
+    return bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) ) and len( x.shape ) >= 2 and int( x.shape[ -1 ] ) in ( 2, 3 )
 
 
 def take_rows( a, idx ):
@@ -772,7 +772,7 @@ def _build_on_card( pos, leaf ):
     num_node = Axis( ShapeVar( nb_nodes ), name = "num_bsp_node" )
     num_lohi = Axis( ShapeVar( 2 ), name = "num_lohi" )
     dim = Axis( ShapeVar( d ), name = "dim" )
-    positions = RealTensor[ num_seed, dim ]( driver.stop_gradient( getattr( pos, "raw", pos ) ) )
+    positions = RealTensor[ num_seed, dim ]( loom.ops().stop_gradient( getattr( pos, "raw", pos ) ) )
     out = dict( seed_indices = IntTensor[ num_seed ](), rank_of = IntTensor[ num_seed ](),
                 node_begin = IntTensor[ num_node ](), node_end = IntTensor[ num_node ](),
                 node_left = IntTensor[ num_node ](), node_right = IntTensor[ num_node ](),

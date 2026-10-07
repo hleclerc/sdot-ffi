@@ -1,10 +1,6 @@
-import numpy
 
 from errand import Param, experiment, test
-from loom.testing import need
 
-from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
-                   box_half_spaces, ot_solve, write_convergence_html )
 
 
 # the domain COMES FROM THE DENSITY, and from it alone: the tile of an image, `centers +- 6 sigma` for
@@ -41,6 +37,11 @@ def _target_masses( plan ):
 
 
 if test( "newton_matches_the_target_masses" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # the basic test: the masses of the CELLS, once the fit is done, must fall back on
     # the masses of the DIRACS -- this is the only thing `SdotPlanNd` promises. ONE Gaussian, wide and
@@ -61,6 +62,11 @@ if test( "newton_matches_the_target_masses" ):
 
 
 if test( "ot_solve_and_the_warm_start_is_a_PLAN_not_weights" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # `ot_solve` is ONLY the shortcut: same plan, up to the last digits. And the warm start
     # is a PLAN -- either given through `ot_plan`, or proposed by the `OtProblem` which keeps its last
@@ -129,6 +135,11 @@ if test( "ot_solve_and_the_warm_start_is_a_PLAN_not_weights" ):
 
 
 if test( "starting_from_nonzero_weights_still_converges" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # the starting point should only be a matter of speed, not of result -- here we
     # start already NEAR the solution ( `weights0` drawn at random but small ) rather than from zero, and
@@ -147,6 +158,11 @@ if test( "starting_from_nonzero_weights_still_converges" ):
 
 
 if test( "no_cell_dies_even_with_scattered_targets" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # the HARD case ( `_scattered_target` ): without a floor, this scenario empties several cells and gets
     # stuck there. Here we check the TWO things the damping promises: no cell dies
@@ -168,6 +184,11 @@ if test( "no_cell_dies_even_with_scattered_targets" ):
 if test( "the_hessian_rows_are_the_jacobian_of_the_measures" ):
     # `PowerDiagram.hessian_rows` against the finite difference of the measures with respect to the weights,
     # on an image ( flat facets with constant density ): symmetric, rows summing to zero
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     rng = numpy.random.default_rng( 31 )
     n = 25
     pos = rng.uniform( 0.1, 0.9, size = ( n, 2 ) )
@@ -195,6 +216,11 @@ if test( "the_hessian_rows_are_the_jacobian_of_the_measures" ):
 if test( "the_hessian_rows_hold_in_3d_too" ):
     # in 3D the facet is a FACE, whose area comes from the accumulation of `LocalN::measure_3d`
     # ( `for_each_facet` ): same finite-difference check, without a distribution ( Lebesgue )
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     rng = numpy.random.default_rng( 32 )
     n = 14
     pos = rng.uniform( 0.1, 0.9, size = ( n, 3 ) )
@@ -217,6 +243,11 @@ if test( "the_hessian_rows_hold_in_3d_too" ):
 
 
 if test( "newton_converges_quadratically_on_an_image" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # on an image, a few steps suffice, the residual drops quadratically at the end, and a warm
     # start ( the weights of a neighboring cloud ) needs only two or three -- which is what a
@@ -246,6 +277,11 @@ if test( "newton_converges_quadratically_on_an_image" ):
 
 
 if test( "newton_starts_from_a_similarity_when_the_voronoi_has_empty_cells" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # diracs OUTSIDE the domain ( their Voronoi cell restricted to the domain is empty ): the
     # start is the Voronoi of the cloud brought back into the domain by a similarity, written as a
@@ -270,6 +306,11 @@ if test( "newton_starts_from_a_similarity_when_the_voronoi_has_empty_cells" ):
 
 
 if test( "newton_works_in_3d" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # the same promise in 3D, without a distribution ( Lebesgue on the cube ): the facet is a face
     rng = numpy.random.default_rng( 61 )
@@ -284,6 +325,11 @@ if test( "newton_works_in_3d" ):
 
 
 if test( "the_log_residual_and_the_lin_residual_reach_the_same_plan" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # `residual = "log"` ( the default: the log residual, then the lin one as soon as `max|a-nu|/nu <= 2` ), `"lin"`
     # ( KMT ) and `"power"` change the path, never the solution ( `solvers_des_familles` README § 24.5 )
@@ -302,6 +348,11 @@ if test( "the_log_residual_and_the_lin_residual_reach_the_same_plan" ):
 
 
 if test( "the_limits_step_reaches_the_same_plan_with_fewer_diagrams" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # `step = "limits"` ( the default in 2D ): the same weights as KMT's trials ( `"trials"` ), and
     # fewer diagrams -- on the HARD case, where the trials back off ( `solvers_des_familles` README § 7 )
@@ -321,6 +372,11 @@ if test( "the_limits_step_reaches_the_same_plan_with_fewer_diagrams" ):
 
 
 if test( "the_continuation_solves_what_direct_newton_cannot" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # NARROW bumps ( the bench's hard case, `solvers_des_familles` README § 9 ): cells with no
     # mass at the start, direct Newton STAGNATES; the width continuation ( `sdotplan/Continuation.h` )
@@ -329,7 +385,7 @@ if test( "the_continuation_solves_what_direct_newton_cannot" ):
     pos = rng.uniform( 0, 1, size = ( 400, 2 ) )
     centres = numpy.array( [ [ 0.3, 0.3 ], [ 0.7, 0.35 ], [ 0.4, 0.75 ], [ 0.75, 0.7 ] ] )
     dst = SumOfGaussians( centres, 0.04 * numpy.array( [ 1, 0.7, 1.3, 1 ] ), weights = numpy.array( [ 0.35, 0.25, 0.25, 0.15 ] ) )
-    direct = OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 100, continuation = "never", tuning = Tuning( mass_rtol = 1e-6 ) ) )
+    direct = OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 100, continuation = "never", on_failure = "ignore", tuning = Tuning( mass_rtol = 1e-6 ) ) )
     assert not direct.converged, direct.stats
     plan = OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 100, tuning = Tuning( mass_rtol = 1e-6 ) ) )
     assert plan.converged and plan.stats[ "nb_continuation_steps" ] > 1, plan.stats
@@ -351,6 +407,11 @@ if test( "the_continuation_solves_what_direct_newton_cannot" ):
 
 
 if test( "the_domain_comes_from_the_density_alone" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # Gaussians: the domain is the support they DECLARE ( `centers +- 6 sigma` ), not
     # the envelope of the diracs -- diracs drawn in a corner of the domain have cells that go
@@ -376,6 +437,11 @@ if test( "the_domain_comes_from_the_density_alone" ):
 
 
 if test( "the_plain_storage_gives_the_same_plan" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # `accelerator = "plain"`: the same weights as the BSP tree, up to rounding ( the acceleration
     # only changes what the diagram costs )
@@ -396,6 +462,11 @@ if test( "moments_are_the_closed_forms" ):
     # mass 1, barycenter ( 1/2, 1/2 ), `int |x|^2 = 2/3`. And on an image with ONE pixel lit, the
     # barycenter is the center of that pixel: this also checks the orientation of the grid
     # ( `values[ i, j ]` <-> `origin + i frame[ 0 ] + j frame[ 1 ]` ).
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     pd = PowerDiagram( numpy.array( [ [ 0.3, 0.6 ] ] ), boundaries = box_half_spaces( [ 0, 0 ], [ 1, 1 ] ),
                        kernel_dtype = "FP64" )
     mass, first, second = pd.moments
@@ -427,6 +498,11 @@ if test( "moments_are_the_closed_forms" ):
 
 
 if test( "the_transport_cost_derives_by_the_envelope_theorem" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # `cost_and_position_grad`: the derivative of the cost with respect to the dirac positions, at the
     # fitted weights, against the finite difference of the cost itself ( each evaluation refitting
@@ -458,6 +534,11 @@ if test( "the_transport_cost_derives_by_the_envelope_theorem" ):
 
 
 if test( "the_multigrid_reaches_the_cholesky_plan_in_2d_and_3d" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # `linear_solver = "mg"` ( `sdotplan/Multigrid.h` ): the in-house multigrid. `mg_stop` small, so that the hierarchy has SEVERAL
     # levels on a test-sized problem ( the default stops coarsening under 1000 unknowns ): aggregation by the tree order,
@@ -480,6 +561,11 @@ if test( "the_multigrid_reaches_the_cholesky_plan_in_2d_and_3d" ):
 
 
 if test( "the_multigrid_without_a_tree_order_and_the_unknown_solver" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # the `plain` storage has no tree: the aggregation then follows the order of the identifiers ( worse, but exact )
     rng = numpy.random.default_rng( 17 )
@@ -507,8 +593,8 @@ if test( "the_multigrid_without_a_tree_order_and_the_unknown_solver" ):
 # ( `bench_newton --save-weights` on both environments ).
 
 def _card():
-    from loom import driver
-    return bool( getattr( driver.device, "is_cuda_gpu", False ) )
+    import loom
+    return bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
 
 
 def _box_target():
@@ -524,6 +610,11 @@ def _generic_measures( pos, w ):
 
 
 if test( "the_card_solves_the_transport" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -587,6 +678,11 @@ def _csr_product( row, col, val, dia, x ):
 
 
 if test( "the_card_linear_solver_solves" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -632,6 +728,11 @@ if test( "the_card_linear_solver_solves" ):
 
 
 if test( "the_card_majorants_bound_the_weights" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -663,6 +764,11 @@ if test( "the_card_majorants_bound_the_weights" ):
 
 
 if test( "the_card_solve_runs_under_jit" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -687,6 +793,11 @@ if test( "the_card_solve_runs_under_jit" ):
 
 
 if test( "the_card_solve_builds_its_tree_in_the_jitted_call" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -718,6 +829,11 @@ if test( "the_card_solve_builds_its_tree_in_the_jitted_call" ):
 
 
 if test( "the_card_solve_on_rings_in_batches_and_past_the_limit" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -775,6 +891,11 @@ if test( "the_card_solve_on_rings_in_batches_and_past_the_limit" ):
 
 
 if test( "the_card_refuses_what_it_does_not_solve" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -884,6 +1005,11 @@ def _image_target( nx, ny, values ):
 
 
 if test( "the_card_solves_an_image_as_the_cpu" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -915,6 +1041,11 @@ if test( "the_card_solves_an_image_as_the_cpu" ):
 
 
 if test( "the_card_solves_gaussians_as_the_cpu" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -941,6 +1072,11 @@ if test( "the_card_solves_gaussians_as_the_cpu" ):
 
 
 if test( "the_card_density_solves_run_under_jit" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -979,6 +1115,11 @@ def _card_scratch_model( n, it ):
 
 
 if test( "the_card_memory_model_follows_the_solve" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -1001,6 +1142,11 @@ if test( "the_card_memory_check_counts_the_jitted_program" ):
     # masses, the weights returned: 40 bytes per seed ); the check counts them, and a pool that holds the eager solve just
     # makes the jitted one give up its recycled solutions -- at 1e7 seeds on a 7.85 GB pool, before: RESOURCE_EXHAUSTED
     # after XLA's 10 s, after: the solve runs with no recycled solution ( `calibration_lmo_today.md`, step 10 )
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     import sdot.CardMemory as cm
     from sdot.SdotPlanNd import SdotPlanNd
     n, it = 10_000_000, Iterative( tol = 1e-6 / 10_000_000, max_iter = 30 )
@@ -1025,6 +1171,11 @@ if test( "the_card_memory_check_counts_the_jitted_program" ):
 if test( "the_card_finish_store_by_chunks_gives_the_same_plan" ):
     # `SDOT_CARD_DEFER_CAP`: the float kernel's finish store smaller than the cloud, so the first pass runs by chunks and the
     # second leaves its cells by position ( `Card::run` ): the same cells, so the same plan to the bit
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -1105,6 +1256,11 @@ def _oom_runs( n, modes, **env ):
 
 
 if test( "the_card_refuses_a_solve_that_does_not_fit_at_once" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -1119,6 +1275,19 @@ if test( "the_card_refuses_a_solve_that_does_not_fit_at_once" ):
     print( f"  without the check: { kind } after { t :.2f} s: { msg[ :300 ] }..." )
     assert kind != "none" and t < 40, ( kind, t, msg )
     assert "RESOURCE_EXHAUSTED" in msg and "the scratch pool refused" in msg and f"Newton solve of { n } seeds" in msg, msg
+
+
+if test( "a_seed_with_more_than_512_neighbours_is_solved" ):
+    import numpy
+    from sdot import OtProblem, SumOfDiracs, SumOfGaussians
+    # two seeds off a line of 1000 aligned ones: each has a cell with ONE FACET PER SEED OF THE LINE ( ~900 ). The facets of a
+    # cell were accumulated in a fixed array of 512 and a cell past it was taken for a scratch overflow: the scratch doubled
+    # for ever ( 19 GB, no output ). The solve must converge, and the cells must tile the domain
+    line = numpy.linspace( 0, 1, 1000 )
+    pos = numpy.concatenate( [ [ [ 0, 1 ], [ 1, 0 ] ], numpy.stack( [ line, line ], axis = 1 ) ] )
+    plan = OtProblem( SumOfDiracs( pos ), SumOfGaussians( [ [ 0.5, 0.5 ] ], [ 0.15 ] ) ).solve()
+    assert plan.converged, plan.stats
+    assert abs( float( plan.cost ) - 0.0916 ) < 1e-3, float( plan.cost )
 
 
 # -- what we LOOK AT -------------------------------------------------------------------------
@@ -1148,9 +1317,12 @@ def _report( p, plan, pos, stem ):
         if j:
             viz.new_frame( int( plan.history[ i ][ "step" ] ) )
         w = plan.history[ i ][ "weights" ]
-        plan.power_diagram( w ).add_to_viz( viz )
-        viz.add_points( pos, color = "#ffffff" )
+        plan.power_diagram( w ).add_to_viz( viz, seed_color = "#ffffff" )
     viz.write_html( p.out_dir / f"{ stem }_anim.html" )
+
+    # the quick ways, on the plan itself: the fitted diagram, its seeds, the transport to the barycenters
+    plan.write_html( p.out_dir / f"{ stem }_plan.html", transport = True )
+    print( "  pvd  :", plan.write_pvd( p.out_dir / f"{ stem }_plan.pvd", transport = True ) )
 
 
 if p := experiment( "ot 2D newton",
@@ -1163,6 +1335,11 @@ if p := experiment( "ot 2D newton",
     # density, exactly what its dirac weighs. The convergence curve says WHETHER it converges
     # and how fast; the animation shows HOW: the PLANES slide from one step to the next,
     # not the seeds. SOFT target ( `_overlapping_target` ).
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     pos = numpy.random.default_rng( p.seed ).uniform( 0.1, 0.9, size = ( p.nb_points, 2 ) )
     src = SumOfDiracs( pos )
     dst = _overlapping_target( 2, p.nb_gaussians, seed = p.seed + 1 )
@@ -1179,6 +1356,11 @@ if p := experiment( "ot 2D newton scattered",
     # the HARD case: narrow, separate bumps ( `_scattered_target` ). The `minimum
     # measure` curve is the one that matters here: it starts almost null ( a dirac in a density
     # desert, at the Voronoi ) and must CLIMB BACK without ever touching 0 again.
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     pos = numpy.random.default_rng( p.seed ).uniform( 0.1, 0.9, size = ( p.nb_points, 2 ) )
     src = SumOfDiracs( pos )
     dst = _scattered_target( 2, p.nb_gaussians, seed = p.seed + 1 )
@@ -1251,6 +1433,11 @@ def _check_aggregated( name, plan, pos, groups, tol ):
 
 
 if test( "the_aggregation_merges_what_the_doubles_cannot_separate" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     for d, steps in ( ( 2, ( "trials", "limits" ) ), ( 3, ( "trials", ) ) ):
         for name, ( pos, groups ) in _degenerate_clouds( d, 17 ).items():
@@ -1261,12 +1448,17 @@ if test( "the_aggregation_merges_what_the_doubles_cannot_separate" ):
                 plan = OtProblem( SumOfDiracs( pos ), _box_target() if d == 2 else Image( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0 ] * 3, frame = numpy.eye( 3 ) ) ).solve( it )
                 _check_aggregated( f"{ d }D { name } { step }", plan, pos, groups, tol )
                 # without the aggregation: the floor ( or worse: two equal points count their cell twice )
-                it = Iterative( tol = tol, max_iter = 60, aggregate = False, tuning = Tuning( step = step ) )
+                it = Iterative( tol = tol, max_iter = 60, aggregate = False, on_failure = "ignore", tuning = Tuning( step = step ) )
                 off = OtProblem( SumOfDiracs( pos ), _box_target() if d == 2 else Image( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0 ] * 3, frame = numpy.eye( 3 ) ) ).solve( it )
                 assert not off.converged and off.stats[ "aggregation" ] == "off" and off.clusters is None, ( name, off.stats[ "status" ] )
 
 
 if test( "a_refused_log_step_falls_back_on_the_lin_residual" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # three ALIGNED seeds 1e-10 apart: the middle Voronoi cell holds 5e-9 of its target. The log residual asks it for
     # `a ( c - log x )`, 1e-10 next to the others' 1e-3, which the linear solver loses; and at the Voronoi start ( weights 0 )
@@ -1291,6 +1483,11 @@ if test( "a_refused_log_step_falls_back_on_the_lin_residual" ):
 
 
 if test( "the_aggregation_changes_nothing_without_such_seeds" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     need( "cpu" )
     # a cloud whose pairs the doubles separate: the same plan to the bit, the same counts, no cluster -- in 2D ( both steps )
     # and in 3D, and with a tolerance under what any mass can reach ( `MEASURE_PRECISION`: no merge either )
@@ -1299,7 +1496,7 @@ if test( "the_aggregation_changes_nothing_without_such_seeds" ):
         n = 3000
         pos = rng.uniform( 0.001, 0.999, size = ( n, d ) )
         target = _box_target() if d == 2 else Image( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0 ] * 3, frame = numpy.eye( 3 ) )
-        plans = [ OtProblem( SumOfDiracs( pos ), target ).solve( Iterative( tol = tol / n, max_iter = 60, aggregate = agg, tuning = Tuning( step = step ) ) )
+        plans = [ OtProblem( SumOfDiracs( pos ), target ).solve( Iterative( tol = tol / n, max_iter = 60, aggregate = agg, on_failure = "ignore", tuning = Tuning( step = step ) ) )
                   for agg in ( True, False ) ]
         on, off = plans
         assert tol < 1e-15 or on.stats[ "status" ] == "converged", on.stats
@@ -1310,6 +1507,11 @@ if test( "the_aggregation_changes_nothing_without_such_seeds" ):
 
 
 if test( "the_card_aggregates_as_the_cpu" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -1356,7 +1558,6 @@ if test( "the_card_aggregates_as_the_cpu" ):
 # weights within the tolerance, the cost and the barycentres; and against the measures of the card's weights through the
 # PLAIN storage ( the generic 3D path with the BSP tree is wrong on a few cells of some clouds: `calibration_n22.md` ).
 
-_CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
 
 
 def _box_target_3d():
@@ -1417,6 +1618,11 @@ def _card_vs_cpu_3d( name, pos, nu, it, tun, wtol = 1e-7 ):
 
 
 if test( "the_card_solves_the_transport_in_3d_as_the_cpu" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -1453,6 +1659,11 @@ if test( "the_card_solves_the_transport_in_3d_as_the_cpu" ):
 
 
 if test( "the_card_solves_the_planes_in_3d_as_the_cpu" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -1470,6 +1681,11 @@ if test( "the_card_solves_the_planes_in_3d_as_the_cpu" ):
 
 
 if test( "the_card_3d_solve_runs_under_jit" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -1497,6 +1713,11 @@ if test( "the_card_3d_solve_runs_under_jit" ):
 
 
 if test( "the_card_3d_solve_refuses_what_it_does_not_solve" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -1519,6 +1740,11 @@ if test( "the_card_3d_solve_refuses_what_it_does_not_solve" ):
 
 
 if test( "the_card_3d_memory_model_follows_the_solve" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -1540,6 +1766,11 @@ if test( "the_card_3d_memory_model_follows_the_solve" ):
 
 
 if test( "the_card_refuses_a_3d_solve_that_does_not_fit_at_once" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -1551,6 +1782,11 @@ if test( "the_card_refuses_a_3d_solve_that_does_not_fit_at_once" ):
 
 
 if test( "the_card_aggregates_in_3d_as_the_cpu" ):
+    import numpy
+    from loom.testing import need
+    from sdot import ( Image, Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians, Tuning, Visualizer,
+                       box_half_spaces, ot_solve, write_convergence_html )
+    _CUBE = ( "image", dict( values = numpy.ones( ( 1, 1, 1 ) ), origin = [ 0.0, 0.0, 0.0 ], frame = numpy.eye( 3 ) ) )
     from errand import skip
     if not _card():
         skip( "the card's solver needs a CUDA device" )
@@ -1567,3 +1803,301 @@ if test( "the_card_aggregates_in_3d_as_the_cpu" ):
                 alone[ members ] = False
                 assert abs( g[ members ].sum() - nu[ members ].sum() ) < 1e-8 / n, ( name, g[ members ].sum() - nu[ members ].sum() )
             assert numpy.abs( g[ alone ] - nu[ alone ] ).max() < 1e-8 / n, name
+
+
+if test( "triangle_mesh_starts_in_its_inscribed_box" ):
+    import numpy
+    from loom.testing import need
+    from sdot import Mesh, OtProblem, SumOfDiracs
+    need( "cpu" )
+    # a density whose support is a TRIANGLE inside its bounding box: the Voronoi start leaves a third of the cells empty, and
+    # the similarity into the box of the domain does not help -- the seeds are packed into the target's `inscribed_box` instead
+    rng = numpy.random.default_rng( 3 )
+    dst = Mesh( nodes = [ [ 0, 0 ], [ 1, 0 ], [ 0, 1 ] ], simplices = [ [ 0, 1, 2 ] ], values = [ 1, 0.1, 0.1 ] )
+    lo, hi = dst.inscribed_box()
+    assert numpy.all( lo >= -1e-9 ) and numpy.all( hi - lo > 0.4 ) and hi.sum() <= 1 + 1e-9, ( lo, hi )
+    plan = OtProblem( SumOfDiracs( rng.uniform( 0, 1, size = ( 100, 2 ) ) ), dst ).solve()
+    assert plan.converged and plan.stats[ "start" ] == "similarity", plan.stats
+
+
+if test( "a_solve_that_misses_its_tolerance_raises" ):
+    import numpy
+    from loom.testing import need
+    from sdot import Iterative, OtNotConverged, OtProblem, SumOfDiracs, SumOfGaussians
+    need( "cpu" )
+    # not silent: `OtNotConverged`, carrying the solution -- unless `on_failure = "ignore"`
+    rng = numpy.random.default_rng( 5 )
+    pos = rng.uniform( 0, 1, size = ( 200, 2 ) )
+    dst = _scattered_target( 2, 4, 7 )
+    try:
+        OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 2, tol = 1e-14 ) )
+        raise AssertionError( "no exception" )
+    except OtNotConverged as e:
+        assert not e.solution.converged
+    assert not OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 2, tol = 1e-14, on_failure = "ignore" ) ).converged
+
+
+if test( "a_mesh_the_plain_solve_misses_goes_through_its_spreading" ):
+    import numpy
+    from scipy.spatial import Delaunay
+    from loom.testing import need
+    from sdot import Iterative, Mesh, OtNotConverged, OtProblem, SumOfDiracs
+    need( "cpu" )
+    # TWO thin curved bands apart, in a mesh that paves their box ( DG1: one on the simplices of the bands, zero elsewhere ): the cells
+    # that start between them are fed by neither, and the plain Newton stagnates. The width continuation spreads the mesh on itself
+    # ( `Mesh.spread`, the corner averages ) and climbs back to it, stage by stage ( `SdotPlanNd._solve_by_spreading` )
+    def ring( angle, shift ):
+        r, t = numpy.linspace( 0.95, 1.0, 3 ), numpy.linspace( -angle, angle, 40 )
+        R, T = numpy.meshgrid( r, t, indexing = "ij" )
+        return numpy.stack( [ R * numpy.sin( T ), R * numpy.cos( T ) ], axis = -1 ).reshape( -1, 2 ) * numpy.array( [ 1, shift ] )
+    def band( x, shift, dy ):
+        y = ( x - [ 0, dy ] ) * [ 1, shift ]
+        r, t = numpy.linalg.norm( y, axis = -1 ), numpy.arctan2( y[ ..., 0 ], y[ ..., 1 ] )
+        return ( r > 0.95 - 1e-9 ) & ( r < 1 + 1e-9 ) & ( numpy.abs( t ) < 0.5 + 1e-9 )
+    bands = numpy.concatenate( [ ring( 0.5, 1 ), ring( 0.5, -1 ) + [ 0, 1.2 ] ] )
+    lo, hi = bands.min( axis = 0 ) - 0.1, bands.max( axis = 0 ) + 0.1
+    g = numpy.stack( numpy.meshgrid( numpy.linspace( lo[ 0 ], hi[ 0 ], 16 ), numpy.linspace( lo[ 1 ], hi[ 1 ], 16 ), indexing = "ij" ), -1 ).reshape( -1, 2 )
+    g = g[ ~band( g, 1, 0 ) & ~band( g, -1, 1.2 ) ]
+    nodes = numpy.concatenate( [ bands, g ] )
+    sx = Delaunay( nodes ).simplices
+    c = nodes[ sx ].mean( axis = 1 )
+    on = band( c, 1, 0 ) | band( c, -1, 1.2 )
+    dst = Mesh( nodes, sx, values = numpy.repeat( on[ :, None ] * 1.0, 3, axis = 1 ) )
+    src = SumOfDiracs( lo + ( hi - lo ) * numpy.random.default_rng( 0 ).random( ( 400, 2 ) ) )
+    try:
+        OtProblem( src, dst ).solve( Iterative( continuation = "never" ) )
+        raise AssertionError( "the plain solve was expected to miss" )
+    except OtNotConverged:
+        pass
+    plan = OtProblem( src, dst ).solve()                            # `auto`: the plain solve misses, the spreading takes over
+    assert plan.converged and plan.stats[ "spread_stages" ][ -1 ] == 0 and plan.stats[ "start" ] == "weights0", plan.stats
+    # the path: from the flat start down to the mesh, the mass and the positivity kept at every stage
+    k0 = dst.spread_start()
+    assert plan.stats[ "spread_start" ] == k0 and k0 >= 2
+    w = numpy.asarray( dst.corner_weights )
+    for k in ( k0, k0 / 7, 1.5, 0.25 ):
+        v = numpy.asarray( dst.spread( k ).values )
+        assert v.min() >= 0 and abs( ( w * v ).sum() / float( dst.mass ) - 1 ) < 1e-10, k
+
+
+if test( "many_gaussians_go_through_the_tree_and_stay_exact" ):
+    import numpy
+    from loom.testing import need
+    from sdot import Iterative, OtProblem, PowerDiagram, SumOfDiracs, SumOfGaussians
+    need( "cpu" )
+    # 400 gaussians along an arc ( a thin banana ): each cell of the solver sees only the gaussians near it, merged during the
+    # continuation ( `GaussianTree.h` ) -- the fitted weights must still give the target masses on the EXACT density, every gaussian
+    # integrated by every cell ( `PowerDiagram.measures`, no tree )
+    rng = numpy.random.default_rng( 5 )
+    G = 400
+    t = rng.uniform( 0.2 * numpy.pi, 0.8 * numpy.pi, G )
+    r = 0.35 + 0.02 * rng.standard_normal( G )
+    dst = SumOfGaussians( numpy.c_[ 0.5 + r * numpy.cos( t ), 0.2 + r * numpy.sin( t ) ], numpy.full( G, 0.01 ), weights = numpy.ones( G ) )
+    pos = rng.uniform( 0, 1, ( 100, 2 ) )
+    plan = OtProblem( SumOfDiracs( pos ), dst ).solve( Iterative( max_iter = 200, tol = 1e-11, continuation = "always" ) )
+    assert plan.converged and plan.stats[ "nb_continuation_steps" ] > 5, plan.stats
+    pd = PowerDiagram( pos, numpy.asarray( plan.weights ).reshape( -1 ), distribution = dst.normalized_version(), kernel_dtype = "FP64" )
+    got = numpy.asarray( pd.measures ).reshape( -1 )
+    assert numpy.allclose( got, _target_masses( plan ), atol = 1e-9 ), numpy.abs( got - _target_masses( plan ) ).max()
+
+
+if test( "the_display_keeps_the_cells_where_the_density_has_mass" ):
+    import itertools, tempfile, pathlib
+    import numpy
+    from loom.testing import need
+    from sdot import Image, Iterative, Mesh, OtProblem, PowerDiagram, SumOfDiracs
+    from sdot.Cell import SEAM, SUPPORT
+    need( "cpu" )
+    # a density with ZERO regions ( a hole, and a corner ): the pieces of `support_pieces` tile exactly the region with mass,
+    # cell by cell -- their measure, summed per seed, is the measure of the cell against the indicator of that region -- and
+    # the walls between two blocks with mass are `SEAM`s, not drawn. An image is gathered into boxes ( far fewer pieces than
+    # tiles ), a mesh is cut by its simplices.
+    def image( d, s, rng ):
+        x = ( numpy.indices( ( s, ) * d ) + 0.5 ) / s
+        values = 1 + rng.random( ( s, ) * d )
+        values[ ( ( x - 0.5 ) ** 2 ).sum( axis = 0 ) < 0.25 ** 2 ] = 0
+        values[ ( x < 0.25 ).all( axis = 0 ) ] = 0
+        frame = numpy.eye( d ) / s
+        return Image( values = values, origin = numpy.zeros( d ), frame = frame ), \
+               Image( values = ( values > 0 ) * 1.0, origin = numpy.zeros( d ), frame = frame ), ( values > 0 ).sum() / s ** d
+
+    def mesh( d, s, rng, hole = True ):
+        # a grid of cubes, each split into d! simplices along the paths of its diagonal ( conforming ), minus a corner; the
+        # nodes in a ball have a zero value -- the simplices that only touch them have no mass
+        nodes = numpy.indices( ( s + 1, ) * d ).reshape( d, -1 ).T / s
+        idx = numpy.arange( len( nodes ) ).reshape( ( s + 1, ) * d )
+        sx = []
+        for c in itertools.product( range( s ), repeat = d ):
+            for perm in itertools.permutations( range( d ) ):
+                k = numpy.array( c )
+                tri = [ idx[ tuple( k ) ] ]
+                for a in perm:
+                    k = k.copy(); k[ a ] += 1
+                    tri.append( idx[ tuple( k ) ] )
+                sx.append( tri )
+        sx = numpy.array( sx )
+        sx = sx[ ~( nodes[ sx ].mean( axis = 1 ) < 0.25 ).all( axis = 1 ) ]
+        values = 1 + rng.random( len( nodes ) )
+        if hole:
+            values[ ( ( nodes - 0.5 ) ** 2 ).sum( axis = 1 ) < 0.25 ** 2 ] = 0
+        kept = sx[ values[ sx ].max( axis = 1 ) > 0 ]
+        P = nodes[ kept ]
+        area = numpy.abs( numpy.linalg.det( P[ :, 1: ] - P[ :, :1 ] ) ).sum() / numpy.prod( numpy.arange( 1, d + 1 ) )
+        return Mesh( nodes, sx, values = values ), Mesh( nodes, kept ), area
+
+    for kind, d, s, n in ( ( image, 2, 24, 60 ), ( image, 3, 8, 40 ), ( mesh, 2, 12, 60 ), ( mesh, 3, 5, 40 ) ):
+        rng = numpy.random.default_rng( 3 + d )
+        dst, indicator, support = kind( d, s, rng )
+        plan = OtProblem( SumOfDiracs( rng.uniform( 0.3, 0.7, ( n, d ) ) ), dst ).solve( Iterative( max_iter = 200, tol = 1e-9 / n ) )
+        assert plan.converged, plan.stats
+        w = numpy.asarray( plan.weights ).reshape( -1 )
+        pos = numpy.asarray( plan._pd.positions ).reshape( -1, d )
+
+        pd = PowerDiagram( pos, w, distribution = dst, kernel_dtype = "FP64" )
+        pieces, owners = pd.support_pieces()
+        vol = numpy.asarray( pieces.measure ).reshape( -1 )
+        per_cell = numpy.bincount( owners, weights = vol, minlength = n )
+        ind = numpy.asarray( PowerDiagram( pos, w, distribution = indicator, kernel_dtype = "FP64" ).measures ).reshape( -1 ) * support
+        assert numpy.allclose( per_cell, ind, atol = 1e-12 ), ( kind.__name__, d, numpy.abs( per_cell - ind ).max() )
+        assert abs( vol.sum() - support ) < 1e-12, ( kind.__name__, d, vol.sum(), support )
+
+        ids = numpy.concatenate( [ it.cid for it in pieces._items() ] )
+        assert ( ids == SEAM ).any() and ( ids == SUPPORT ).any()
+        if kind is image:
+            assert ( numpy.bincount( owners, minlength = n ) == 1 ).any()   # some cells are kept whole
+            # the boxes: far fewer than the tiles with mass
+            g = dst.normalized_version()._display( 0.0 )
+            print( f"  { len( numpy.unique( owners ) ) } cells drawn, { len( g[ 'box_lo' ] ) } boxes for { int( ( g[ 'label' ] >= 0 ).sum() ) } tiles" )
+            assert len( g[ "box_lo" ] ) < 0.5 * ( g[ "label" ] >= 0 ).sum()
+
+        # the display: html and ParaView, from the plan
+        out = pathlib.Path( tempfile.mkdtemp() )
+        plan.write_html( out / f"support_{ kind.__name__ }_{ d }d.html", support_only = True )
+        plan.write_pvd( out / f"support_{ kind.__name__ }_{ d }d.pvd", support_only = True )
+        print( f"  { kind.__name__ } { d }D: { n } cells, { len( owners ) } pieces -> { out }" )
+
+    # a threshold: the pieces cover where `rho > threshold * max` -- on a mesh, the plane `rho = threshold` of each simplex, checked
+    # against the same area counted on random points ( the mesh of the loop above: a grid of squares cut along their diagonal )
+    dst, _, _ = mesh( 2, 12, numpy.random.default_rng( 5 ) )
+    pos = numpy.random.default_rng( 9 ).uniform( 0.1, 0.9, ( 40, 2 ) )
+    pd = PowerDiagram( pos, numpy.zeros( 40 ), distribution = dst, kernel_dtype = "FP64" )
+    pieces, owners = pd.support_pieces( threshold = 0.6 )
+    vals = numpy.zeros( len( numpy.asarray( dst.nodes ) ) )                  # ( the node values back from the corners: continuous here )
+    vals[ numpy.asarray( dst.simplices ).ravel() ] = numpy.asarray( dst.values ).ravel()
+    x = numpy.random.default_rng( 10 ).random( ( 400_000, 2 ) )
+    k, f = numpy.minimum( ( x * 12 ).astype( int ), 11 ), x * 12 - numpy.minimum( ( x * 12 ).astype( int ), 11 )
+    node = lambda a, b: vals[ ( k[ :, 0 ] + a ) * 13 + k[ :, 1 ] + b ]
+    up = f[ :, 0 ] >= f[ :, 1 ]                                        # the simplex of the path `e0` then `e1`, or the other one
+    rho = numpy.where( up, ( 1 - f[ :, 0 ] ) * node( 0, 0 ) + ( f[ :, 0 ] - f[ :, 1 ] ) * node( 1, 0 ) + f[ :, 1 ] * node( 1, 1 ),
+                           ( 1 - f[ :, 1 ] ) * node( 0, 0 ) + ( f[ :, 1 ] - f[ :, 0 ] ) * node( 0, 1 ) + f[ :, 0 ] * node( 1, 1 ) )
+    rho[ ( k < 3 ).all( axis = 1 ) ] = 0                                 # the corner that is not meshed
+    expected = ( rho > 0.6 * vals.max() ).mean()
+    got = float( numpy.asarray( pieces.measure ).sum() )
+    assert abs( got - expected ) < 4e-3, ( got, expected )
+
+    # a mesh without a hole: the cells away from its border are kept whole ( their box meets no facet of the border )
+    dst, indicator, support = mesh( 2, 12, numpy.random.default_rng( 7 ), hole = False )
+    pos = numpy.random.default_rng( 8 ).uniform( 0.3, 0.7, ( 30, 2 ) )
+    pd = PowerDiagram( pos, numpy.zeros( 30 ), distribution = dst, kernel_dtype = "FP64" )
+    pieces, owners = pd.support_pieces()
+    assert ( numpy.bincount( owners, minlength = 30 ) == 1 ).any(), numpy.bincount( owners, minlength = 30 )
+    per_cell = numpy.bincount( owners, weights = numpy.asarray( pieces.measure ).reshape( -1 ), minlength = 30 )
+    ind = numpy.asarray( PowerDiagram( pos, numpy.zeros( 30 ), distribution = indicator, kernel_dtype = "FP64" ).measures ).reshape( -1 ) * support
+    assert numpy.allclose( per_cell, ind, atol = 1e-12 )
+
+
+if test( "a_concave_crease_of_the_support_is_drawn" ):
+    import numpy
+    from loom.testing import need
+    from sdot import Image, PowerDiagram, Visualizer
+    need( "cpu" )
+    # an L-shaped prism ( 2 x 2 x 1 voxels, one of them empty ) in ONE cell: the edges drawn are exactly the 18 edges of the
+    # prism -- the CONCAVE one, where the border of the support folds on a seam, included, and none of the seams themselves
+    values = numpy.ones( ( 2, 2, 1 ) )
+    values[ 1, 1, 0 ] = 0
+    pd = PowerDiagram( numpy.array( [ [ 0.7, 0.7, 0.5 ] ] ), numpy.zeros( 1 ), distribution = Image( values = values, origin = numpy.zeros( 3 ), frame = numpy.eye( 3 ) ),
+                       kernel_dtype = "FP64" )
+    viz = Visualizer()
+    pd.add_to_viz( viz, support_only = True, seeds = False )
+    pos, edges = numpy.asarray( viz.positions, float ), numpy.asarray( viz.edges )
+    drawn = numpy.stack( [ pos[ edges[ :, 0 ] ], pos[ edges[ :, 1 ] ] ], axis = 1 )
+
+    outline = numpy.array( [ [ 0, 0 ], [ 2, 0 ], [ 2, 1 ], [ 1, 1 ], [ 1, 2 ], [ 0, 2 ] ], float )
+    true = [ ( numpy.r_[ outline[ i ], z ], numpy.r_[ outline[ ( i + 1 ) % 6 ], z ] ) for i in range( 6 ) for z in ( 0, 1 ) ]
+    true += [ ( numpy.r_[ p, 0 ], numpy.r_[ p, 1 ] ) for p in outline ]
+
+    def on( m, a, b ):
+        t = numpy.clip( ( m - a ) @ ( b - a ) / ( ( b - a ) @ ( b - a ) ), 0, 1 )
+        return numpy.linalg.norm( a + t * ( b - a ) - m ) < 1e-6
+    for a, b in drawn:                                          # nothing drawn off the edges of the prism ( no seam )
+        assert any( on( ( a + b ) / 2, p, q ) for p, q in true ), ( a, b )
+    for p, q in true:                                           # and every edge of the prism drawn, the concave one at ( 1, 1 ) included
+        assert any( on( ( p + q ) / 2, a, b ) for a, b in drawn ), ( p, q )
+
+
+if test( "a_disconnected_laplacian_is_a_status_not_a_crash" ):
+    import numpy
+    from loom.testing import need
+    from sdot import Iterative, Mesh, OtProblem, SumOfDiracs
+    from sdot.OtProblem import Tuning
+    need( "cpu" )
+    # a mesh density ZERO outside two small far apart bumps, and a start KEPT as given ( `keep_start` ): most cells
+    # have no mass, the facet graph falls apart into components, and every one that does not hold the gauge is a singular
+    # block -- the coarse LU of AMGCL used to throw ( "Zero sum in skyline_lu factorization" ) through the FFI call. The
+    # solve must come back with a status, the caller ( `on_failure = "ignore"` ) deciding what to do with it.
+    g = numpy.linspace( 0, 1, 61 )
+    X, Y = numpy.meshgrid( g, g, indexing = "ij" )
+    nodes = numpy.stack( [ X.ravel(), Y.ravel() ], 1 )
+    k = numpy.arange( 60 )[ :, None ] * 61 + numpy.arange( 60 )[ None, : ]
+    k = k.ravel()
+    sx = numpy.concatenate( [ numpy.stack( [ k, k + 61, k + 62 ], 1 ), numpy.stack( [ k, k + 62, k + 1 ], 1 ) ] )
+    def bump( c, s ):
+        return numpy.maximum( 0.0, 1 - numpy.linalg.norm( nodes - c, axis = 1 ) / s )
+    vals = bump( [ 0.2, 0.25 ], 0.06 ) + 0.5 * bump( [ 0.8, 0.7 ], 0.04 )
+    # ( 100 seeds and these small random weights: the smallest case found that reached the throw, the AMG forced -- AUTO only takes it
+    # with OpenMP )
+    pos = numpy.random.default_rng( 3 ).uniform( 0.02, 0.98, ( 100, 2 ) )
+    w0 = numpy.random.default_rng( 3 ).uniform( 0, 1e-2, 100 )
+    sol = OtProblem( SumOfDiracs( pos ), Mesh( nodes, sx, values = vals ) ).solve(
+        Iterative( weights0 = w0, continuation = "never", on_failure = "ignore", max_iter = 20,
+                   tuning = Tuning( keep_start = True, linear_solver = "amg" ) ) )
+    assert not sol.converged and sol.stats[ "status" ] == "linear solver failure", sol.stats[ "status" ]
+
+
+if test( "the_plan_is_differentiable_with_respect_to_all_its_inputs" ):
+    import numpy
+    from loom.testing import check_grad, need
+    from sdot import Iterative, Mesh, OtProblem, SumOfDiracs, SumOfGaussians
+    need( "cpu" )
+    # `weights`, `cell_masses`, `cost` and `barycenters` against EVERY input -- the positions and the masses of the diracs, the parameters of
+    # the target -- by the implicit function theorem ( `SdotPlanNd._attach_derivatives`: the solve itself has no adjoint, it runs on
+    # detached inputs and the derivative is one solve with the laplacian ). Checked by finite differences on the whole solve.
+    rng = numpy.random.default_rng( 0 )
+    n = 24
+    pos = rng.uniform( 0.2, 0.8, size = ( n, 2 ) )
+    nu = rng.uniform( 0.5, 1.5, size = n )
+    settings = Iterative( tol = 1e-13, max_iter = 200 )
+    nodes, simplices = [ [ 0, 0 ], [ 1, 0 ], [ 1, 1 ], [ 0, 1 ] ], [ [ 0, 1, 2 ], [ 0, 2, 3 ] ]
+    values = numpy.array( [ [ 1, 0.5, 0.2 ], [ 1, 0.2, 0.7 ] ] )
+
+    def on_mesh( p, q, v ):
+        return OtProblem( SumOfDiracs( p, weights = q ), Mesh( nodes = nodes, simplices = simplices, values = v ) ).solve( settings )
+
+    # a mesh: closed forms, the finite differences are clean
+    for output, tol in ( ( "weights", 1e-5 ), ( "cell_masses", 1e-5 ), ( "cost", 1e-3 ), ( "barycenters", 1e-3 ) ):
+        check_grad( lambda p, q, v: getattr( on_mesh( p, q, v ), output ), pos, nu, values, seed = 3, eps = 1e-5, rtol = tol, atol = tol * 1e-2 )
+
+    # gaussians: the support is DECLARED as a box ( a traced parameter has no support to read ), the quadrature of the moments flips its
+    # subdivisions -- the finite differences of the cost and of the barycenters are only as smooth as its `rtol`
+    def on_gaussians( p, q, c, s, m ):
+        dst = SumOfGaussians( c, s, weights = m, support_box = ( [ 0, 0 ], [ 1, 1 ] ) )
+        return OtProblem( SumOfDiracs( p, weights = q ), dst ).solve( settings )
+    c, s, m = numpy.array( [ [ 0.4, 0.5 ], [ 0.7, 0.3 ] ] ), numpy.array( [ 0.25, 0.2 ] ), numpy.array( [ 1.0, 0.7 ] )
+    for output, eps, tol in ( ( "weights", 1e-5, 1e-5 ), ( "cell_masses", 1e-5, 1e-5 ), ( "cost", 1e-4, 5e-3 ), ( "barycenters", 1e-4, 5e-3 ) ):
+        check_grad( lambda p, q, c, s, m: getattr( on_gaussians( p, q, c, s, m ), output ), pos, nu, c, s, m, seed = 4, eps = eps, rtol = tol, atol = tol * 1e-2 )
+
+    # and the values are those of the solve: nothing changes when nobody differentiates
+    plain = OtProblem( SumOfDiracs( pos, weights = nu ), Mesh( nodes = nodes, simplices = simplices, values = values ) ).solve( settings )
+    import jax
+    traced = jax.jit( lambda p: on_mesh( p, nu, values ).cost.raw )( pos )
+    assert abs( float( traced ) - float( plain.cost ) ) < 1e-5 * float( plain.cost ), ( float( traced ), float( plain.cost ) )
