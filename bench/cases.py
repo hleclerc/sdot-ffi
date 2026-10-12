@@ -16,8 +16,9 @@ import it, and so can any script.
   uniform3d        3    1e6 ( diagram ), 1e5 ( Newton )
   planes_voronoi   3    100 000                4 planes, sigma = 0.02, weights 0
   planes_equal     3    100 000                the same cloud, weights = equal volumes ( made by the old bench itself )
+  uniform4d..6d    4-6  1e5 ( Newton )         uniform in [ 0.001, 0.999 ]^d, weights 0 ( not of the campaign: the dimension scan )
 
-The domain of all of them is the unit square / cube.
+The domain of all of them is the unit square / cube ( / hypercube ).
 
 = Where the reference files are
 
@@ -46,7 +47,8 @@ import numpy
 
 EPS = 1e-4          # the seeds of the hard clouds STRICTLY inside the domain ( as in the generators )
 
-CASE_NAMES = ( "uniform2d", "lines_voronoi", "lines_equal", "uniform3d", "planes_voronoi", "planes_equal" )
+CASE_NAMES = ( "uniform2d", "lines_voronoi", "lines_equal", "uniform3d", "planes_voronoi", "planes_equal",
+               "uniform4d", "uniform5d", "uniform6d" )
 
 #: name -> ( dimension, file, number of seeds of the file )
 FILES = {
@@ -57,7 +59,7 @@ FILES = {
 }
 
 #: the size of the case in the old campaign when `n = None` and there is no file
-DEFAULT_N = { "uniform2d": 1_000_000, "uniform3d": 1_000_000 }
+DEFAULT_N = { "uniform2d": 1_000_000, "uniform3d": 1_000_000, "uniform4d": 100_000, "uniform5d": 100_000, "uniform6d": 100_000 }
 
 
 def cases_dirs():
@@ -76,7 +78,9 @@ def cases_dir():
 
 
 def dimension( name ):
-    return 3 if name in ( "uniform3d", "planes_voronoi", "planes_equal" ) else 2
+    if name.startswith( "uniform" ):
+        return int( name[ len( "uniform" ) ] )
+    return 3 if name in ( "planes_voronoi", "planes_equal" ) else 2
 
 
 # -- reading ---------------------------------------------------------------------------------------

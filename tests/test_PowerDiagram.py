@@ -2318,3 +2318,36 @@ if test( "moments_of_a_diagram_are_differentiable_like_the_measures" ):
         check_grad( lambda v: PowerDiagram( pos, w, boundaries = box, distribution = mesh( v ), memory = 0 ).moment( k ), values, seed = 21 + k )
         check_grad( lambda c, s, q: PowerDiagram( pos, w, boundaries = box, distribution = gauss( c, s, q ), memory = 0 ).moment( k ),
                     centers, sigmas, masses, seed = 31 + k, eps = 1e-3, rtol = 1e-2, atol = 2e-4 )
+
+
+if test( "hessian_rows_beyond_3d_are_the_derivatives_of_the_measures" ):
+    import numpy
+    from loom.testing import need
+    from sdot import PowerDiagram, box_half_spaces, set_kernel_dtype
+    need( "cpu" )
+    # beyond 3D the facet measures come from a fan of simplices started on each facet ( `LocalN::for_each_facet` ): the jacobian they
+    # assemble must be the one of the measures, by centered finite differences, in the double kernel
+    previous = set_kernel_dtype( numpy.float64 )
+    try:
+        for d in ( 4, 5 ):
+            n = 40
+            rng = numpy.random.default_rng( d )
+            pos = rng.random( ( n, d ) )
+            w = 1e-3 * rng.random( n )
+            box = box_half_spaces( numpy.zeros( d ), numpy.ones( d ) )
+            measures = lambda q: numpy.asarray( PowerDiagram( pos, weights = q, boundaries = box ).measures.value ).reshape( -1 )
+            cnt, ids, vals = PowerDiagram( pos, weights = w, boundaries = box ).hessian_rows()
+            J = numpy.zeros( ( n, n ) )
+            for i in range( n ):
+                for r in range( cnt[ i ] ):
+                    if ids[ i, r ] >= 0:
+                        J[ i, ids[ i, r ] ] -= vals[ i, r ]
+                        J[ i, i ] += vals[ i, r ]
+            h, F = 1e-6, numpy.zeros( ( n, n ) )
+            for j in range( n ):
+                e = numpy.zeros( n )
+                e[ j ] = h
+                F[ :, j ] = ( measures( w + e ) - measures( w - e ) ) / ( 2 * h )
+            assert numpy.abs( J - F ).max() < 1e-7 * numpy.abs( J ).max(), ( d, numpy.abs( J - F ).max() / numpy.abs( J ).max() )
+    finally:
+        set_kernel_dtype( previous )

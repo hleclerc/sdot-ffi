@@ -4,7 +4,7 @@ layout: home
 hero:
   name: SDOT
   text: Semi-Discrete Optimal Transport
-  tagline: Fast · Differentiable · N-dimensional · JAX/PyTorch/Cupy/Dask...
+  tagline: Fast · Differentiable · N-dimensional · Framework independant (JAX/PyTorch/Cupy/Dask...)
   image:
     src: /examples/img/patate.png
     alt: VitePress
@@ -42,21 +42,55 @@ features:
 
 ## Hello, World
 
-Here is a computation of the Wasserstein 2 distance between a sum of diracs and a spline grid:
+Here is a computation of the Wasserstein 2 distance between a sum of diracs and an image:
 
-```python
+:::code-group
+
+```python [PyTorch]
+import torch
+import sdot
+
+f = sdot.SumOfDiracs( torch.rand( 100, 2 ) )  # 100 equal-weight diracs, 2D
+g = sdot.Image( torch.rand( 10, 10 ) )  # 10×10 image (auto-normalized)
+
+print( sdot.w2( f, g ) )
+```
+
+```python [JAX]
+import jax
+import sdot
+
+f = sdot.SumOfDiracs( jax.random.uniform( jax.random.key( 0 ), ( 100, 2 ) ) )  # 100 equal-weight diracs, 2D
+g = sdot.Image( jax.random.uniform( jax.random.key( 0 ), ( 10, 10 ) ) )  # 10×10 image (auto-normalized)
+
+print( sdot.w2( f, g ) )
+```
+
+```python [NumPy]
 import numpy as np
 import sdot
 
-f = sdot.SumOfDiracs( np.random.rand( 1000, 2 ) ) # 1000 equal-weight diracs in 2D
-g = sdot.Image( np.random.rand( 10, 10 ) ) # pixels
+f = sdot.SumOfDiracs( np.random.rand( 100, 2 ) )  # 100 equal-weight diracs, 2D
+g = sdot.Image( np.random.rand( 10, 10 ) )  # 10×10 image (auto-normalized)
 
-print( sdot.w2( f, g ) ) # use the 2 norm as the ground metric by default
+print( sdot.w2( f, g ) )
 ```
 
-If not already loaded or specified, Sdot automatically picks the best available backend (JAX, PyTorch, ...) and device. [Configure it →](/guide/backends)
+```python [CuPy]
+import cupy as cp
+import sdot
 
-## What is Semi-Discrete Optimal Transport?
+f = sdot.SumOfDiracs( cp.random.rand( 100, 2 ) )  # 100 equal-weight diracs, 2D
+g = sdot.Image( cp.random.rand( 10, 10 ) )  # 10×10 image (auto-normalized)
+
+print( sdot.w2( f, g ) )
+```
+
+:::
+
+<!-- If not already loaded or specified, Sdot automatically picks the best available backend (JAX, PyTorch, ...) and device. [Configure it →](/guide/backends) -->
+
+## How the transport plans are computed?
 
 Given a discrete measure **f** (a weighted sum of Dirac masses) and a continuous density **g**, semi-discrete OT finds the _power diagram_ (Laguerre tessellation) that partitions space so that the mass of each cell matches the weight of the corresponding Dirac.
 
@@ -69,45 +103,38 @@ $$\text{Find } w \text{ such that } \int_{C_i(w)} g(x) \, dx = m_i \quad \forall
 > **Reference:** Kitagawa, Mérigot, Thibert —
 > _Convergence of a Newton algorithm for semi-discrete optimal transport_, JEMS 2019.
 
-Of courses, sdot allows to access quantities of the transport plan.
+## Performance
 
-```python
-from sdot import SplineGrid, SumOfDiracs, optimal_transport_plan
-import numpy as np
+A Newton solve needs only a handful of iterations whatever the number of diracs. Each iteration is a power diagram plus a
+multigrid solve, and both are almost linear in `n`. On an 8-core CPU, a 2D plan with 10⁵ diracs is solved to 10⁻⁶
+relative accuracy in about **1 s** (3D: 2.3 s). On a GPU the same solve takes **0.07 s** (3D: 0.14 s), and 10⁶ diracs in 2D
+take **0.4 s**. That is 10 to 17x faster than the CPU.
 
-f = np.random.random( [ 30, 2 ] ) * 2 - 1 # dirac positions
-g = Box( frame = [ [ 0, 0 ], [ 2, 0 ], [ 2, 0 ] ] )
+[Detailed benchmarks →](/guide/performance) (single diagram, CPU vs GPU, image and gaussian targets, scaling with the
+number of diracs and with the dimension, comparison other libraries)
 
-plan = optimal_transport_plan( f, g )
+Note: 1D benchmarks still need to be added.
 
-print( plan.barycenters ) # centroid of each transport cell
-print( plan.cells )       # batch of cells, with possible access to vertices, edges, ... with gradient enabled
-print( plan.second_order_moments ) # ...
+## Target densities
 
-plan.backward_map.brenier_potential.plot()  # the dual potential ψ
-```
+To define a density, you essentially need to be able to integrate over simplices, and to provide a way to smooth the density when it is irregular.
 
-![Computed Tomography Reconstruction](/examples/img/brenier.png){ width="200" style="display: block; margin: 0 auto"  }
+Sdot provides a number of predefined target densities:
+- [images](/guide/distributions#polynomialgrid)
+- [splines](/guide/distributions#splinegrid)
+- [sums of Gaussians](/guide/distributions#sumofgaussians) _(coming soon)_
+- [Lebesgue measure on polytopes](/guide/distributions#polynomialcells) _(coming soon)_
+- ...
 
-### Use inside JAX/Torch
+For more details, see the [Distributions guide](/guide/distributions).
 
-Virtually all the outputs can generated gradients. Here is an example with `distance`:
+## Differentiation
 
-```python
-@jax.jit
-def loss( positions ):
-    f = SumOfGaussians( positions )
-    g = SumOfDiracs( diracs )
-    return distance( f, g )
+In principle, sdot supports backward differentiation of any variable with respect to any variable.
 
-diracs = np.random.normal( [ 1, 2 ], 0.3, size = ( 50, 2 ) )
-grad = jax.grad( loss )( jnp.array( [ 0.0, 0.0 ] ) )
-```
+See the [Differentiability guide](/guide/differentiability) and the [Examples gallery](/examples/) to go further.
 
-Of course, it applies on all the other quantities (e.g. barycenters, cell vertices) with respect to all input quantities (images values, ...).
-
-## Applications
-
+<!-- 
 SDOT has been used for Quantization & sampling, Meshing, Machine learning, PDEs, Registration...
 
-See the [Examples gallery →](/examples/) for more illustrations
+See the [Examples gallery →](/examples/) for more illustrations -->

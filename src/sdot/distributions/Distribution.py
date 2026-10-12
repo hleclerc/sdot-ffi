@@ -81,6 +81,14 @@ class Distribution( Aggregate ):
     allocating, so it is said from here.
     """
 
+    def __base_init__( self, **kwargs ):
+        # the caller's universe, read off what they GAVE: what the public functions return to them
+        # ( see `loom/boundary.py` ). Not read later off the fields: the solve caches values in them
+        # ( `current_mass` ), computed in whatever framework the kernels ran in
+        import loom
+        self._universe = loom.universe_of( (), kwargs )
+        super().__base_init__( **kwargs )
+
     def add_to_viz( self, viz, **kwargs ):
         """What this distribution shows of itself in a `Visualizer` -- NOTHING by default; a
         subclass draws what is meaningful for it ( the centres of the gaussians, ... ) and grows

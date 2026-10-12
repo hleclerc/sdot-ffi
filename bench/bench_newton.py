@@ -59,7 +59,7 @@ def _peak_rss_gb():
 
 if p := bench( "newton",
                case          = Param( "uniform", choices = CASE_CHOICES, help = "the case ( see cases.py ); `uniform` uses --dim" ),
-               dim           = Param( 2, help = "dimension of the `uniform` case ( 2 or 3 )" ),
+               dim           = Param( 2, help = "dimension of the `uniform` case ( 2 to 6; beyond 3D: CPU only, no reference row )" ),
                n             = Param( 0, help = "number of seeds ( 0: the case of the campaign: 1e5 for the uniform ones, the file's size otherwise )" ),
                threads       = Param( 0, help = "workers ( 0: all the cores; the campaign: 8 )" ),
                pin           = Param( "yes", choices = [ "yes", "no", "env" ], help = "pin worker w to core w ( SDOT_PIN_THREADS ); `env`: leave the variable alone" ),

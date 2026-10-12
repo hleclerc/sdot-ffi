@@ -51,6 +51,7 @@ measured.** `residu = log` wins on direct solves and breaks continuation in dens
 """
 
 import copy
+import loom
 
 import numpy as np                  # the only host arrays in here : the few planes of the domain
 
@@ -406,6 +407,7 @@ class OtProblem:
 
 # -- THE SHORTCUT ------------------------------------------------------------------------------
 
+@loom.public
 def ot_solve( source, target, *, verbose = False, **settings ):
     """Pose the problem and solve it, in one expression -- for a transport that is solved
     ONLY ONCE.

@@ -36,7 +36,7 @@ class Cell_N( Cell ):
         """`LocalN::words_for( cap )`: `cap` vertices AND `cap` cuts, with the temporaries of the
         cut, of the compaction and of the triangulation"""
         d = self.dim
-        return ( 4 * d + 5 ) * words_of( fp_size // 8, cap ) + ( 5 * d + 10 ) * words_of( 4, cap )
+        return ( 4 * d + 5 ) * words_of( fp_size // 8, cap ) + ( 7 * d + 10 ) * words_of( 4, cap )
 
     def init_capacity( self ):
         return 2 ** self.dim

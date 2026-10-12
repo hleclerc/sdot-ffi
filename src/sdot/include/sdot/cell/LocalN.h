@@ -74,14 +74,14 @@ struct __attribute__(( visibility( "default" ) )) LocalN {
 
     // the temporaries, in the scratch too
     TK  *s, *nx[ D ], *rate[ D ], *s3[ 3 ];
-    int *hole, *nk[ D - 1 ], *rec_v, *rec_f, *dest, *nn_[ D ], *fresh, *src, *dst, *m, *apex[ D ], *v0, *on_face;
+    int *hole, *nk[ D - 1 ], *rec_v, *rec_f, *dest, *nn_[ D ], *fresh, *src, *dst, *m, *apex[ D ], *fvl[ D ], *fcl[ D ], *v0, *on_face;
 
     // ---- the scratch --------------------------------------------------------------------------
 
     /// how many words are needed for `cap` vertices ( and as many cuts ) -- THE SAME FORMULA as
     /// `Cell_N.scratch_words`
     HD static constexpr SI words_for( SI cap ) {
-        return ( 4 * D + 5 ) * words_of<TK>( cap ) + ( 5 * D + 10 ) * words_of<int>( cap );
+        return ( 4 * D + 5 ) * words_of<TK>( cap ) + ( 7 * D + 10 ) * words_of<int>( cap );
     }
 
     HD bool attach( Carver &c, SI capacity ) {
@@ -99,6 +99,8 @@ struct __attribute__(( visibility( "default" ) )) LocalN {
         for ( int d = 0; d < D; ++d ) nn_[ d ] = c.take<int>( cap );
         fresh = c.take<int>( cap ); src = c.take<int>( cap ); dst = c.take<int>( cap ); m = c.take<int>( cap );
         for ( int d = 0; d < D; ++d ) apex[ d ] = c.take<int>( cap );
+        for ( int d = 0; d < D; ++d ) fvl[ d ] = c.take<int>( cap );
+        for ( int d = 0; d < D; ++d ) fcl[ d ] = c.take<int>( cap );
         v0 = c.take<int>( cap ); on_face = c.take<int>( cap );
         nv = 0; nc = 0; unbounded = false; has_planes = false;
         return ! c.overflow;
@@ -736,49 +738,72 @@ struct __attribute__(( visibility( "default" ) )) LocalN {
     /// lower. For each face encountered we need ONE of its vertices ( "the apex" ): `apex` keeps
     /// one row per depth and one slot per cut, filled in a single pass over the vertices
     /// of the face -- `D * nc` words, where indexing the faces by their SET of cuts costs
-    /// `nc^( D - 1 )`.
+    /// `nc^( D - 1 )`. The vertices of the face at each depth are LISTED in `fvl[ depth ]` ( the
+    /// parent's list filtered by the new cut ): a face is visited in `O( its vertices )`, not `O( nv )`
+    /// -- what makes 5D and beyond affordable, where cells have hundreds of vertices and the fan
+    /// thousands of faces.
     HD void for_each_simplex( auto &&func ) const {
         if ( nv == 0 )
             return;
         Vector<SI,D+1> chain;
         Vector<SI,D> face_cuts;
         chain[ 0 ] = 0;
-        for_each_simplex_rec( chain, face_cuts, func, Ct<int,D>() );
+        for ( int i = 0; i < nv; ++i )
+            fvl[ 0 ][ i ] = i;
+        for ( int d = 0; d < D; ++d )
+            for ( int c = 0; c < nc; ++c )
+                apex[ d ][ c ] = -1;
+        for_each_simplex_rec( chain, face_cuts, nv, func, Ct<int,D>() );
     }
 
+    /// the fan of the face cut by `face_cuts[ 0 .. depth )`, whose `len` vertices are `fvl[ depth ][ 0 .. len )`
     template<int K>
-    HD void for_each_simplex_rec( Vector<SI,D+1> &chain, Vector<SI,D> &face_cuts, auto &&func, Ct<int,K> ) const {
+    HD void for_each_simplex_rec( Vector<SI,D+1> &chain, Vector<SI,D> &face_cuts, int len, auto &&func, Ct<int,K> ) const {
         constexpr int depth = D - K;                     // the number of cuts that define the face
         if constexpr ( K == 0 ) {
             func( chain );
         } else {
             const SI p = chain[ depth ];                 // the apex of the face, fixed for this subtree
-            for ( int c = 0; c < nc; ++c )
-                apex[ depth ][ c ] = -1;
-            for ( int i = 0; i < nv; ++i ) {
-                bool on = true;
-                for ( int m = 0; m < depth; ++m )
-                    on &= has_cut( i, int( face_cuts[ m ] ) );
-                if ( ! on )
-                    continue;
+            const int *fv = fvl[ depth ];
+            int *ap = apex[ depth ], *fc = fcl[ depth ], nf = 0;
+            for ( int j = 0; j < len; ++j ) {
+                const int i = fv[ j ];
                 for ( int r = 0; r < D; ++r ) {
                     const int c = vk[ r ][ i ];
                     bool in = false;
                     for ( int m = 0; m < depth; ++m )
                         in |= int( face_cuts[ m ] ) == c;
-                    if ( ! in && apex[ depth ][ c ] < 0 )
-                        apex[ depth ][ c ] = i;
+                    if ( ! in && ap[ c ] < 0 ) {
+                        ap[ c ] = i;
+                        fc[ nf++ ] = c;
+                    }
                 }
             }
+            // `apex` is -1 everywhere between two visits: reset what this face set, the facets kept in `fcl`
+            for ( int f = 0; f < nf; ++f )
+                ap[ fc[ f ] ] = -1;
             // ... then cone `p` over the facets that do NOT contain it ( the others would give
             // flat simplices )
-            for ( int c = 0; c < nc; ++c ) {
-                const int a = apex[ depth ][ c ];
-                if ( a < 0 || has_cut( int( p ), c ) )
+            for ( int f = 0; f < nf; ++f ) {
+                const int c = fc[ f ];
+                if ( has_cut( int( p ), c ) )
                     continue;
+                // the vertices of the sub-face, in the same order: its apex is the first one
+                int sub = 0, a = -1;
+                if constexpr ( K > 1 ) {
+                    int *child = fvl[ depth + 1 ];
+                    for ( int j = 0; j < len; ++j )
+                        if ( has_cut( fv[ j ], c ) )
+                            child[ sub++ ] = fv[ j ];
+                    a = child[ 0 ];
+                } else {
+                    for ( int j = 0; j < len && a < 0; ++j )
+                        if ( has_cut( fv[ j ], c ) )
+                            a = fv[ j ];
+                }
                 face_cuts[ depth ] = c;
                 chain[ depth + 1 ] = a;
-                for_each_simplex_rec( chain, face_cuts, func, Ct<int,K-1>() );
+                for_each_simplex_rec( chain, face_cuts, sub, func, Ct<int,K-1>() );
             }
         }
     }
@@ -876,19 +901,61 @@ struct __attribute__(( visibility( "default" ) )) LocalN {
         return true;
     }
 
-    /// `func( c, measure )` for each cut `c` that carries a face: its AREA ( 3D only )
+    /// `func( c, measure )` for each cut `c` that carries a face: its ( D - 1 )-measure. In 3D the accumulated cross products;
+    /// beyond, the fan of `for_each_simplex` started ON the face ( depth 1, apex one of its vertices ), each simplex measured
+    /// by its Gram determinant -- `nc` fans per cell, enough for the dimensions where cells are few.
     template<class TF>
     HD void for_each_facet( auto &&func ) const {
-        static_assert( D == 3, "for_each_facet: 3D only beyond the plane" );
-        if ( nv < 4 )
+        if ( nv < D + 1 )
             return;
-        accumulate_faces_3d();
-        TK *const *s = s3;
-        for ( int k = 0; k < nc; ++k ) {
-            if ( v0[ k ] < 0 )
-                continue;
-            const TF sx = TF( s[0][k] ), sy = TF( s[1][k] ), sz = TF( s[2][k] );
-            func( k, sdot::sqrt( sx * sx + sy * sy + sz * sz ) / 2 );
+        if constexpr ( D > 3 ) {
+            TF fact = 1;
+            for ( int i = 2; i < D; ++i )
+                fact *= i;
+            Vector<SI,D+1> chain;
+            Vector<SI,D> face_cuts;
+            for ( int d = 0; d < D; ++d )
+                for ( int c = 0; c < nc; ++c )
+                    apex[ d ][ c ] = -1;
+            for ( int c = 0; c < nc; ++c ) {
+                int len = 0;
+                for ( int i = 0; i < nv; ++i )
+                    if ( has_cut( i, c ) )
+                        fvl[ 1 ][ len++ ] = i;
+                if ( len == 0 )
+                    continue;
+                const int a = fvl[ 1 ][ 0 ];
+                chain[ 0 ] = a;
+                chain[ 1 ] = a;
+                face_cuts[ 0 ] = c;
+                TF sum = 0;
+                for_each_simplex_rec( chain, face_cuts, len, [&]( const auto &ch ) {
+                    TF e[ D - 1 ][ D ];
+                    for ( int k = 0; k < D - 1; ++k )
+                        for ( int d = 0; d < D; ++d )
+                            e[ k ][ d ] = TF( v[ d ][ ch[ k + 2 ] ] ) - TF( v[ d ][ ch[ 1 ] ] );
+                    const auto G = Matrix<TF,D-1>::with_func( [&]( auto r, auto s ) {
+                        TF g = 0;
+                        for ( int d = 0; d < D; ++d )
+                            g += e[ int( r ) ][ d ] * e[ int( s ) ][ d ];
+                        return g;
+                    } );
+                    const TF det = G.determinant();
+                    if ( det > 0 )
+                        sum += sdot::sqrt( det );
+                }, Ct<int,D-1>() );
+                if ( sum > 0 )
+                    func( c, sum / fact );
+            }
+        } else {
+            accumulate_faces_3d();
+            TK *const *s = s3;
+            for ( int k = 0; k < nc; ++k ) {
+                if ( v0[ k ] < 0 )
+                    continue;
+                const TF sx = TF( s[0][k] ), sy = TF( s[1][k] ), sz = TF( s[2][k] );
+                func( k, sdot::sqrt( sx * sx + sy * sy + sz * sz ) / 2 );
+            }
         }
     }
 

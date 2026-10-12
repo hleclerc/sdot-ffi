@@ -45,7 +45,7 @@ CASE_CHOICES = [ "uniform", "lines_voronoi", "lines_equal", "planes_voronoi", "p
 
 if p := bench( "diagram",
                case      = Param( "uniform", choices = CASE_CHOICES, help = "the case ( see cases.py ); `uniform` uses --dim" ),
-               dim       = Param( 2, help = "dimension of the `uniform` case ( 2 or 3 )" ),
+               dim       = Param( 2, help = "dimension of the `uniform` case ( 2 to 6; beyond 3D: CPU only, no reference row )" ),
                n         = Param( 0, help = "number of seeds ( 0: the case of the campaign: 1e6 for the uniform ones, the file's size otherwise )" ),
                wscale    = Param( 0.0, help = "uniform case: weights in [ -w h^2, w h^2 ] ( 0: Voronoi; the old bench's `--weights`; 0.3 is a Laguerre one )" ),
                threads   = Param( 0, help = "workers ( 0: all the cores; the campaign: 8 )" ),

@@ -35,6 +35,7 @@ export default defineConfig({
             { text: 'Backends (JAX / PyTorch)', link: '/guide/backends' },
             { text: 'Differentiability',        link: '/guide/differentiability' },
             { text: 'Ot Plans',                 link: '/guide/ot-plan' },
+            { text: 'Performance',              link: '/guide/performance' },
             { text: 'The FFI boundary',         link: '/guide/ffi-internals' },
           ]
         }
