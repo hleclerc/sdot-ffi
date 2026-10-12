@@ -54,6 +54,22 @@ def diagram_class_for( positions, weights, accelerator ):
     return PowerDiagram_Bsp
 
 
+def _engine_unit( dim, seeds ):
+    """The cell engine for these seeds, as a `loom.FfiModule` (`sdot/engine/Cells.h` declares `engine_run`; both floats of the
+    kernel are instantiated: the float of the cells is that of the call's domain, which the seeds do not know)."""
+    inst = "".join( f'template LOOM_EXPORT int engine_run<LocalFor<{ dim },{ tk }>,{ seeds }>( LocalFor<{ dim },{ tk }> &, const { seeds } &, SI );\n'
+                    for tk in ( "float", "double" ) )
+    return loom.FfiModule(
+        "sdot_engine", includes = [ "sdot/engine/Cells.h", "sdot/cell/Engine.h" ],
+        source = ( "namespace sdot { namespace engine {\n"
+                   "template<class Local,class Seeds>\n"
+                   "int engine_run( Local &cell, const Seeds &seeds, SI k0 ) {\n"
+                   "    using TK = typename Local::TKernel;\n"
+                   "    auto f = seeds.template provider<TK>( k0 );\n"
+                   "    return run<true>( cell, f );\n"
+                   "}\n" + inst + "} }\n" ) )
+
+
 class PowerDiagram( Aggregate, Displayable ):
     # ---- what a specialization provides -------------------------------------------------------------
     #
@@ -201,6 +217,30 @@ class PowerDiagram( Aggregate, Displayable ):
     def dim_count( self ):
         return int( self.nb_dims.value )
 
+    def ffi_units( self, call_arg ):
+        """The cell engine as a SHARED LIBRARY ( `sdot/engine/Cells.h` ): every call that holds this diagram links the variant
+        of `sdot_engine` module (`_engine_unit`) its seeds ask for, instead of instantiating the engine in its own kernel. Called by loom for the
+        calls on the CPU ( the card has its own cells ), with the resolved types of the members. Says the same as
+        `engine::has_unit` ( dimensions 2 and 3 ) and as `engine_seeds()` of the storages."""
+        if not call_arg.device.is_cpu or self.dim_count not in ( 2, 3 ):
+            return []
+        m = call_arg.attributes
+        bsp = "tree" in m
+
+        def bound( name ):
+            ca = m.get( name )
+            return ca is not None and getattr( ca, "io_category", None ) is not None and ca.io_category.is_bound
+
+        positions = m[ "sorted_positions" if bsp else "positions" ]
+        tr = "double" if positions.itemsize == 8 else "float"
+        weights = int( bound( "sorted_weights" if bsp else "weights" ) )
+        if bsp:
+            ti = "SI" if m[ "tree" ].attributes[ "node_begin" ].itemsize == 8 else "int"
+            seeds = f"BspSeeds<{ tr },{ ti },{ self.dim_count },bool( { weights } ),bool( { int( bound( 'memo_counts' ) ) } )>"
+        else:
+            seeds = f"PlainSeeds<{ tr },{ self.dim_count },bool( { weights } )>"
+        return [ _engine_unit( self.dim_count, seeds ) ]
+
     @property
     def kernel_dtype( self ):
         return self._domain_cell().kernel_dtype
@@ -321,7 +361,8 @@ class PowerDiagram( Aggregate, Displayable ):
         # the budget that decides parallelism: what ONE work-item holds -- its scratch, sized
         # for the backward from the forward on ( it redoes the sweep on a scratch of the same shape )
         nb_words = self._scratch_words( self._scratch_capacity, self._nb_work_cells(), True )
-        nt = loom.resolved_device().nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ self.num_point ] )
+        kp = loom.kernel_parameters_for( "power_diagram_moment" if moment is not None else "power_diagram_measures" )
+        nt = kp.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ self.num_point ] )
 
         # the work-item axis is a BATCH axis carried by the scratch: `thread_index` /
         # `nb_threads` are the rank of this work-item and their number, the strided loop reads off them
@@ -330,8 +371,7 @@ class PowerDiagram( Aggregate, Displayable ):
         dist_expr, grad_dist_expr, dist_kwargs = self._dist_for( moment )
         memo_expr, memo_args, memo_produced = self._memo_for_call()
 
-        loom.ffi_call(
-            "power_diagram_measures" if moment is None else "power_diagram_moment",
+        kp.ffi_call(
             FfiCode.per_item( code = "inputs.power_diagram.measures( outputs.res, inputs.dom_cell, scratch.pool( batch_index ), "
                            f"{ dist_expr }, { memo_expr }, thread_index, nb_threads );",
                 # the gradients on the seeds are SHARED by all items: each work-item
@@ -398,15 +438,15 @@ class PowerDiagram( Aggregate, Displayable ):
         adjusted weights -- `2 mass_i ( p_i - b_i )` -- which `SdotPlanNd` does by itself."""
         dom = self._domain_cell()
         nb_words = self._scratch_words( self._scratch_capacity, self._nb_work_cells(), False )
-        nt = loom.resolved_device().nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ self.num_point ] )
+        kp = loom.kernel_parameters_for( "power_diagram_moments" )
+        nt = kp.nb_threads( nb_local_bytes_per_thread = 4 * nb_words, batch_axes = [ self.num_point ] )
         num_thread = new_batch_axis( nt, prefix = "thread" )
         mass = RealTensor[ self.num_point ]()
         first = RealTensor[ self.num_point, self.dim ]()
         second = RealTensor[ self.num_point ]()
         dist_expr, _, dist_kwargs = self._dist_for()
 
-        loom.ffi_call(
-            "power_diagram_moments",
+        kp.ffi_call(
             FfiCode.per_item( code = "inputs.power_diagram.moments( outputs.mass, outputs.first, outputs.second, "
                            f"inputs.dom_cell, scratch.pool( batch_index ), { dist_expr }, thread_index, nb_threads );" ),
             power_diagram = self,

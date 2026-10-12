@@ -155,6 +155,7 @@ struct GaussianTree {
             return r;
         };
         double best = 0;
+        std::vector<double> &bounds = bounds_buffer();
         bounds.clear();
         auto emit = [&]( const Term &t, double ub ) {
             if ( ub < rel * best ) return;
@@ -207,7 +208,13 @@ struct GaussianTree {
         out.resize( k );
     }
 
-    static inline thread_local std::vector<double> bounds;   ///< the bounds of the terms of `gather`, per thread
+    /// the bounds of the terms of `gather`, per thread. A function-local `thread_local`, not a `static inline`
+    /// member: Mach-O's linker refuses the member's initialization routine when several kernels are linked into one
+    /// library (`duplicate symbol 'thread-local initialization routine for ...'`), the catalogue's case.
+    static std::vector<double> &bounds_buffer() {
+        thread_local std::vector<double> bounds;
+        return bounds;
+    }
 };
 
 } // namespace sdot

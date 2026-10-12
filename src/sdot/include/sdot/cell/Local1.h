@@ -27,7 +27,7 @@
 namespace sdot {
 
 template<class TK>
-struct Local1 {
+struct __attribute__(( visibility( "default" ) )) Local1 {
     static constexpr int ct_dim = 1;
     using TKernel = TK;
     using PlaneT  = Plane<TK,1>;

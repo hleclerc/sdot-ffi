@@ -1,4 +1,4 @@
-"""THE 2D CELLS OF THE CARD ( `include/sdot/gpu/Cell2D.cuh`, `Laplacian2D.cuh`, `PowerDiagram_Bsp._card_variant` ).
+"""THE 2D CELLS OF THE CARD ( `src/sdot/include/sdot/gpu/Cell2D.cuh`, `Laplacian2D.cuh`, `PowerDiagram_Bsp._card_variant` ).
 
 On a CUDA device, a 2D power diagram in a box goes through a dedicated kernel ( the cell in registers, overflow
 passes, the tree as records in the kernel's float, the float accuracy fixes of the old GPU campaign ): its measures,
@@ -16,7 +16,7 @@ past the vertex limit is an ERROR ( `KernelFailure`, eager and traced ), never a
 Every test skips itself without a CUDA device ( the path does not exist on a CPU ) -- but the one on the choice of the
 variant, which is pure Python.
 
-THE 3D CELLS ( `include/sdot/gpu/Cell3D.cuh`, the last section ): a warp per cell, the same outputs, the same four
+THE 3D CELLS ( `src/sdot/include/sdot/gpu/Cell3D.cuh`, the last section ): a warp per cell, the same outputs, the same four
 properties, checked the same way against the generic double path ( or the plain storage where the cell is large ).
 """
 
@@ -787,7 +787,7 @@ if test( "the_wide_card_variant_computes_the_same_cells" ):
         assert numpy.array_equal( gn, gw )
 
 
-# ---- THE 3D CELLS ( `include/sdot/gpu/Cell3D.cuh` ) ----------------------------------------------------------------------
+# ---- THE 3D CELLS ( `src/sdot/include/sdot/gpu/Cell3D.cuh` ) ----------------------------------------------------------------------
 #
 # A warp per cell ( 64 vertices on the lanes' registers, then 128, then a slot of global memory ), the tree built on the card
 # ( `Bsp2D.cuh::build_tree< 3 >`, `Majorant3D.cuh` ). The reference is the generic double path on the same tree, or the plain

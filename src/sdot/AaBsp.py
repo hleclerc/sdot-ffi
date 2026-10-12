@@ -756,6 +756,9 @@ def take_rows( a, idx ):
     if "torch" in type( idx ).__module__:
         import torch
         return torch.as_tensor( a, device = idx.device )[ idx ]
+    if "cupy" in type( idx ).__module__:
+        import cupy
+        return cupy.asarray( a )[ idx ]
     import jax.numpy as jnp
     return jnp.asarray( a )[ idx ]
 

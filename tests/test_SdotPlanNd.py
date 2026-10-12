@@ -1478,8 +1478,9 @@ if test( "a_refused_log_step_falls_back_on_the_lin_residual" ):
         _check_aggregated( f"aligned triple { step } lin", runs[ "lin" ], pos, [ ( [ 4, 9, 13 ], False ) ], tol )
         log, lin = runs[ "log" ].stats, runs[ "lin" ].stats
         assert log[ "it_switch" ] == 0, ( step, log[ "it_switch" ] )
-        # the same iterations as lin; the refused log trials on top ( 3 diagrams with the limits, 8 with the trials )
-        assert log[ "nb_iter" ] == lin[ "nb_iter" ] and log[ "nb_diag" ] <= lin[ "nb_diag" ] + 10, ( step, log[ "nb_diag" ], lin[ "nb_diag" ] )
+        # the same iterations as lin; the refused log trials on top ( a few diagrams with the limits, a few dozen with the trials: how many
+        # depends on how much of the tiny residual the linear solver keeps -- 38 with the Cholesky, 26 with the multigrid )
+        assert log[ "nb_iter" ] == lin[ "nb_iter" ] and log[ "nb_diag" ] <= lin[ "nb_diag" ] + 40, ( step, log[ "nb_diag" ], lin[ "nb_diag" ] )
 
 
 if test( "the_aggregation_changes_nothing_without_such_seeds" ):

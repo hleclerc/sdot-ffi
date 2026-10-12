@@ -28,7 +28,7 @@ class Mesh( Distribution ):
     = How a cell meets it
 
     The cell is cut by each simplex it meets: a piece is `cell INTERSECT simplex`, on which the density is AFFINE and
-    integrated exactly ( `include/sdot/Mesh.h`). The simplices a cell meets are found in a bounding volume hierarchy
+    integrated exactly ( `src/sdot/include/sdot/Mesh.h`). The simplices a cell meets are found in a bounding volume hierarchy
     built here, on the host, once ( `_bvh.py` ): the simplices are stored in the order of its leaves, `bvh_*` is the tree, and the
     cell's own box is all the query there is.
 

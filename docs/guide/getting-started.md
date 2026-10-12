@@ -1,8 +1,22 @@
 # Getting Started
 
+## Installation
+
+```bash
+pip install sdot
+```
+
+Alternatively, to participate, or get the latest version, one can use the sources:
+
+```
+git clone git@github.com:sdot-team/sdot.git
+cd sdot
+pip install -e .
+```
+
 ## Framework
 
-SDOT can work with a lot of different frameworks. Here are the links for the official installation instructions for some of them (one is enough :) ):
+SDOT can work with a lot of different frameworks. Here are the links for the official installation instructions for some of them (one is enough for most of the applications :) ):
 
 - [JAX](https://docs.jax.dev/en/latest/installation.html)
 - [PyTorch](https://pytorch.org/get-started/locally/)
@@ -10,31 +24,21 @@ SDOT can work with a lot of different frameworks. Here are the links for the off
 - [Dask](https://docs.dask.org/en/stable/install.html)
 - [NumPy](https://numpy.org/install/)
 
-## Installation using pip
+> **GPU support** — follow the GPU installation instructions of the chosen framework for your platform (CUDA, …). SDOT will automatically use the devices your tensors are on, but some of the frameworks need specific installation instructions.
 
-```bash
-pip install sdot
-```
+## Compilers
 
+SDOT uses dynamic libraries that can be generated and compiled on demand. 
 
-> **GPU support** — follow the GPU installation instructions of the chosen framework for your platform (CUDA, …). SDOT will automatically use the devices your tensors are on.
-
-Internally, SDOT uses compiled code through dynamic libraries. The packages come bundled with the object files for the most common cases.
-
-For more exotic cases, SDOT may have to generate and compile some code. In this case, one will need a compiler toolchain (SDOT uses `ninja` as build system).
-
-## Installation from the sources
-
-Alternatively, to participate or get the last version, one can use the sources
-```
-git clone git@github.com:sdot-team/sdot.git
-cd sdot
-pip install -e .
-```
+Most of them will come from the packages (`pip`, ...). For more "exotic" case, you may need a compiler toolchain (`ninja`, a C++ compiler, `nvcc` if there's a Nvidia GPU, ...).
 
 ## Hello, World
 
-```python
+Here is a simple program to test if the installation works.
+
+:::code-group
+
+```python [NumPy]
 import numpy as np
 import sdot
 
@@ -45,6 +49,41 @@ plan = sdot.ot_solve( f, g )
 plan.show()
 ```
 
+```python [JAX]
+import jax
+import sdot
+
+f = sdot.SumOfDiracs( jax.random.uniform( jax.random.key( 0 ), ( 100, 2 ) ) )  # 100 equal-weight diracs, 2D
+g = sdot.Image( jax.random.uniform( jax.random.key( 0 ), ( 10, 10 ) ) )  # 10×10 image (auto-normalized)
+
+plan = sdot.ot_solve( f, g )
+plan.show()
+```
+
+```python [PyTorch]
+import torch
+import sdot
+
+f = sdot.SumOfDiracs( torch.rand( 100, 2 ) )  # 100 equal-weight diracs, 2D
+g = sdot.Image( torch.rand( 10, 10 ) )  # 10×10 image (auto-normalized)
+
+plan = sdot.ot_solve( f, g )
+plan.show()
+```
+
+```python [CuPy]
+import cupy as cp
+import sdot
+
+f = sdot.SumOfDiracs( cp.random.rand( 100, 2 ) )  # 100 equal-weight diracs, 2D
+g = sdot.Image( cp.random.rand( 10, 10 ) )  # 10×10 image (auto-normalized)
+
+plan = sdot.ot_solve( f, g )
+plan.show()
+```
+
+:::
+
 <script setup>
 import { withBase } from 'vitepress'
 </script>
@@ -54,7 +93,7 @@ import { withBase } from 'vitepress'
   title="SdotPlanNd interactive viewer"
   loading="lazy"
   allowfullscreen
-  style="width: 100%; height: 20vh; min-height: 480px; border: 0; display: block; margin: 1.5rem 0;"
+  style="width: 100%; height: 18vh; min-height: 380px; border: 0; display: block; margin: 1.5rem 0;"
 ></iframe>
 
 <p style="text-align: right; margin: 0"><a :href="withBase('/examples/SdotPlanNd-start.html')" target="_blank">Open in a separate page ↗</a></p>

@@ -1,0 +1,20 @@
+{
+ "cpu": "Apple M4 Pro",
+ "date": "2026-10-11",
+ "experiments": [
+  {
+   "seconds": {
+    "armv8-a": 0.901392
+   },
+   "weight": 1.0
+  }
+ ],
+ "loom": "0.1.0",
+ "machine": "hugos-macbook-pro18.home",
+ "os": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+ "scores": {
+  "armv8-a": 1.0
+ },
+ "tolerance": 0.05,
+ "use": "armv8-a"
+}

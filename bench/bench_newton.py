@@ -51,6 +51,12 @@ import reference_lmo
 
 CASE_CHOICES = [ "uniform", "lines_voronoi", "lines_equal", "planes_voronoi", "planes_equal", *cases.DENSITY_CASES ]
 
+def _peak_rss_gb():
+    import resource, sys
+    r = resource.getrusage( resource.RUSAGE_SELF ).ru_maxrss
+    return r / ( 1 << 30 if sys.platform == "darwin" else 1 << 20 )
+
+
 if p := bench( "newton",
                case          = Param( "uniform", choices = CASE_CHOICES, help = "the case ( see cases.py ); `uniform` uses --dim" ),
                dim           = Param( 2, help = "dimension of the `uniform` case ( 2 or 3 )" ),
@@ -111,7 +117,7 @@ if p := bench( "newton",
     if p.openmp >= 0:
         benchlib.set_openmp( p.openmp )
     import time
-    from sdot import Image, Iterative, OtProblem, SumOfDiracs, Tuning
+    from sdot import Image, Iterative, OtNotConverged, OtProblem, SumOfDiracs, Tuning
 
     density = p.case in cases.DENSITY_CASES
     if density:
@@ -152,7 +158,10 @@ if p := bench( "newton",
 
     # warm-up on a small prefix: the first solve of the process compiles the kernels
     m = min( n, 2000 )
-    OtProblem( SumOfDiracs( pos[ :m ] ), target() ).solve( settings( m, 3 ) )
+    try:
+        OtProblem( SumOfDiracs( pos[ :m ] ), target() ).solve( settings( m, 3 ) )
+    except OtNotConverged:
+        pass  # three iterations are not meant to converge: only the compilation matters
 
     import loom
     on_card = bool( getattr( loom.resolved_device(), "is_cuda_gpu", False ) )
@@ -276,9 +285,9 @@ if p := bench( "newton",
         p.results[ "ratio_new_old" ] = wall / ref[ "seconds" ]
 
     f = lambda x: f"{ x :.3f}"
-    header = [ "case", "n", "thr", "kernel", "step", "res", "lin", "status", "it", "diag", "t_diag", "t_asm", "t_lin", "t_lim", "t_maj", "total", "old", "new/old" ]
+    header = [ "case", "n", "thr", "kernel", "step", "res", "lin", "status", "it", "diag", "t_diag", "t_asm", "t_lin", "t_lim", "t_maj", "total", "rss_GB", "old", "new/old" ]
     row = [ name, n, benchlib.nb_threads(), p.kernel, p.step, p.residual, p.linear_solver, st[ "status" ], st[ "nb_iter" ], st[ "nb_diag" ], f( st[ "t_diag" ] ), f( st[ "t_asm" ] ),
-            f( st[ "t_lin" ] ), f( st[ "t_lim" ] ), f( st[ "t_majorant" ] ), f( wall ),
+            f( st[ "t_lin" ] ), f( st[ "t_lim" ] ), f( st[ "t_majorant" ] ), f( wall ), f"{ _peak_rss_gb() :.1f}",
             "-" if not ref else f"{ ref[ 'seconds' ] :.2f}", benchlib.ratio( wall, ref and ref[ "seconds" ] ) ]
     print( benchlib.table( header, [ row ] ) )
     if on_card:

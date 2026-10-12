@@ -119,7 +119,8 @@ class SdotPlan1d( Aggregate ):
         rebuilt by every forward/backward call here.
         """
         n  = int( self.nb_diracs.value )
-        nt = loom.resolved_device().nb_threads( batch_axes = self.batch_axes, nb_local_bytes_per_thread = 3 * 8 * n )
+        kp = loom.kernel_parameters_for( "update_outputs_SdotPlan1d" )
+        nt = kp.nb_threads( batch_axes = self.batch_axes, nb_local_bytes_per_thread = 3 * 8 * n )
         # `NB_BUCKETS = 256` (8-bit radix digit, see `SdotPlan1d.cxx::sort_diracs`) -- MUST match that
         # constant by hand. The histogram is now ONE ROW PER SUB-GROUP (warp), not per work-item (see
         # `sort_diracs`'s docstring) -- `nb_shared_bytes_per_subgroup` tells `group_size` to budget
@@ -130,7 +131,7 @@ class SdotPlan1d( Aggregate ):
         # allocates one extra shared row (the cross-chunk bucket offsets) on top -- tell `group_size`
         # about that fixed overhead so its shared-memory budget check matches what actually gets
         # allocated.
-        gs = loom.resolved_device().group_size( nb_shared_bytes_per_subgroup = 2 * 256 * 4, nb_shared_bytes_fixed = 256 * 4 )
+        gs = kp.group_size( nb_shared_bytes_per_subgroup = 2 * 256 * 4, nb_shared_bytes_fixed = 256 * 4 )
         num_group = Axis( ShapeVar( nt ), name = "num_group" )
         num_local = Axis( ShapeVar( gs ), name = "num_local" )
         num_scan  = Axis( ShapeVar( gs + 1 ), name = "num_local_scan" )   # `+1` = the phi_total broadcast slot
@@ -181,15 +182,15 @@ class SdotPlan1d( Aggregate ):
         #
         # This is the BODY of a C++ method ( see `FfiCode` ): the call's arguments are in
         # scope there under their names -- hence under their GROUP -- and the computation reads naturally.
+        kp = loom.kernel_parameters_for( "update_outputs_SdotPlan1d" )
         cooperative_geometry = dict(
             max_nb_threads = "return scratch.sorted_indices.shape( 0 );",
             group_size = f"return { group_size_expr };",
             local_mem_elems = ( f"const int gs = { group_size_expr };\n"
-                                f"        const int sg = { loom.resolved_device().subgroup_size };\n"
+                                f"        const int sg = { kp.subgroup_size };\n"
                                 f"        return ( 2 * ( ( gs + sg - 1 ) / sg ) + 1 ) * 256;" ),
         )
-        loom.ffi_call(
-            "update_outputs_SdotPlan1d",
+        kp.ffi_call(
             FfiCode.per_item( # `scratch.<x>( group_index )` yields this work-GROUP's shared rank-1 row.
                 # `plan( batch_index )` still picks the angle. The backward RE-SORTS into its OWN
                 # fresh scratch, so it needs all of them -- they are no longer residuals (per-group,
@@ -290,7 +291,8 @@ class SdotPlan1d( Aggregate ):
         """
         self.dst_dist.ensure_cell_cum_mass()
         group_size_expr = "scratch.num_local_marker.shape( 0 )"   # a C++ expression, read off an argument
-        gs = loom.resolved_device().group_size( nb_shared_bytes_per_subgroup = 0, nb_shared_bytes_fixed = 0 )
+        kp = loom.kernel_parameters_for( "update_outputs_presorted_SdotPlan1d" )
+        gs = kp.group_size( nb_shared_bytes_per_subgroup = 0, nb_shared_bytes_fixed = 0 )
         # ONE group only: this call handles a SINGLE angle (the caller's `lax.scan` supplies the outer
         # angle loop), so there is no "concurrent angles" axis to size `num_group` on (contrast
         # `_scratch`, sized on `nt` concurrent angles for the internally-sorting, all-angles-at-once path).
@@ -306,8 +308,7 @@ class SdotPlan1d( Aggregate ):
             group_size = f"return { group_size_expr };",
             local_mem_elems = "return 0;",
         )
-        loom.ffi_call(
-            "update_outputs_presorted_SdotPlan1d",
+        kp.ffi_call(
             FfiCode.per_item( code = ( "outputs.plan( batch_index ).update_outputs_presorted( inputs.sorted_indices( group_index ), inputs.sorted_pos( group_index ), "
                             "scratch.group_scan( group_index ), "
                             "local_index, local_size, group );" ),

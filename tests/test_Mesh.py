@@ -1,4 +1,4 @@
-"""A mesh of simplices as a density ( `include/sdot/Mesh.h`, `distributions/Mesh.py` ): continuous piecewise linear, one value per node.
+"""A mesh of simplices as a density ( `src/sdot/include/sdot/Mesh.h`, `distributions/Mesh.py` ): continuous piecewise linear, one value per node.
 
 The witness is that the density does not depend on HOW the domain is meshed: two triangulations with the values of the same
 affine function are the same density, whatever the pieces a cell is cut into."""

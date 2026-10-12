@@ -13,11 +13,11 @@ build/
 *.so.p
 *.dylib
 compile_commands.json
+catalogue_record
 
-# THE COMPILED CATALOGUE: `.so` files per machine variant, rebuilt by
-# `scripts/build_catalogue.py`. Only the README, which explains how, is tracked.
-catalogue/*
-!catalogue/README.md
+# THE PRECOMPILED KERNELS: `<tag>/<key>.so` per architecture, produced by `make catalogue`. Only the README is tracked.
+src/sdot/precompiled-kernels/*
+!src/sdot/precompiled-kernels/README.md
 
 # the runner ( errand )
 .errand/
@@ -33,3 +33,6 @@ node_modules/
 docs/.vitepress/cache/
 docs/.vitepress/dist/
 .pytest_cache/
+
+# the wheels `make wheels` builds
+/dist/

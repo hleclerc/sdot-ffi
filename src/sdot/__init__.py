@@ -1,24 +1,26 @@
-# the C++ of this package (`sdot/`, `asimd/`): `<repo>/sdot/include` from a checkout, the
-# `sdot/_include` tree the wheel ships next to the package otherwise -- registered with loom,
-# which compiles the kernels and does not know its users by name
+# the C++ of this package (`sdot/`, `asimd/`): `include/` next to this file, in a checkout, an editable install and a
+# wheel alike -- registered with loom, which compiles the kernels and does not know its users by name
 from pathlib import Path as _Path
 import os as _os
 import loom.compilation as _compilation
 _here = _Path( __file__ ).resolve().parent
-_compilation.register_include_root( _here / "_include" if ( _here / "_include" ).is_dir() else _here.parents[ 1 ] / "include" )
+_compilation.register_include_root( _here / "include" )
 
-# the catalogue of precompiled kernels, when there is one: a wheel's `sdot/_catalogue`, built with
-# these very headers -- or, for a checkout, the directory `SDOT_CATALOGUE_DIR` names EXPLICITLY (a
-# checkout's headers move, a catalogue registered by default would silently serve stale binaries)
-# the transport's linear solvers (`sdot/sdotplan/Linear.cpp`): Eigen and AMGCL, header-only,
+# the precompiled kernels (`precompiled-kernels/<tag>/<key>.so`, see `loom/compilation/catalogue.py`): always there, empty
+# in a checkout, filled in a wheel. Read-only as far as we are concerned -- the user may well not be allowed to write
+# in the installation. For a checkout, `SDOT_CATALOGUE_DIR` can name another one EXPLICITLY (a checkout's headers move, so
+# a catalogue registered by default would silently serve stale binaries)
+# the transport's linear solvers (`sdot/sdotplan/Linear.cpp`): Eigen, header-only,
 # which loom downloads once into its cache at the first compiled kernel (`loom/compilation/externals.py`)
 _compilation.register_external( "eigen", "3.4.0", "https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz",
                                 "8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72" )
-_compilation.register_external( "amgcl", "1.4.4", "https://github.com/ddemidov/amgcl/archive/refs/tags/1.4.4.tar.gz",
-                                "02fd5418e14d669422f65fc739ce72bf9516ced2d8942574d4b8caa05dda9d8c" )
 
 from loom.compilation import catalogue as _catalogue
-_catalogue.register_catalogue( _os.environ[ "SDOT_CATALOGUE_DIR" ] if "SDOT_CATALOGUE_DIR" in _os.environ else _here / "_catalogue" )
+_catalogue.register_catalogue( _os.environ[ "SDOT_CATALOGUE_DIR" ] if "SDOT_CATALOGUE_DIR" in _os.environ else _here / "precompiled-kernels" )
+
+# what was measured about which architecture each kernel runs as (see `loom/choices.py`); tracked in git, never written at run time
+import loom as _loom
+_loom.register_choices( _here / "choices" )
 
 from .AaBsp import AaBsp as AaBsp
 from .Cell import Cell as Cell

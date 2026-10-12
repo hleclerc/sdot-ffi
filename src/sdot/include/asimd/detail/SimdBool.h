@@ -29,7 +29,9 @@ struct SimdBool {
     HaD                       SimdBool  ( bool a, bool b, bool c, bool d ) { internal::init_mask( impl, a, b, c, d ); }
     HaD                       SimdBool  ( bool a, bool b ) { internal::init_mask( impl, a, b ); }
     HaD                       SimdBool  ( bool a ) { internal::init_mask( impl, a ); }
-    HaD                       SimdBool  ( Impl impl ) : impl( impl ) {}
+    // host only: `Impl` is a vector register on SSE / AVX targets, and a vector by value cannot cross nvcc's device pass
+    // (an error as soon as the class is instantiated in a `.cu`, whatever calls it)
+    SimdBool                  ( Impl impl ) : impl( impl ) {}
     HaD                       SimdBool  () {}
 
     // individual items

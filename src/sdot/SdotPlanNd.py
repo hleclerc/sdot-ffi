@@ -724,7 +724,7 @@ class SdotPlanNd( Displayable ):
         raise first
 
     def _build_card( self, pd, settings, step, verbose ):
-        """THE CARD'S SOLVE ( `include/sdot/gpu/Newton2D.cuh` ): the same Newton, the same options and outputs as the CPU's, in
+        """THE CARD'S SOLVE ( `src/sdot/include/sdot/gpu/Newton2D.cuh` ): the same Newton, the same options and outputs as the CPU's, in
         ONE ffi call whose handler drives the loop on the call's stream -- so it runs under `jax.jit` too. Taken in 2D and 3D,
         with the BSP tree and a box domain ( `PowerDiagram_Bsp._card_takes` ); anything else is refused here rather than solved
         on another path.

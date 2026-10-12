@@ -6,6 +6,7 @@
 #include <loom/support/common_macros.h>
 #include "diagram/Common.h"
 #include "AaBsp.h"
+#include "engine/Seeds.h"
 
 namespace sdot {
 
@@ -34,6 +35,20 @@ struct PowerDiagram_Bsp {
 
     template<class TK>
     HD auto provider( SI k0 ) const { return ProviderBsp<PowerDiagram_Bsp,TK,ct_dim,has_weights,has_memo>( *this, k0 ); }
+
+    /// the same seeds and tree without tensor types, for the cell engine compiled as a unit ( `engine/Cells.h` ).
+    /// The unit is built for the element types of the tree: floats like the positions, ranks of the integer type of `node_begin`.
+    HD auto engine_seeds() const {
+        // the ranks are read as the integer of their WIDTH ( `long` and `long long` are both 64 bits, and which one the call's
+        // tensors spell depends on the platform: the unit is built for `SI` or `int`, whatever the spelling )
+        using TI = std::conditional_t<( sizeof( typename DECAYED_TYPE_OF( tree.node_begin )::TF ) == 8 ), SI, int>;
+        static_assert( std::is_same_v<std::remove_cv_t<typename DECAYED_TYPE_OF( tree.node_box )::TF>,TF>, "the tree's boxes are of the float of the positions" );
+        using S = engine::BspSeeds<TF,TI,ct_dim,has_weights,has_memo>;
+        return S{ engine::view2<TF>( sorted_positions ), engine::opt_view1<TF>( sorted_weights ),
+                  typename S::Tree{ engine::view1<TI>( tree.node_begin ), engine::view1<TI>( tree.node_end ), engine::view3<TF>( tree.node_box ),
+                                    engine::opt_view2<TF>( tree.node_wa ), engine::opt_view1<TF>( tree.node_wb ) },
+                  engine::opt_view2<int>( memo_nbrs ), engine::opt_view1<int>( memo_counts ) };
+    }
 
     /// THE SAME DIAGRAM, the weights and the tree's majorants read ELSEWHERE -- views that
     /// the caller owns and WRITES ( the `SdotPlanNd` solver, which sets weights at each trial ):

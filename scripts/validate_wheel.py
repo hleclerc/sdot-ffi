@@ -10,7 +10,7 @@ PYTHONPATH to the repo, no local `build/` reused) and we run make_hypercube(2D) 
 measure -- the whole cycle generation -> compilation (host compiler) -> registration (Jax FFI) -> execution.
 
 The key proof is that the compilation uses the C++ headers SHIPPED IN THE WHEELS
-(`.../site-packages/loom/_include`, `sdot/_include`), not those of the checkout: `include_roots()`
+(`.../site-packages/loom/include`, `sdot/include`), not those of the checkout: `include_roots()`
 must only name paths of the venv, and the kernel must compile with them.
 
 Unlike `run_tests.py`, this script NEVER inserts `src/python` into sys.path: that would be

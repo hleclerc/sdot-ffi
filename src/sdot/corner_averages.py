@@ -1,4 +1,4 @@
-"""The corner averages of a DG1 density: its spreading on its own mesh, for the width continuation ( `include/sdot/CornerAverages.h` ).
+"""The corner averages of a DG1 density: its spreading on its own mesh, for the width continuation ( `src/sdot/include/sdot/CornerAverages.h` ).
 
 A DG1 density is a value per node of each simplex: `cv [ nb_elems, d + 1 ]` on `nodes [ nb_nodes, d ]`, `simplices [ nb_elems, d + 1 ]`.
 `corner_averages( ..., ks )` gives the states `k` of the path ( `[ len( ks ), nb_elems, d + 1 ]` ): `k = 0` the original, `k = 1` one

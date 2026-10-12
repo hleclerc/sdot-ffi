@@ -1,8 +1,8 @@
 // THE DOMAIN UNIT of the linear solvers ( see `Linear.h` ): compiled once per
 // compiler, linked by the kernels that name `sdot/sdotplan/Linear.cpp` in their `sources`.
-// Eigen and AMGCL are those that loom downloads ( `sdot/__init__.py` -> `loom/compilation/externals.py`,
-// on the include path ), or failing that those of the system ( `<eigen3/...>` ); what is missing is
-// simply not offered.
+// Eigen is the one that loom downloads ( `sdot/__init__.py` -> `loom/compilation/externals.py`,
+// on the include path ), or failing that the system's ( `<eigen3/...>` ); what is missing is
+// simply not offered. No OpenMP anywhere: the parallel loops run on loom's thread pool.
 
 #include "Linear.h"
 #include <algorithm>
@@ -10,26 +10,11 @@
 #include <cmath>
 #include <stdexcept>
 #include <tuple>
-
-#if __has_include( <amgcl/make_solver.hpp> )
-#  define SDOT_AMGCL 1
-#  ifndef AMGCL_NO_BOOST
-#    define AMGCL_NO_BOOST
-#  endif
-#  include <amgcl/adapter/crs_tuple.hpp>
-#  include <amgcl/amg.hpp>
-#  include <amgcl/backend/builtin.hpp>
-#  include <amgcl/coarsening/ruge_stuben.hpp>
-#  include <amgcl/coarsening/smoothed_aggregation.hpp>
-#  include <amgcl/make_solver.hpp>
-#  include <amgcl/relaxation/gauss_seidel.hpp>
-#  include <amgcl/relaxation/spai0.hpp>
-#  include <amgcl/solver/cg.hpp>
-#endif
-
-#ifdef _OPENMP
-#  include <omp.h>
-#  include <cstdlib>
+#include <cstdio>
+#include <cstdint>
+#if defined( __APPLE__ )
+#  include <sys/types.h>
+#  include <sys/sysctl.h>
 #endif
 
 #if __has_include( <Eigen/SparseCholesky> )
@@ -42,7 +27,7 @@
 #  include <eigen3/Eigen/SparseCore>
 #endif
 
-#include "Multigrid.h"                   // the in-house multigrid: needs the OpenMP / Eigen switches above
+#include "Multigrid.h"                   // the in-house multigrid: needs the Eigen switch above
 
 namespace sdot {
 namespace sdotplan {
@@ -102,82 +87,6 @@ struct Cg : LinearSolver {
         return err < 1;
     }
 };
-
-// ---- AMGCL ----------------------------------------------------------------------------------------
-
-#ifdef SDOT_AMGCL
-struct Amg : LinearSolver {
-    enum Variant : int { SA_SPAI0 = 0, SA_GS = 1, RS_GS = 2 };
-    int    variant = SA_SPAI0;     ///< the default of the old `newton` bench
-    double tol      = 1e-6;        ///< RELATIVE residual: a DAMPED direction needs no more ( README § 17.2: 1e-4 starts to cost diagrams ); the old `newton` bench ran at 1e-10
-    int    maxit    = 20000;
-
-    const char *name() const override {
-        return variant == RS_GS ? "AMGCL Ruge-Stuben+GS"
-             : variant == SA_GS ? "AMGCL aggregation+GS" : "AMGCL aggregation+spai0";
-    }
-
-    bool solves( const Laplacian &L, const std::vector<double> &b, std::vector<double> &d ) override {
-#ifdef _OPENMP
-        // as many OpenMP threads as the pool has workers, unless the user chose ( `OMP_NUM_THREADS` ): more threads
-        // than the pinned pool's cores oversubscribes them ( measured: 3D planes, 12.0 s of linear algebra with 16
-        // threads against 2.7 s with 8 )
-        if ( ! std::getenv( "OMP_NUM_THREADS" ) )
-            if ( const char *nt = std::getenv( "SDOT_NB_THREADS" ) )
-                if ( std::atoi( nt ) > 0 )
-                    omp_set_num_threads( std::atoi( nt ) );
-#endif
-        const SI n = L.n, m = n - 1;
-        const double t0 = now();
-        std::vector<int> ptr, col;
-        std::vector<double> val;
-        L.reduced_crs( ptr, col, val );
-        std::vector<double> rb( m ), sol( m, 0.0 );
-        for ( SI i = 1; i < n; ++i )
-            rb[ i - 1 ] = b[ i ];
-        const double t1 = now();
-        st.t_build += t1 - t0;
-
-        using Back = amgcl::backend::builtin<double>;
-        int it = 0;
-        double err = 0;
-        auto launch = [&]( auto tag ) {
-            using Solv = typename decltype( tag )::type;
-            typename Solv::params prm;
-            prm.solver.tol = tol;
-            prm.solver.maxiter = maxit;
-            Solv so( std::tie( m, ptr, col, val ), prm );
-            const double ta = now();
-            st.t_hierarchy += ta - t1;
-            ++st.nb_hierarchies;
-            std::tie( it, err ) = so( rb, sol );
-            st.t_res += now() - ta;
-        };
-        using SaSpai = amgcl::make_solver<amgcl::amg<Back, amgcl::coarsening::smoothed_aggregation, amgcl::relaxation::spai0>, amgcl::solver::cg<Back>>;
-        using SaGs   = amgcl::make_solver<amgcl::amg<Back, amgcl::coarsening::smoothed_aggregation, amgcl::relaxation::gauss_seidel>, amgcl::solver::cg<Back>>;
-        using RsGs   = amgcl::make_solver<amgcl::amg<Back, amgcl::coarsening::ruge_stuben, amgcl::relaxation::gauss_seidel>, amgcl::solver::cg<Back>>;
-        // AMGCL THROWS where the others say `false`: a singular system ( a facet graph split into components, each one
-        // without the gauge being a singular block -- a kept start that empties cells of a density zero on most of its
-        // domain ) reaches the direct solver of the coarsest level, whose LU stops on a zero pivot ( `precondition`,
-        // "Zero sum in skyline_lu factorization" ). Through the FFI call it would be a crash instead of a status.
-        try {
-            if      ( variant == SA_GS ) launch( std::type_identity<SaGs>{} );
-            else if ( variant == RS_GS ) launch( std::type_identity<RsGs>{} );
-            else                          launch( std::type_identity<SaSpai>{} );
-        } catch ( const std::exception & ) {
-            st.t_res += now() - t1;
-            return false;
-        }
-        st.nb_iter += it;
-        st.worst = std::max( st.worst, err );
-
-        d.assign( n, 0.0 );
-        for ( SI i = 1; i < n; ++i )
-            d[ i ] = sol[ i - 1 ];
-        return err < 1;                                  // `1`: the solver did nothing at all
-    }
-};
-#endif
 
 // ---- Eigen ----------------------------------------------------------------------------------------
 
@@ -245,27 +154,65 @@ int available_linear_methods() {
 #ifdef SDOT_EIGEN
     res |= 1 << int( Lin::CHOLESKY );
 #endif
-#ifdef SDOT_AMGCL
-    res |= 1 << int( Lin::AMG );
-#endif
     return res;
 }
 
-std::unique_ptr<LinearSolver> linear_solver( Lin method, SI n, int dim, const LinearOptions &opts ) {
-    const int available = available_linear_methods();
-    // AUTO. 3D: the in-house multigrid ( `Multigrid.h` ), as in the old `newton` bench -- measured, 8 pinned threads, n = 1e5, linear
-    // part: uniform 0.53 s against 1.07 s for AMGCL, planes 1.12 s against 1.96 s; at n = 5e5 AMGCL stagnates where it converges.
-    // 2D: the builtin backend of AMGCL is parallel through OpenMP ONLY. With it ( `-fopenmp` ), AMG wins from 2D uniform on
-    // ( 0.58 s of linear algebra against 0.77 s for MG and 1.78 s for Cholesky, n = 1e5; lines: 2.0 / 3.3 / 2.0 ) -- the old bench chose it
-    // in 2D too. Without it, AMG is sequential and 4x slower than that ( 3.6 s ): Cholesky stays the choice in 2D up to a few hundred
-    // thousand seeds.
-#ifdef _OPENMP
-    constexpr bool amg_is_parallel = true;
+/// the memory the machine can still give ( bytes; 0: unknown )
+static double available_memory() {
+#if defined( __linux__ )
+    if ( FILE *f = std::fopen( "/proc/meminfo", "r" ) ) {
+        char line[ 256 ];
+        double kb = 0;
+        while ( std::fgets( line, sizeof line, f ) )
+            if ( std::sscanf( line, "MemAvailable: %lf kB", &kb ) == 1 )
+                break;
+        std::fclose( f );
+        return kb * 1024;
+    }
+    return 0;
+#elif defined( __APPLE__ )
+    std::uint64_t bytes = 0;
+    std::size_t size = sizeof bytes;
+    return sysctlbyname( "hw.memsize", &bytes, &size, nullptr, 0 ) == 0 ? 0.5 * double( bytes ) : 0;   // no "available" there: half of it
 #else
-    constexpr bool amg_is_parallel = false;
+    return 0;
 #endif
+}
+
+/// the peak memory of the sparse Cholesky on a 2D laplacian of `n` seeds: the factor of a planar graph under the AMD ordering
+/// is O( n log n ) ( measured, `CHOLESKY_BYTES_PER_NLOGN` ); in 3D it grows like n^(4/3) ( rough upper bound )
+static double cholesky_bytes( SI n, int dim ) {
+    constexpr double CHOLESKY_BYTES_PER_NLOGN = 40.0;   // measured ~35 ( peak RSS, 2D uniform, n = 1e6 )
+    if ( dim >= 3 )
+        return 60.0 * std::pow( double( n ), 4.0 / 3.0 );
+    return CHOLESKY_BYTES_PER_NLOGN * double( n ) * std::log2( double( std::max<SI>( n, 2 ) ) );
+}
+
+/// the Cholesky is there, and fits in the memory ( at most half of what is available )
+static bool cholesky_fits( SI n, int dim ) {
+#ifdef SDOT_EIGEN
+    const double have = available_memory();
+    return have <= 0 || cholesky_bytes( n, dim ) <= 0.5 * have;
+#else
+    (void) n; (void) dim;
+    return false;
+#endif
+}
+
+std::unique_ptr<LinearSolver> linear_solver( Lin method, SI n, int dim, const LinearOptions &opts ) {
+    // AUTO. 3D: the in-house multigrid ( `Multigrid.h` ) -- the Cholesky takes minutes there ( 4 s against 800 s of linear algebra at
+    // n = 1e5 ). 2D: the Cholesky up to the crossover below, if its factor fits in the memory; the multigrid otherwise.
+    // The crossover in 2D ( 8 pinned threads, whole Newton solves, linear part ): uniform 1.7 s / 3.0 s ( Cholesky / multigrid ) at 1e5,
+    // 11.4 / 15.1 at 3e5, 89 / 75 at 1e6 -- the Cholesky is O( n^1.5 ) in time, the multigrid O( n ); the lines clouds keep the Cholesky
+    // ahead much longer ( 2.2 s against 12 s at 1e5 ). Its factor weighs ~35 bytes x n log2 n ( 0.7 GB over the multigrid at 1e6 ).
+    constexpr SI CHOLESKY_MAX_AUTO_2D = 600000;
     if ( method == Lin::AUTO )
-        method = dim >= 3 ? Lin::MG : ( n <= 300000 && ! amg_is_parallel ) ? Lin::CHOLESKY : Lin::AMG;
+        method = dim >= 3 || n > CHOLESKY_MAX_AUTO_2D ? Lin::MG : Lin::CHOLESKY;
+    // `AMG` was AMGCL, which is gone: its place is taken by the multigrid ( `LinearOptions::amg_variant` is ignored )
+    if ( method == Lin::AMG )
+        method = Lin::MG;
+    if ( method == Lin::CHOLESKY && ! cholesky_fits( n, dim ) )
+        method = Lin::MG;
     if ( method == Lin::MG ) {
         auto res = std::make_unique<Mg>();
         if ( dim >= 3 ) res->nu = 1;                     // measured: a 15-entry row carries information far enough ( see `Multigrid.h` )
@@ -277,19 +224,8 @@ std::unique_ptr<LinearSolver> linear_solver( Lin method, SI n, int dim, const Li
         if ( opts.mg_rebuild > 0 ) res->rebuild = opts.mg_rebuild;
         return res;
     }
-    if ( method == Lin::CHOLESKY && ! ( available & ( 1 << int( Lin::CHOLESKY ) ) ) ) method = Lin::AMG;
-    if ( method == Lin::AMG      && ! ( available & ( 1 << int( Lin::AMG      ) ) ) ) method = Lin::CHOLESKY;
-    if ( ! ( available & ( 1 << int( method ) ) ) )                                   method = Lin::CG;
 #ifdef SDOT_EIGEN
     if ( method == Lin::CHOLESKY ) return std::make_unique<Cholesky>();
-#endif
-#ifdef SDOT_AMGCL
-    if ( method == Lin::AMG ) {
-        auto res = std::make_unique<Amg>();
-        if ( opts.tol > 0 ) res->tol = opts.tol;
-        if ( opts.amg_variant >= 0 ) res->variant = opts.amg_variant;
-        return res;
-    }
 #endif
     auto res = std::make_unique<Cg>();
     if ( opts.tol > 0 ) res->tol = opts.tol;

@@ -74,10 +74,11 @@
 // * The hierarchy and the recycled subspace are keyed on the size of the system, as in the old code; the tree
 //   order is given by `LinearSolver::order( rank_of )` ( the rank of each user identifier ) instead of the
 //   old `pd.ids` ( the inverse permutation ).
-// * Without OpenMP the loops run sequentially ( the pragmas are ignored ).
+// * The loops run on loom's thread pool ( `mg_for` ), in contiguous slices: no OpenMP.
 // =====================================================================================
 
 #include "Linear.h"
+#include <loom/support/kernels/CpuThreadPool.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -85,21 +86,52 @@
 namespace sdot {
 namespace sdotplan {
 
-#ifdef _OPENMP
-static int mg_nb_threads() { return omp_get_max_threads(); }
-static int mg_thread() { return omp_get_thread_num(); }
-#else
-static int mg_nb_threads() { return 1; }
-static int mg_thread() { return 0; }
-#endif
+/// THE LOOPS run on loom's thread pool ( the one the kernels use: `SDOT_NB_THREADS`, `SDOT_PIN_THREADS` ), in CONTIGUOUS slices
+/// -- one per worker, so that a thread stays in its region of the tree order. No OpenMP: the wheel needs no runtime for it.
+static int mg_nb_threads() { return cpu_thread_pool().nb_workers(); }
+
+/// under this size a loop stays sequential: the wake-up of the workers costs more than the work
+static constexpr SI MG_PAR_THRESHOLD = 2048;
+
+/// `body( i, t )` for `i` in `[ 0, n )`, `t` being the worker ( `< mg_nb_threads()` ) that runs it
+template<class F> static void mg_for( SI n, F &&body ) {
+    const int T = mg_nb_threads();
+    if ( T <= 1 || n < MG_PAR_THRESHOLD ) {
+        for ( SI i = 0; i < n; ++i )
+            body( i, 0 );
+        return;
+    }
+    cpu_thread_pool().run_threads( T, [&]( int t ) {
+        const SI end = n * ( t + 1 ) / T;
+        for ( SI i = n * t / T; i < end; ++i )
+            body( i, t );
+    } );
+}
+
+/// the sum / the maximum of `term( i )`, the partial results being combined in the order of the workers ( deterministic for a given count )
+template<class F> static double mg_reduce( SI n, double init, F &&term, bool maximum ) {
+    const int T = n < MG_PAR_THRESHOLD ? 1 : std::max( mg_nb_threads(), 1 );
+    std::vector<double> part( T, init );
+    auto slice = [&]( int t ) {
+        const SI end = n * ( t + 1 ) / T;
+        double r = init;
+        for ( SI i = n * t / T; i < end; ++i )
+            r = maximum ? std::max( r, term( i ) ) : r + term( i );
+        part[ t ] = r;
+    };
+    if ( T == 1 ) slice( 0 ); else cpu_thread_pool().run_threads( T, slice );
+    double r = init;
+    for ( double p : part )
+        r = maximum ? std::max( r, p ) : r + p;
+    return r;
+}
+template<class F> static double mg_sum( SI n, F &&term ) { return mg_reduce( n, 0.0, term, false ); }
+template<class F> static double mg_max( SI n, F &&term ) { return mg_reduce( n, 0.0, term, true ); }
 
 static double mg_now() {
     using namespace std::chrono;
     return duration<double>( steady_clock::now().time_since_epoch() ).count();
 }
-
-/// under this size a loop stays sequential: the fork/join costs more than the work
-static constexpr SI MG_PAR_THRESHOLD = 2048;
 
 /// one level. Level 0 POINTS at the caller's laplacian, the others own their matrix.
 /// Convention everywhere: `y_i = dia_i x_i - sum_e val_e x_( col_e )`.
@@ -147,7 +179,6 @@ struct Mg : LinearSolver {
     }
 
     bool solves( const Laplacian &L, const std::vector<double> &b, std::vector<double> &d ) override {
-        set_threads();
         const double t0 = mg_now();
         if ( ! lev.empty() && lev[ 0 ].n != L.n ) { Uv.clear(); AUv.clear(); }
         const bool fresh = lev.empty() || lev[ 0 ].n != L.n || lev.size() == 1 || since >= std::max( rebuild, 1 );
@@ -178,16 +209,6 @@ private:
     bool            bottom_ready = false;
     Eigen::VectorXd eb, ex;
 #endif
-
-    /// as many OpenMP threads as the pool has workers ( see `Amg::solves` ), unless the user chose
-    static void set_threads() {
-#ifdef _OPENMP
-        if ( ! std::getenv( "OMP_NUM_THREADS" ) )
-            if ( const char *nt = std::getenv( "SDOT_NB_THREADS" ) )
-                if ( std::atoi( nt ) > 0 )
-                    omp_set_num_threads( std::atoi( nt ) );
-#endif
-    }
 
     int shift() const {                              // `log2( pack )`, rounded up to a power of two
         int sh = 1;
@@ -222,12 +243,11 @@ private:
         for ( SI i = 0; i < nl; ++i ) row[ i + 1 ] = row[ i ] + len[ i ];
         col.resize( row[ nl ] );
         val.resize( row[ nl ] );
-        #pragma omp parallel for schedule( static ) if( nl >= MG_PAR_THRESHOLD )
-        for ( SI i = 0; i < nl; ++i ) {
+        mg_for( nl, [&]( SI i, int ) {
             const int t = thr[ i ];
             const SI  o = loc[ i ], p = row[ i ];
             for ( SI k = 0; k < len[ i ]; ++k ) { col[ p + k ] = tcol[ t ][ o + k ]; val[ p + k ] = tval[ t ][ o + k ]; }
-        }
+        } );
     }
 
     // ---------------------------------------------------------------- the hierarchy
@@ -244,31 +264,28 @@ private:
         const SI n = v.n;
         v.rlx.resize( n );
         double mx = 0;
-        #pragma omp parallel for schedule( static ) if( n >= MG_PAR_THRESHOLD )
-        for ( SI i = 0; i < n; ++i ) {
+        mg_for( n, [&]( SI i, int t ) {
             const double d = v.dia[ i ];
             double q = d * d;
             for ( SI e = v.row[ i ]; e < v.row[ i + 1 ]; ++e ) q += v.val[ e ] * v.val[ e ];
             v.rlx[ i ] = q > 0 ? d / q : 0.0;
-        }
-        #pragma omp parallel for schedule( static ) reduction( max : mx ) if( n >= MG_PAR_THRESHOLD )
-        for ( SI i = 0; i < n; ++i ) {
+        } );
+mx = mg_max( n, [&]( SI i ) {
             double s = v.dia[ i ];
             for ( SI e = v.row[ i ]; e < v.row[ i + 1 ]; ++e ) s += std::fabs( v.val[ e ] );
-            mx = std::max( mx, v.rlx[ i ] * s );
-        }
+            return v.rlx[ i ] * s;
+        } );
         v.lmax = mx > 0 ? mx : 2.0;
     }
 
     /// `r = b - A x`
     static void residual( MgLevel &v ) {
         const SI n = v.n;
-        #pragma omp parallel for schedule( static ) if( n >= MG_PAR_THRESHOLD )
-        for ( SI i = 0; i < n; ++i ) {
+        mg_for( n, [&]( SI i, int t ) {
             double s = v.dia[ i ] * v.x[ i ];
             for ( SI e = v.row[ i ]; e < v.row[ i + 1 ]; ++e ) s -= v.val[ e ] * v.x[ v.col[ e ] ];
             v.r[ i ] = v.b[ i ] - s;
-        }
+        } );
     }
 
     /// THE CHEBYSHEV SMOOTHER, the three-term recurrence. `deg` matrix-vector products, exactly like `deg` sweeps of
@@ -286,24 +303,21 @@ private:
         } else {
             residual( v );
         }
-        #pragma omp parallel for schedule( static ) if( n >= MG_PAR_THRESHOLD )
-        for ( SI i = 0; i < n; ++i ) v.y[ i ] = v.rlx[ i ] * v.r[ i ] / th;     // `y` carries the direction
+        mg_for( n, [&]( SI i, int ) { v.y[ i ] = v.rlx[ i ] * v.r[ i ] / th; } );     // `y` carries the direction
         for ( int k = 0; k < deg; ++k ) {
-            #pragma omp parallel for schedule( static ) if( n >= MG_PAR_THRESHOLD )
-            for ( SI i = 0; i < n; ++i ) v.x[ i ] += v.y[ i ];
+            mg_for( n, [&]( SI i, int ) { v.x[ i ] += v.y[ i ]; } );
             if ( k + 1 == deg ) break;
             // ONE PASS, with a double buffer: the product `A y` of row `i` reads `y` at the neighbours, so the
             // next direction cannot be written into `y`; but it needs no further pass -- we read `y`, update
             // `r` in place ( each its own index ) and write the next direction into `z`, then swap
             const double r2 = 1 / ( 2 * si - rh ), c1 = r2 * rh, c2 = 2 * r2 / de;
-            #pragma omp parallel for schedule( static ) if( n >= MG_PAR_THRESHOLD )
-            for ( SI i = 0; i < n; ++i ) {
+            mg_for( n, [&]( SI i, int t ) {
                 double s = v.dia[ i ] * v.y[ i ];
                 for ( SI e = v.row[ i ]; e < v.row[ i + 1 ]; ++e ) s -= v.val[ e ] * v.y[ v.col[ e ] ];
                 const double ri = v.r[ i ] - s;
                 v.r[ i ] = ri;
                 v.z[ i ] = c1 * v.y[ i ] + c2 * v.rlx[ i ] * ri;
-            }
+            } );
             v.y.swap( v.z );
             rh = r2;
         }
@@ -340,8 +354,7 @@ private:
         {
             const bool by_rank = ( l == 0 && ! rg.empty() );
             const int sh = shift();
-            #pragma omp parallel for schedule( static ) if( nf >= MG_PAR_THRESHOLD )
-            for ( SI i = 0; i < nf; ++i ) m[ i ] = ( by_rank ? rg[ i ] : i ) >> sh;
+            mg_for( nf, [&]( SI i, int ) { m[ i ] = ( by_rank ? rg[ i ] : i ) >> sh; } );
         }
         prol.emplace_back();
         prolt.emplace_back();
@@ -352,10 +365,8 @@ private:
             prepare_buffers( T, nc, 0 );
             std::vector<SI> len( nf ), loc( nf );
             std::vector<int> thr( nf );
-            #pragma omp parallel for schedule( static ) if( nf >= MG_PAR_THRESHOLD )
-            for ( SI i = 0; i < nf; ++i ) {
-                const int t = mg_thread();
-                std::vector<double> &ac = acc[ t ];
+            mg_for( nf, [&]( SI i, int t ) {
+                                std::vector<double> &ac = acc[ t ];
                 std::vector<char> &mk = mkc[ t ];
                 std::vector<SI> &tc = tcol[ t ];
                 std::vector<double> &tv = tval[ t ];
@@ -389,7 +400,7 @@ private:
                 if ( sum > 0 )
                     for ( SI k = beg; k < SI( tv.size() ); ++k ) tv[ k ] /= sum;
                 loc[ i ] = beg; len[ i ] = kept - beg; thr[ i ] = t;
-            }
+            } );
             assemble_csr( nf, len, loc, thr, P.row, P.col, P.val );
         }
 
@@ -400,10 +411,8 @@ private:
             prepare_buffers( T, nc, nf );
             std::vector<SI> len( nc ), loc( nc );
             std::vector<int> thr( nc );
-            #pragma omp parallel for schedule( static ) if( nc >= MG_PAR_THRESHOLD )
-            for ( SI a = 0; a < nc; ++a ) {
-                const int t = mg_thread();
-                std::vector<char> &mk = mkf[ t ];
+            mg_for( nc, [&]( SI a, int t ) {
+                                std::vector<char> &mk = mkf[ t ];
                 std::vector<SI> &ls = lst[ t ];
                 std::vector<SI> &tc = tcol[ t ];
                 std::vector<double> &tv = tval[ t ];
@@ -424,7 +433,7 @@ private:
                         if ( P.col[ e ] == a ) { tc.push_back( i ); tv.push_back( P.val[ e ] ); break; }
                 }
                 loc[ a ] = beg; len[ a ] = SI( tc.size() ) - beg; thr[ a ] = t;
-            }
+            } );
             assemble_csr( nc, len, loc, thr, Pt.row, Pt.col, Pt.val );
         }
 
@@ -434,10 +443,8 @@ private:
             prepare_buffers( T, nc, 0 );
             std::vector<SI> len( nf ), loc( nf );
             std::vector<int> thr( nf );
-            #pragma omp parallel for schedule( static ) if( nf >= MG_PAR_THRESHOLD )
-            for ( SI i = 0; i < nf; ++i ) {
-                const int t = mg_thread();
-                std::vector<double> &ac = acc[ t ];
+            mg_for( nf, [&]( SI i, int t ) {
+                                std::vector<double> &ac = acc[ t ];
                 std::vector<char> &mk = mkc[ t ];
                 std::vector<SI> &tc = tcol[ t ];
                 std::vector<double> &tv = tval[ t ];
@@ -461,7 +468,7 @@ private:
                     ac[ tc[ k ] ] = 0; mk[ tc[ k ] ] = 0;
                 }
                 loc[ i ] = beg; len[ i ] = SI( tc.size() ) - beg; thr[ i ] = t;
-            }
+            } );
             assemble_csr( nf, len, loc, thr, AP.row, AP.col, AP.val );
         }
 
@@ -473,10 +480,8 @@ private:
             std::vector<SI> len( nc ), loc( nc );
             std::vector<int> thr( nc );
             std::vector<double> dia( nc, 0.0 );
-            #pragma omp parallel for schedule( static ) if( nc >= MG_PAR_THRESHOLD )
-            for ( SI a = 0; a < nc; ++a ) {
-                const int t = mg_thread();
-                std::vector<double> &ac = acc[ t ];
+            mg_for( nc, [&]( SI a, int t ) {
+                                std::vector<double> &ac = acc[ t ];
                 std::vector<char> &mk = mkc[ t ];
                 std::vector<SI> &tc = tcol[ t ];
                 std::vector<double> &tv = tval[ t ];
@@ -502,12 +507,11 @@ private:
                 }
                 tc.resize( kept );
                 loc[ a ] = beg; len[ a ] = kept - beg; thr[ a ] = t;
-            }
+            } );
             assemble_csr( nc, len, loc, thr, c.orow, c.ocol, c.oval );
             c.nnz = c.orow[ nc ];
             c.odia.resize( nc );
-            #pragma omp parallel for schedule( static ) if( nc >= MG_PAR_THRESHOLD )
-            for ( SI a = 0; a < nc; ++a ) c.odia[ a ] = dia[ a ] > 0 ? dia[ a ] : 1.0;
+            mg_for( nc, [&]( SI a, int ) { c.odia[ a ] = dia[ a ] > 0 ? dia[ a ] : 1.0; } );
         }
         lev.push_back( std::move( c ) );
         MgLevel &v = lev.back();                      // after the move: the buffers have moved
@@ -542,19 +546,15 @@ private:
     // ---------------------------------------------------------------- the blocks
     static void matvec( const MgLevel &v, const std::vector<double> &x, std::vector<double> &y ) {
         const SI n = v.n;
-        #pragma omp parallel for schedule( static ) if( n >= MG_PAR_THRESHOLD )
-        for ( SI i = 0; i < n; ++i ) {
+        mg_for( n, [&]( SI i, int t ) {
             double s = v.dia[ i ] * x[ i ];
             for ( SI e = v.row[ i ]; e < v.row[ i + 1 ]; ++e ) s -= v.val[ e ] * x[ v.col[ e ] ];
             y[ i ] = s;
-        }
+        } );
     }
     static double dot( const std::vector<double> &u, const std::vector<double> &v ) {
         const SI n = SI( u.size() );
-        double s = 0;
-        #pragma omp parallel for schedule( static ) reduction( + : s ) if( n >= MG_PAR_THRESHOLD )
-        for ( SI i = 0; i < n; ++i ) s += u[ i ] * v[ i ];
-        return s;
+        return mg_sum( n, [&]( SI i ) { return u[ i ] * v[ i ]; } );
     }
 
     // ---------------------------------------------------------------- the V-cycle
@@ -580,20 +580,18 @@ private:
         residual( g );
         // THE RESTRICTION IS A GATHER, never a scatter: no atomic. `P^t` is a CSR product.
         const MgCsr &Pt = prolt[ l ];
-        #pragma omp parallel for schedule( static ) if( ncc >= MG_PAR_THRESHOLD )
-        for ( SI a = 0; a < ncc; ++a ) {
+        mg_for( ncc, [&]( SI a, int t ) {
             double s = 0;
             for ( SI k = Pt.row[ a ]; k < Pt.row[ a + 1 ]; ++k ) s += Pt.val[ k ] * g.r[ Pt.col[ k ] ];
             c.b[ a ] = s;
-        }
+        } );
         cycle( l + 1 );
         const MgCsr &P = prol[ l ];
-        #pragma omp parallel for schedule( static ) if( nf >= MG_PAR_THRESHOLD )
-        for ( SI i = 0; i < nf; ++i ) {
+        mg_for( nf, [&]( SI i, int t ) {
             double s = 0;
             for ( SI e = P.row[ i ]; e < P.row[ i + 1 ]; ++e ) s += P.val[ e ] * c.x[ P.col[ e ] ];
             g.x[ i ] += s;
-        }
+        } );
         chebyshev( g, nu, false );
     }
 
@@ -635,12 +633,9 @@ private:
     static void center( std::vector<double> &v ) {
         const SI n = SI( v.size() );
         if ( n <= 0 ) return;
-        double s = 0;
-        #pragma omp parallel for schedule( static ) reduction( + : s ) if( n >= MG_PAR_THRESHOLD )
-        for ( SI i = 0; i < n; ++i ) s += v[ i ];
+        const double s = mg_sum( n, [&]( SI i ) { return v[ i ]; } );
         const double mu = s / double( n );
-        #pragma omp parallel for schedule( static ) if( n >= MG_PAR_THRESHOLD )
-        for ( SI i = 0; i < n; ++i ) v[ i ] -= mu;
+        mg_for( n, [&]( SI i, int ) { v[ i ] -= mu; } );
     }
 
     // ---------------------------------------------------------------- the outer CG
@@ -681,13 +676,12 @@ private:
                 }
             }
             if ( solve_dense( G, f, k ) ) {
-                #pragma omp parallel for schedule( static ) if( n >= MG_PAR_THRESHOLD )
-                for ( SI i = 0; i < n; ++i ) {
+                mg_for( n, [&]( SI i, int t ) {
                     double sx = 0, sr = 0;
                     for ( int j = 0; j < k; ++j ) { sx += f[ j ] * Uv[ j ][ i ]; sr += f[ j ] * AUv[ j ][ i ]; }
                     d[ i ] = sx;
                     cr[ i ] -= sr;
-                }
+                } );
                 center( d );
                 center( cr );
             }
@@ -704,21 +698,17 @@ private:
             const double pq = dot( cp, cq );
             if ( ! ( pq > 0 ) ) break;                   // the direction is in the kernel: done
             const double al = rz / pq;
-            double s = 0;
-            #pragma omp parallel for schedule( static ) reduction( + : s ) if( n >= MG_PAR_THRESHOLD )
-            for ( SI i = 0; i < n; ++i ) {
+            rr = mg_sum( n, [&]( SI i ) {
                 d[ i ] += al * cp[ i ];
                 cr[ i ] -= al * cq[ i ];
-                s += cr[ i ] * cr[ i ];
-            }
-            rr = s;
+                return cr[ i ] * cr[ i ];
+            } );
             if ( rr <= target ) { ++it; break; }
             precond( cr, cz );
             const double rz2 = dot( cr, cz );
             const double be = rz != 0 ? rz2 / rz : 0.0;
             rz = rz2;
-            #pragma omp parallel for schedule( static ) if( n >= MG_PAR_THRESHOLD )
-            for ( SI i = 0; i < n; ++i ) cp[ i ] = cz[ i ] + be * cp[ i ];
+            mg_for( n, [&]( SI i, int ) { cp[ i ] = cz[ i ] + be * cp[ i ]; } );
         }
         st.nb_iter += it;
         // THE SOLUTION JOINS THE SUBSPACE, in the zero-mean gauge: the one it is solved in, so the one `U` lives in
@@ -728,8 +718,7 @@ private:
         }
         // WE RETURN THE GAUGE `d[ 0 ] = 0`: see the header
         const double d0 = d[ 0 ];
-        #pragma omp parallel for schedule( static ) if( n >= MG_PAR_THRESHOLD )
-        for ( SI i = 0; i < n; ++i ) d[ i ] -= d0;
+        mg_for( n, [&]( SI i, int ) { d[ i ] -= d0; } );
         const double err = std::sqrt( rr / bb );
         st.worst = std::max( st.worst, err );
         return err < 1;

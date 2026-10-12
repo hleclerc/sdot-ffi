@@ -1,4 +1,4 @@
-"""The corner averages of a DG1 density ( `sdot.corner_averages`, `include/sdot/CornerAverages.h` ): the spreading on its own mesh
+"""The corner averages of a DG1 density ( `sdot.corner_averages`, `src/sdot/include/sdot/CornerAverages.h` ): the spreading on its own mesh
 for the width continuation. The witnesses: the original at `k = 0`, the mass and the positivity at every `k`, the powers of the two
 averages against a plain numpy version, and the Chebyshev series close to them."""
 

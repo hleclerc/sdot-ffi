@@ -36,6 +36,7 @@
 #include <limits>
 #include "../cell/Providers.h"
 #include "../cell/Engine.h"
+#include "../engine/Cells.h"
 #include "../cell/Ops.h"
 #include "../PieceWorkspace.h"
 #include "../UnitDensity.h"
@@ -82,8 +83,29 @@ HD bool make_cell( const PD &pd, Local &c, SI k0, const auto &dom ) {
     using TK = typename Local::TKernel;
     if ( ! c.load( dom ) )
         return false;
-    auto f = pd.template provider<TK>( k0 );
-    return run<PD::on_cpu>( c, f ) != CutStatus::NO_ROOM;
+#ifdef SDOT_ENGINE_DEVICE_DEBUG
+    static_assert( ! PD::on_cpu, "A: on the cpu" );
+    static_assert( requires { pd.engine_seeds(); }, "B: no engine_seeds" );
+    static_assert( engine::has_unit( PD::ct_dim ), "C: no unit for this dimension" );
+    static_assert( std::is_same_v<Local,engine::LocalFor<PD::ct_dim,TK>>, "D: the cell is not the one of the unit" );
+#endif
+    // on the CPU the engine is a shared library ( `engine/Cells.h` ), where the storage can describe itself without tensor types
+#ifdef SDOT_NO_ENGINE_UNIT      // the engine inlined in every kernel, as it was ( to measure what the unit costs: `bench/engine_unit.py` )
+    if constexpr ( false ) {
+#else
+    if constexpr ( PD::on_cpu && requires { pd.engine_seeds(); } && engine::has_unit( PD::ct_dim )
+                   && std::is_same_v<Local,engine::LocalFor<PD::ct_dim,TK>> ) {
+#endif
+        return engine::engine_run( c, pd.engine_seeds(), k0 ) != CutStatus::NO_ROOM;
+#if defined( __CUDACC__ ) && ( defined( SDOT_ENGINE_DEVICE_NOINLINE ) || defined( SDOT_ENGINE_DEVICE_EXTERN ) )
+    } else if constexpr ( ! PD::on_cpu && requires { pd.engine_seeds(); } && engine::has_unit( PD::ct_dim )
+                          && std::is_same_v<Local,engine::LocalFor<PD::ct_dim,TK>> ) {
+        return engine::engine_run_device( c, pd.engine_seeds(), k0 ) != CutStatus::NO_ROOM;
+#endif
+    } else {
+        auto f = pd.template provider<TK>( k0 );
+        return run<PD::on_cpu>( c, f ) != CutStatus::NO_ROOM;
+    }
 }
 
 /// the plane of cut `k` of `cell`, in the positions' float: the bisector REBUILT

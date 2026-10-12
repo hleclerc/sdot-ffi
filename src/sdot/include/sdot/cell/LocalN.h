@@ -55,7 +55,7 @@
 namespace sdot {
 
 template<class TK,int D>
-struct LocalN {
+struct __attribute__(( visibility( "default" ) )) LocalN {
     static_assert( D >= 3, "below 3D, it is `Local2`" );
     static constexpr int ct_dim = D;
     using TKernel = TK;

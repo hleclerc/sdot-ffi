@@ -5,6 +5,7 @@
 #include <sdot/generated/aggregates/PowerDiagram_Plain.h>
 #include <loom/support/common_macros.h>
 #include "diagram/Common.h"
+#include "engine/Seeds.h"
 
 namespace sdot {
 
@@ -21,6 +22,11 @@ struct PowerDiagram_Plain {
 
     template<class TK>
     HD auto provider( SI k0 ) const { return ProviderAll<PowerDiagram_Plain,TK,ct_dim>( *this, k0 ); }
+
+    /// the same seeds without tensor types, for the cell engine compiled as a unit ( `engine/Cells.h` )
+    HD auto engine_seeds() const {
+        return engine::PlainSeeds<TF,ct_dim,has_weights>{ engine::view2<TF>( positions ), engine::opt_view1<TF>( weights ) };
+    }
 
     /// the same diagram, the weights read ELSEWHERE ( see `PowerDiagram_Bsp::with_weights` ); the order
     /// of the members is that of `PowerDiagram.py` + `PowerDiagram_Plain.py`

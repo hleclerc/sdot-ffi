@@ -100,7 +100,7 @@ class PowerDiagram_Bsp( PowerDiagram ):
         self.memo_nbrs = nbrs.raw
         self.memo_counts = counts.raw
 
-    # ---- the cells of the card ( 2D: `include/sdot/gpu/Cell2D.cuh`, `Laplacian2D.cuh`; 3D: `Cell3D.cuh` ) ----------
+    # ---- the cells of the card ( 2D: `src/sdot/include/sdot/gpu/Cell2D.cuh`, `Laplacian2D.cuh`; 3D: `Cell3D.cuh` ) ----------
     #
     # `measures` on a CUDA device, in 2D: one thread per cell, the cell in registers, the overflow redone by later
     # passes ( a warp per cell in shared, then in global memory ), the tree as aligned records in the kernel's float,
