@@ -1,5 +1,7 @@
 import numpy
 
+import loom
+
 from loom.tensor import Axis, CtShapeVar, RealTensor, ShapeVar
 from loom.util import ComputedAttribute
 
@@ -104,24 +106,33 @@ class SumOfGaussians( Distribution ):
         return viz
 
     def bounding_half_spaces( self ):
-        """the box `[ c_i - k s_i, c_i + k s_i ]` united over the gaussians ( see the class
-        docstring ) -- `None` without `support_sigmas`, or when the parameters are not readable on the
-        host side ( under `jit` ): bounding is an optimization, it must not break the call"""
+        """the box `[ c_i - k s_i, c_i + k s_i ]` united over the gaussians ( see the class docstring ) -- `None` without
+        `support_sigmas`. The DOMAIN is a constant of the transport ( nothing differentiates through it ): it is computed on
+        DETACHED parameters. Readable on the host, it is a numpy box; under a trace ( `jax.jit`, `jax.grad` ), its offsets are
+        traced arrays of the framework -- a `PowerDiagram` cuts its domain with them where they are ( `_domain_cell` )."""
         if self.support_box is not None:
             lo, hi = self.support_box
             d = len( lo )
             return numpy.concatenate( [ numpy.eye( d ), -numpy.eye( d ) ] ), numpy.concatenate( [ hi, -lo ] )
         if self.support_sigmas is None:
             return None
+        from loom.tensor.host import to_host
+        d = int( self.nb_dims.value )
+        dirs = numpy.concatenate( [ numpy.eye( d ), -numpy.eye( d ) ] )
+        ops = loom.ops( self.positions.raw )
+        c = ops.stop_gradient( self.positions.raw )
+        s = ops.stop_gradient( self.sigmas.raw )
         try:
-            d = int( self.nb_dims.value )
-            c = numpy.asarray( self.positions, dtype = float ).reshape( -1, d )
-            s = numpy.asarray( self.sigmas, dtype = float ).reshape( -1, 1 )
-        except ( TypeError, ValueError, RuntimeError ):      # RuntimeError: a torch tensor that requires grad
-            return None
+            c, s = to_host( c ), to_host( s )
+        except Exception:      # a tracer: no value on the host, the box stays where the parameters are
+            c, s = ops.reshape( c, ( -1, d ) ), ops.reshape( s, ( -1, 1 ) )
+            k = self.support_sigmas
+            return dirs, ops.concatenate( [ ops.max( c + k * s, axis = 0 ), -ops.min( c - k * s, axis = 0 ) ] )
+        c = numpy.asarray( c, dtype = float ).reshape( -1, d )
+        s = numpy.asarray( s, dtype = float ).reshape( -1, 1 )
         lo = ( c - self.support_sigmas * s ).min( axis = 0 )
         hi = ( c + self.support_sigmas * s ).max( axis = 0 )
-        return numpy.concatenate( [ numpy.eye( d ), -numpy.eye( d ) ] ), numpy.concatenate( [ hi, -lo ] )
+        return dirs, numpy.concatenate( [ hi, -lo ] )
 
     def _update_current_mass( self ):
         # reduction over the GAUSSIAN axis only, so that a possible batch axis survives

@@ -335,7 +335,9 @@ class SdotPlanNd( Displayable ):
                 if isinstance( v, Aggregate ):
                     if traced( v ):
                         return True
-                elif isinstance( v, Tensor ) and v.is_defined and loom.is_traced( v.raw ):
+                # `storage.traces`: what an autodiff RECORDS -- a jax tracer, but also a torch tensor that `requires_grad`, which
+                # `loom.is_traced` leaves out ( for torch, it only means a `torch.func` transform )
+                elif isinstance( v, Tensor ) and v.is_defined and ( v.storage.traces or loom.is_traced( v.raw ) ):
                     return True
             return False
         return traced( problem.source ) or traced( problem.target )
@@ -662,8 +664,8 @@ class SdotPlanNd( Displayable ):
             if loom.is_traced( pos_raw ):
                 self._dup_note = "not checked ( traced positions )"
             else:
-                P = np.asarray( pos_raw.cpu() if hasattr( pos_raw, "cpu" ) and not isinstance( pos_raw, np.ndarray ) else pos_raw,
-                                dtype = np.float64 ).reshape( n, -1 )
+                from loom.tensor.host import to_host     # any framework, any device ( a cupy array refuses `np.asarray` )
+                P = np.asarray( to_host( pos_raw ), dtype = np.float64 ).reshape( n, -1 )
                 dup, rep = exact_duplicates( P )
                 self._dup_note = "checked"
                 if len( dup ):

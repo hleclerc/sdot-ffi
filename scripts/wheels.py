@@ -64,7 +64,7 @@ def main():
     p.add_argument( "--version", default = None, help = "write this version in loom and sdot first (`next`: year.month.day.number of today, the number counting today's releases)" )
     p.add_argument( "--no-validate", action = "store_true" )
     p.add_argument( "--no-build", action = "store_true", help = "only write the version" )
-    p.add_argument( "--publish", metavar = "URL", default = "https://upload.pypi.org/legacy/", help = "the upload URL of the index" )
+    p.add_argument( "--publish", metavar = "URL", default = None, help = "upload the wheels of dist/ to the index at this URL ( e.g. https://upload.pypi.org/legacy/ ); nothing is uploaded without it" )
     a = p.parse_args()
 
     loom = Path( a.loom ) if a.loom else next( d for d in ( ROOT / "loom", ROOT.parent / "loom" ) if ( d / "pyproject.toml" ).exists() )

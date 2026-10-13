@@ -13,8 +13,6 @@ scale with the number of diracs and with the dimension. Every number comes from 
 
 Protocol:
 
-* The machine runs nothing else.
-* Each figure is the minimum of 3 runs (10 for a single diagram), taken after a warm-up.
 * A Newton solve starts cold, from the Voronoi diagram (zero weights), tree build included. It stops when
   `max |mass - target| / target <= 1e-6`.
 * GPU times are for a **jitted** call (JAX). An eager call costs about 0.1 s more.
@@ -82,13 +80,13 @@ before it starts.
 Lebesgue on the unit hypercube, diracs drawn uniformly, a cold start, `rtol = 1e-6`. CPU `lmo`, 8 pinned threads,
 double kernel, `step = trials`. One run per row (3 for 4D at 1e5). 6D at 1e3: 9 min (5 / 7).
 
-| dim | total, n = 1e4 | total, n = 1e5 | Newton it. / diagrams | one diagram, per dirac (n = 1e4) | vertices per cell |
-|---|---|---|---|---|---|
-| 2 | 0.20 s | 1.09 s | 5 / 6 | 0.9 µs | 6 |
-| 3 | 0.40 s | 2.31 s | 5 / 6 | 3.6 µs | ~25 |
-| 4 | 5.1 s | 44.7 s | 5 / 6 | 80 µs | ~120 |
-| 5 | 103 s | 19 min | 5 / 6 | 1.7 ms | ~670 |
-| 6 | 52 min | – | 4 / 5 | 63 ms | ~3300 |
+| dim | total, n = 1e4 | Newton it. / diagrams | one diagram, per dirac (n = 1e4) | vertices per cell |
+|---|---|---|---|---|
+| 2 | 0.20 s | 5 / 6 | 0.9 µs | 6 |
+| 3 | 0.40 s | 5 / 6 | 3.6 µs | ~25 |
+| 4 | 5.1 s  | 5 / 6 | 80 µs | ~120 |
+| 5 | 103 s  | 5 / 6 | 1.7 ms | ~670 |
+| 6 | 52 min | 4 / 5 | 63 ms | ~3300 |
 
 Newton is not affected by the dimension: the iteration count (5 iterations, 6 diagrams) and the cost of the linear
 solves (under 2.5 s at 1e5) stay the same up to 6D. The whole cost is in the cells. A Laguerre cell of a uniform cloud
@@ -99,7 +97,7 @@ about 20 (3D to 4D, 4D to 5D), then by about 40 from 5D to 6D.
 In practice, 4D is comfortable up to a few 10⁵ diracs and 5D up to about 10⁵. 6D is limited to about 10⁴ diracs (an hour on 8 cores).
 Beyond that, the cost comes from the geometry of the cells, not from the solver.
 
-## Comparison with other libraries
+<!-- ## Comparison with other libraries
 
 ::: warning To be measured
 **CGAL** (`Regular_triangulation_2/3`): the programs in `bench/cgal/` already build the same power diagrams as
@@ -109,11 +107,11 @@ Beyond that, the cost comes from the geometry of the cells, not from the solver.
 
 The previous C++ implementation of sdot (CPU, same machine, same cases) gives the following Newton totals: 2D uniform
 1.08 s, 3D uniform 2.25 s, 3D planes 7.19 s. The current CPU path takes 0.9 to 1.15 times as long.
-:::
+::: -->
 
 <!-- TODO: table: n, dim, sdot CPU / sdot GPU / CGAL (triangulation only, then + cell measures) / geogram (whole OT). -->
 
-## Reproducing
+<!-- ## Reproducing
 
 The benchmarks run through `errand`. The complete list of options is in
 [`bench/README.md`](https://github.com/sdot-team/sdot/tree/main/bench/README.md).
@@ -128,4 +126,4 @@ errand -k bench --env lmo-jax   bench_newton --case=uniform2d,uniform3d,planes_v
 errand -k bench --env lmo-numpy bench_newton --case=uniform --dim=2,3,4,5,6 --n=10000 --threads=8 --reps=1
 # densities (image, gaussians) with continuation
 errand -k bench --env lmo-jax   bench_newton --case=image,gauss4 --sigma=0.02 --step=trials,limits
-```
+``` -->

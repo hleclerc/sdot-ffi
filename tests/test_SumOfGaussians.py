@@ -71,3 +71,26 @@ if test( "the_3d_transport_towards_gaussians_is_solved" ):
     plan = OtProblem( SumOfDiracs( rng.uniform( 0.2, 0.8, size = ( n, 3 ) ) ), dens ).solve( Iterative( tol = 1e-2 / n ) )
     m = numpy.asarray( plan.cell_masses ).reshape( -1 )
     assert plan.converged and numpy.abs( m * n - 1 ).max() < 1e-2, ( plan.stats[ "status" ], numpy.abs( m * n - 1 ).max() )
+
+
+if test( "the_support_follows_traced_parameters" ):
+    import numpy
+    from loom.testing import need
+    import sdot
+    need( "cpu" )
+    need( "grad" )
+    import jax
+    import jax.numpy as jnp
+    # no `support_box`: the domain is the box of the gaussians up to `support_sigmas`, read off their parameters even when
+    # they are traced ( `bounding_half_spaces`: traced offsets, detached ) -- what lets a fit differentiate, and jit, with the
+    # domain following the gaussians
+    rng = numpy.random.default_rng( 1 )
+    x = jnp.asarray( rng.normal( 0, 0.5, size = ( 40, 2 ) ) )
+    def w2( c, s, m ):
+        return sdot.w2( sdot.SumOfDiracs( x ), sdot.SumOfGaussians( c, s, weights = m ) )
+    args = ( jnp.asarray( [ [ -0.3, 0.1 ], [ 0.4, -0.2 ] ] ), jnp.asarray( [ 0.5, 0.4 ] ), jnp.asarray( [ 1.0, 0.7 ] ) )
+    g = jax.grad( w2, argnums = ( 0, 1, 2 ) )( *args )
+    gj = jax.jit( jax.grad( w2, argnums = ( 0, 1, 2 ) ) )( *args )
+    for a, b in zip( g, gj ):
+        assert numpy.isfinite( numpy.asarray( a ) ).all() and numpy.abs( numpy.asarray( a ) ).max() > 0
+        assert numpy.allclose( numpy.asarray( a ), numpy.asarray( b ), rtol = 1e-8, atol = 1e-12 ), ( a, b )

@@ -58,6 +58,8 @@ from .distributions.Polytope import Polygon as Polygon
 from .distributions.Polytope import Polyhedron as Polyhedron
 from .distributions.SumOfGaussians import SumOfGaussians as SumOfGaussians
 
+from .quantization import quantization as quantization
+
 from .viz.Visualizer import Visualizer as Visualizer
 from .viz.convergence import write_convergence_html as write_convergence_html
 

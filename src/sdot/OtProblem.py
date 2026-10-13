@@ -330,6 +330,8 @@ class OtProblem:
         from the support that the TARGET declares, and from it alone. Raises if this support does not bound it."""
         d = self.nb_dims
         support = self._target.bounding_half_spaces()
+        if support is not None and loom.is_traced( support[ 1 ] ):
+            return support      # offsets known only under the trace ( `SumOfGaussians` ): a box, which bounds
         if support is not None:
             dirs = np.asarray( support[ 0 ], dtype = float ).reshape( -1, d )
             offs = np.asarray( support[ 1 ], dtype = float ).reshape( -1 )

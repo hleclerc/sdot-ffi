@@ -169,7 +169,7 @@ class PowerDiagram( Aggregate, Displayable ):
         if boundaries is not None:
             # WHERE TO START FROM, read off the half-spaces themselves: those a box already expresses leave
             # the list -- they are `2d` of them and would come back on every cell ( 25 %, measured ).
-            start_box = axis_aligned_box( *boundaries )
+            start_box = axis_aligned_box( *boundaries ) or traced_box( *boundaries )
             if start_box is None or start_box[ 2 ].any():
                 # not just a box: a polytope. When it is a small simple one, THE POLYTOPE IS THE CELL the cuts start from
                 # ( `StartCell.py` ); a big or degenerate one cuts the box of its vertices
@@ -186,7 +186,7 @@ class PowerDiagram( Aggregate, Displayable ):
                 mi, ma, kept = start_box
                 kwargs[ "box_min" ], kwargs[ "box_max" ] = mi, ma
                 boundaries = ( np.asarray( boundaries[ 0 ], dtype = float )[ kept ],
-                               np.asarray( boundaries[ 1 ], dtype = float )[ kept ] )
+                               boundaries[ 1 ][ kept ] if loom.is_traced( boundaries[ 1 ] ) else np.asarray( boundaries[ 1 ], dtype = float )[ kept ] )
             if len( boundaries[ 1 ] ):
                 kwargs[ "bnd_directions" ], kwargs[ "bnd_offsets" ] = boundaries
 
@@ -269,9 +269,10 @@ class PowerDiagram( Aggregate, Displayable ):
         d = self.dim_count
         kw = dict( kernel_dtype = self._kernel_dtype )
         if self.box_min.is_defined:
-            mi = np.asarray( self.box_min ).reshape( -1 )
-            ma = np.asarray( self.box_max ).reshape( -1 )
-            return Cell.make_hypercube( d, mi, np.diag( ma - mi ), **kw )
+            # the backend's values ( a box known only under a trace: `traced_box` ), detached -- the domain is a constant
+            mi = loom.ops().stop_gradient( self.box_min.raw ).reshape( -1 )
+            ma = loom.ops().stop_gradient( self.box_max.raw ).reshape( -1 )
+            return Cell.make_hypercube( d, mi, np.eye( d ) * ( ma - mi )[ None, : ], **kw )
         return Cell.make_unbounded( d, **kw )
 
     def _dist_for( self, moment = None ):
@@ -635,6 +636,23 @@ class Neighbors( Aggregate ):
 
 
 # ---- the domain, read off half-spaces ------------------------------------------------------------
+
+def traced_box( directions, offsets ):
+    """`axis_aligned_box` for a box whose OFFSETS are known only under a trace ( `SumOfGaussians.bounding_half_spaces` under
+    `jax.jit` ): the directions must then be exactly `[ I, -I ]` -- readable, they are constants -- and the box is `( -offsets[ d: ],
+    offsets[ :d ] )`, traced arrays. `None` otherwise."""
+    if not loom.is_traced( offsets ):
+        return None
+    try:
+        dirs = np.asarray( directions, dtype = float )
+    except ( TypeError, ValueError, RuntimeError ):
+        return None
+    d = dirs.shape[ -1 ] if dirs.ndim == 2 else 0
+    if not d or not np.array_equal( dirs, np.concatenate( [ np.eye( d ), -np.eye( d ) ] ) ):
+        return None
+    offsets = offsets.reshape( -1 )
+    return -offsets[ d: ], offsets[ :d ], np.zeros( 2 * d, dtype = bool )
+
 
 def axis_aligned_box( directions, offsets ):
     """`( mi, ma, kept )`: the box that these half-spaces bound, and which of them it does

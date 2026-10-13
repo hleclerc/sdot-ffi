@@ -6,7 +6,7 @@
 pip install sdot
 ```
 
-Alternatively, to participate, or get the latest version, one can use the sources:
+Alternatively, to get the latest version (or to participate), one can use the sources:
 
 ```
 git clone git@github.com:sdot-team/sdot.git
@@ -30,7 +30,7 @@ SDOT can work with a lot of different frameworks. Here are the links for the off
 
 SDOT uses dynamic libraries that can be generated and compiled on demand. 
 
-Most of them will come from the packages (`pip`, ...). For more "exotic" case, you may need a compiler toolchain (`ninja`, a C++ compiler, `nvcc` if there's a Nvidia GPU, ...).
+Most of them will come with the packages installed via `pip`, but for more "exotic" case, you may need a compiler toolchain. In such a cas, you will need to install `ninja`, a C++ compiler, and `nvcc` if you plan to compile for Nvidia GPUs.
 
 ## Hello, World
 
@@ -100,7 +100,7 @@ import { withBase } from 'vitepress'
 
 
 
-## Backend
+<!-- ## Backend
 
 SDOT is based on [Loom](https://github.com/hleclerc/loom) to achieve backend independance. 
 
@@ -137,15 +137,15 @@ export SDOT_DTYPE=FP32
 export SDOT_DEVICE=cuda:0
 ```
 
-All arrays returned by SDOT live in the same framework, so they slot directly into your JAX/PyTorch computation graph.
+All arrays returned by SDOT live in the same framework, so they slot directly into your JAX/PyTorch computation graph. -->
 
 
 ## What's Next
 
+- [Examples gallery →](/examples/)
 - [Distributions in depth →](/guide/distributions)
 - [Differentiability →](/guide/differentiability)
 - [Ground metrics →](/guide/ground-metrics)
 - [OT plans in depth →](/guide/distributions)
 - [Backend configuration →](/guide/backends)
 - [Mathematical background →](/tutorials/ot-plan-intro)
-- [Examples gallery →](/examples/)

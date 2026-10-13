@@ -629,6 +629,17 @@ class Visualizer:
     def write_html( self, filename ):
         """Writes a self-contained HTML page (see the module header). Returns the path written."""
         path = Path( filename )
+        html = self.to_html()
+
+        path.parent.mkdir( parents = True, exist_ok = True )
+        path.write_text( html )
+        print( f"OUTPUT: file://{ path.absolute() }" )
+        return path
+
+    def to_html( self, wheel = True, touch = True ):
+        """The self-contained HTML page, as a string. `wheel` / `touch` say whether the wheel and
+        the touch gestures drive the view by default (`?wheel=0` / `?touch=0` in the URL still
+        win) -- off when the page is embedded in a host page that must keep scrolling."""
         if self.nb_dims is None:
             raise ValueError( "Visualizer: nothing to display (no primitive added)" )
 
@@ -667,13 +678,10 @@ class Visualizer:
             "__RMAX__"    : repr( float( r0 * 60 ) ),
             "__BG__"      : json.dumps( None if self.background is None
                                         else list( _rgb( self.background ) ) ),
+            "__WHEEL__"   : "true" if wheel else "false",
+            "__TOUCH__"   : "true" if touch else "false",
         }
-        html = re.sub( r"__[A-Z0-9_]+__", lambda m: subs.get( m.group( 0 ), m.group( 0 ) ), _HTML )
-
-        path.parent.mkdir( parents = True, exist_ok = True )
-        path.write_text( html )
-        print( f"OUTPUT: file://{ path.absolute() }" )
-        return path
+        return re.sub( r"__[A-Z0-9_]+__", lambda m: subs.get( m.group( 0 ), m.group( 0 ) ), _HTML )
 
 
 _HTML = r"""<!DOCTYPE html>
@@ -765,6 +773,11 @@ _HTML = r"""<!DOCTYPE html>
     <label><input type="checkbox" id="cbPoints" checked> points</label>
     <label>radius <span class="val" id="rVal"></span>
       <input id="r" type="range" min="0" max="1" step="0.001" value="0.5"></label>
+  </div>
+  <div class="sec" id="edlBox" style="display:none">
+    <label><input type="checkbox" id="cbEdl" checked> eye-dome lighting</label>
+    <label>strength <span class="val" id="edlVal"></span>
+      <input id="edlK" type="range" min="0" max="1" step="0.01" value="0.5"></label>
   </div>
   <div class="sec" id="axes" style="display:none">
     views on <select id="axX"></select><select id="axY"></select><select id="axZ"></select>
@@ -1474,6 +1487,62 @@ void main() {
   oCol = vec4(vCol.rgb * l, vCol.a);
 }`);
 
+// EYE-DOME LIGHTING (3D): the scene is drawn into a texture, then each pixel is darkened by how far its
+// neighbours stand IN FRONT of it -- the silhouettes and the steps in depth come out, with no normal and no
+// light to set up. It is what point cloud viewers use (ParaView, CloudCompare, Potree): a lone dirac is a disc
+// with no surface around it, which neither the sphere shading nor an ambient occlusion can give a depth to.
+const pEdl = prog(`#version 300 es
+void main() {                                          // one triangle that covers the screen
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`,
+`#version 300 es
+precision highp float;
+uniform sampler2D uCol; uniform sampler2D uDep;
+uniform float uNear, uFar, uOrtho, uRef, uK, uRad;
+out vec4 oCol;
+float viewDepth(float d) {                             // the distance along the view axis
+  float z = 2.0 * d - 1.0;
+  return uOrtho > 0.5 ? z * uFar : 2.0 * uNear * uFar / (uFar + uNear - z * (uFar - uNear));
+}
+void main() {
+  ivec2 c = ivec2(gl_FragCoord.xy), sz = textureSize(uDep, 0);
+  float zc = viewDepth(texelFetch(uDep, c, 0).r);
+  // in perspective, the differences are RELATIVE to the depth (a log depth): the same object looks the
+  // same near and far. In orthographic, relative to the size of the scene.
+  float ref = uOrtho > 0.5 ? uRef : zc;
+  float s = 0.0;
+  for (int i = 0; i < 8; i++) {
+    float a = 0.7853982 * float(i);
+    ivec2 q = clamp(c + ivec2(round(uRad * vec2(cos(a), sin(a)))), ivec2(0), sz - 1);
+    s += max(0.0, zc - viewDepth(texelFetch(uDep, q, 0).r)) / ref;
+  }
+  vec4 col = texelFetch(uCol, c, 0);
+  oCol = vec4(col.rgb * exp(-uK * s / 8.0), 1.0);
+}`);
+const edl = { fb: null, col: null, dep: null, w: 0, h: 0, vao: gl.createVertexArray() };
+function edlTargets(w, h) {                            // (re)allocated when the canvas changes size
+  if (edl.w === w && edl.h === h) return;
+  if (edl.fb) { gl.deleteFramebuffer(edl.fb); gl.deleteTexture(edl.col); gl.deleteTexture(edl.dep); }
+  const tex = (internal, format, type) => {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    return t;
+  };
+  edl.col = tex(gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+  edl.dep = tex(gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT);
+  edl.fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, edl.fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, edl.col, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, edl.dep, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  edl.w = w; edl.h = h;
+}
+function edlStrength() { return 20 * Math.pow(100, parseFloat(ui.edlK.value)); }
+
 const buf = {};
 ["triPos", "triNrm", "triCol", "linA", "linB", "linCol", "linCorner", "pntPos", "pntCol", "pntRad"]
   .forEach(k => buf[k] = gl.createBuffer());
@@ -1514,12 +1583,15 @@ const ui = {
   faces: document.getElementById("cbFaces"), points: document.getElementById("cbPoints"),
   edgeMode: document.getElementById("edgeMode"), op: document.getElementById("op"),
   r: document.getElementById("r"),
+  edl: document.getElementById("cbEdl"), edlK: document.getElementById("edlK"),
 };
 function pointRadius() { return RMIN * Math.pow(RMAX / RMIN, parseFloat(ui.r.value)); }
 
 function draw() {
   const w = canvas.width, h = canvas.height;
   const dark = document.body.classList.contains("dark");
+  const useEdl = D >= 3 && ui.edl.checked;
+  if (useEdl) { edlTargets(w, h); gl.bindFramebuffer(gl.FRAMEBUFFER, edl.fb); }
   gl.viewport(0, 0, w, h);
   const bg = BG !== null ? BG : (dark ? [0.10, 0.10, 0.10] : [1, 1, 1]);
   gl.clearColor(bg[0], bg[1], bg[2], 1);
@@ -1608,6 +1680,26 @@ function draw() {
     gl.uniform1f(gl.getUniformLocation(pPoint, "uR"), pointRadius());
     gl.depthFunc(gl.LEQUAL);
     gl.drawArrays(gl.POINTS, 0, PNT.n);
+  }
+
+  // (5) eye-dome lighting: the texture to the screen, darkened where the neighbours are in front
+  if (useEdl) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+    gl.useProgram(pEdl); gl.bindVertexArray(edl.vao);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, edl.col);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, edl.dep);
+    gl.uniform1i(gl.getUniformLocation(pEdl, "uCol"), 0);
+    gl.uniform1i(gl.getUniformLocation(pEdl, "uDep"), 1);
+    gl.uniform1f(gl.getUniformLocation(pEdl, "uNear"), near);
+    gl.uniform1f(gl.getUniformLocation(pEdl, "uFar"), far);
+    gl.uniform1f(gl.getUniformLocation(pEdl, "uOrtho"), cam.ortho ? 1 : 0);
+    gl.uniform1f(gl.getUniformLocation(pEdl, "uRef"), s.r);
+    gl.uniform1f(gl.getUniformLocation(pEdl, "uK"), edlStrength());
+    gl.uniform1f(gl.getUniformLocation(pEdl, "uRad"), 1.5 * (window.devicePixelRatio || 1));
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.enable(gl.DEPTH_TEST);
   }
   gl.bindVertexArray(null);
 }
@@ -1715,9 +1807,10 @@ canvas.addEventListener("dblclick", resetView);
 // shared with a mouse's Ctrl+wheel) -> zoom; otherwise scrolling = move.
 // `?wheel=0` in the URL (e.g. when embedded in an iframe) leaves the wheel to the host page.
 // `?touch=0` does the same for touch gestures. Both can be switched back on from the menu.
+// Without the parameter, the default comes from Python (`to_html( wheel, touch )`).
 const URL_OPTS = new URLSearchParams(location.search);
-let wheelEnabled = URL_OPTS.get("wheel") !== "0";
-let touchEnabled = URL_OPTS.get("touch") !== "0";
+let wheelEnabled = URL_OPTS.has("wheel") ? URL_OPTS.get("wheel") !== "0" : __WHEEL__;
+let touchEnabled = URL_OPTS.has("touch") ? URL_OPTS.get("touch") !== "0" : __TOUCH__;
 canvas.addEventListener("wheel", e => {
   if (!wheelEnabled) return;
   e.preventDefault();
@@ -1774,7 +1867,8 @@ const cbWheel = document.getElementById("cbWheel"), cbTouch = document.getElemen
 cbWheel.checked = wheelEnabled; cbTouch.checked = touchEnabled;
 cbWheel.addEventListener("change", () => { wheelEnabled = cbWheel.checked; });
 cbTouch.addEventListener("change", () => { touchEnabled = cbTouch.checked; });
-if (window.self !== window.top) {                     // embedded: offer the standalone page
+// embedded: offer the standalone page -- unless there is none (`srcdoc` iframe of a notebook)
+if (window.self !== window.top && location.href !== "about:srcdoc") {
   const a = document.getElementById("openFull");
   a.href = location.pathname; a.style.display = "block";
 }
@@ -1856,6 +1950,7 @@ if (NB_FRAMES > 1) {
 function syncLabels() {
   document.getElementById("opVal").textContent = parseFloat(ui.op.value).toFixed(2);
   document.getElementById("rVal").textContent = pointRadius().toPrecision(3);
+  document.getElementById("edlVal").textContent = edlStrength().toFixed(0);
   draw();
 }
 ui.op.addEventListener("input", syncLabels);
@@ -1863,6 +1958,9 @@ ui.r.addEventListener("input", syncLabels);
 ui.faces.addEventListener("change", draw);
 ui.points.addEventListener("change", draw);
 ui.edgeMode.addEventListener("change", draw);
+ui.edl.addEventListener("change", draw);
+ui.edlK.addEventListener("input", syncLabels);
+if (D >= 3) document.getElementById("edlBox").style.display = "block";
 if (PNT_V.length === 0) document.getElementById("ptBox").style.display = "none";
 
 // beyond 3 dimensions: we choose the 3 we look at, and fix the others (the SLICE).
